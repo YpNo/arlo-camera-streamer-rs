@@ -1,0 +1,299 @@
+//! Composition root for the application layer.
+//!
+//! [`StreamerSystem::spawn`] takes the four port handles plus the
+//! [`StreamerConfig`] and brings up:
+//!
+//! - One [`CameraOrchestrator`] tokio task per `[[cameras]]` block.
+//! - One [`EventRouter`] tokio task fanning the shared SSE bus into
+//!   per-camera mailboxes.
+//!
+//! All tasks share a single [`CancellationToken`] so a graceful
+//! shutdown propagates atomically. [`StreamerSystem::shutdown`] cancels
+//! the token and awaits every spawned handle.
+//!
+//! # Channel sizing
+//!
+//! Each per-camera mailbox is sized at [`MAILBOX_CAPACITY`]. Motion
+//! events arrive at most a few per minute on a busy camera, so 32 is
+//! ample headroom — the [`EventRouter`] will log and drop on overflow
+//! rather than block the shared bus.
+
+#![allow(clippy::similar_names)]
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
+
+use streamer_domain::config::StreamerConfig;
+use streamer_domain::error::DomainError;
+use streamer_domain::event::CameraEvent;
+use streamer_domain::port::{
+    ArloEventSource, ArloStreamRequester, ArloThumbnailSource, MediaMultiplexer,
+};
+
+use crate::orchestrator::CameraOrchestrator;
+use crate::router::EventRouter;
+
+/// Per-camera mailbox capacity. See module docs for sizing rationale.
+pub const MAILBOX_CAPACITY: usize = 32;
+
+/// Handle to a running streamer system. Keep it alive for the lifetime
+/// of the daemon; drop / call [`StreamerSystem::shutdown`] for graceful
+/// teardown.
+#[derive(Debug)]
+pub struct StreamerSystem {
+    handles: Vec<JoinHandle<()>>,
+    shutdown: CancellationToken,
+}
+
+impl StreamerSystem {
+    /// Spawn the orchestrator + router tasks, return a handle.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomainError::AdapterTransport`] when [`ArloEventSource::subscribe`]
+    ///   fails.
+    /// - [`DomainError::InvalidConfig`] when a camera's
+    ///   [`CooldownConfig`](streamer_domain::config::CooldownConfig)
+    ///   is rejected by the budget tracker (e.g., bad `budget_reset`).
+    pub async fn spawn(
+        config: &StreamerConfig,
+        event_source: Arc<dyn ArloEventSource>,
+        stream_requester: Arc<dyn ArloStreamRequester>,
+        thumbnails: Arc<dyn ArloThumbnailSource>,
+        media: Arc<dyn MediaMultiplexer>,
+    ) -> Result<Self, DomainError> {
+        if config.cameras.is_empty() {
+            return Err(DomainError::InvalidConfig(
+                "no [[cameras]] configured — nothing to do".to_string(),
+            ));
+        }
+
+        let shutdown = CancellationToken::new();
+        let mut routes: HashMap<_, mpsc::Sender<CameraEvent>> = HashMap::new();
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+
+        for camera_cfg in &config.cameras {
+            let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
+            if routes
+                .insert(camera_cfg.arlo_device_id.clone(), tx)
+                .is_some()
+            {
+                warn!(
+                    camera = %camera_cfg.arlo_device_id,
+                    "duplicate [[cameras]] entry; later one wins"
+                );
+            }
+            let orch = CameraOrchestrator::new(
+                camera_cfg,
+                stream_requester.clone(),
+                thumbnails.clone(),
+                media.clone(),
+                rx,
+                shutdown.child_token(),
+            )?;
+            handles.push(tokio::spawn(orch.run()));
+        }
+
+        let events = event_source.subscribe().await?;
+        let router = EventRouter::new(routes);
+        handles.push(tokio::spawn(router.run(events, shutdown.child_token())));
+
+        info!(cameras = config.cameras.len(), "streamer system spawned");
+        Ok(Self { handles, shutdown })
+    }
+
+    /// Cancel all tasks and wait for them to drain. Idempotent.
+    pub async fn shutdown(self) {
+        info!("shutting down streamer system");
+        self.shutdown.cancel();
+        for handle in self.handles {
+            if let Err(e) = handle.await {
+                warn!(error = %e, "task join failed");
+            }
+        }
+        info!("streamer system shut down");
+    }
+
+    /// Cancellation token shared by every spawned task. Useful for
+    /// callers that want to wire it to a `tokio::signal` handler.
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use std::path::PathBuf;
+    use streamer_domain::camera::{CameraId, StreamName};
+    use streamer_domain::config::{
+        ArloConfig, CameraConfig, CooldownConfig, ImapMfaConfig, MfaConfig, OutputConfig,
+        RtspOutput,
+    };
+    use streamer_domain::event::ConnectionStatus;
+    use streamer_domain::stream::StreamSource;
+
+    // Minimal stub adapters for spawn-time wiring tests.
+    struct StubEventSource;
+    #[async_trait]
+    impl ArloEventSource for StubEventSource {
+        async fn subscribe(&self) -> Result<BoxStream<'static, CameraEvent>, DomainError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        async fn connection_status(
+            &self,
+        ) -> Result<BoxStream<'static, ConnectionStatus>, DomainError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    struct FailingEventSource;
+    #[async_trait]
+    impl ArloEventSource for FailingEventSource {
+        async fn subscribe(&self) -> Result<BoxStream<'static, CameraEvent>, DomainError> {
+            Err(DomainError::AdapterTransport("simulated".to_string()))
+        }
+        async fn connection_status(
+            &self,
+        ) -> Result<BoxStream<'static, ConnectionStatus>, DomainError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    struct StubStreamRequester;
+    #[async_trait]
+    impl ArloStreamRequester for StubStreamRequester {
+        async fn request_live(&self, _camera: &CameraId) -> Result<StreamSource, DomainError> {
+            Ok(StreamSource {
+                url: "rtsps://test".to_string(),
+                codec_hint: None,
+            })
+        }
+    }
+
+    struct StubThumbnails;
+    #[async_trait]
+    impl ArloThumbnailSource for StubThumbnails {
+        async fn last_thumbnail(&self, _camera: &CameraId) -> Result<Option<Bytes>, DomainError> {
+            Ok(None)
+        }
+    }
+
+    struct StubMedia;
+    #[async_trait]
+    impl MediaMultiplexer for StubMedia {
+        async fn register(&self, _camera: &CameraId) -> Result<(), DomainError> {
+            Ok(())
+        }
+        async fn attach_live(
+            &self,
+            _camera: &CameraId,
+            _source: StreamSource,
+        ) -> Result<(), DomainError> {
+            Ok(())
+        }
+        async fn detach_live(&self, _camera: &CameraId) -> Result<(), DomainError> {
+            Ok(())
+        }
+        async fn refresh_thumbnail(
+            &self,
+            _camera: &CameraId,
+            _jpeg: Bytes,
+        ) -> Result<(), DomainError> {
+            Ok(())
+        }
+    }
+
+    fn one_camera_config() -> StreamerConfig {
+        StreamerConfig {
+            arlo: ArloConfig {
+                email: "u@example.com".to_string(),
+                password_env: "PW".to_string(),
+                session_cache_path: PathBuf::from("/tmp/x.json"),
+                mfa: MfaConfig::Imap(ImapMfaConfig {
+                    host: "h".to_string(),
+                    user: "u".to_string(),
+                    password_env: "IPW".to_string(),
+                    port: 993,
+                }),
+            },
+            output: OutputConfig {
+                rtsp: RtspOutput {
+                    bind: "0.0.0.0:8554".to_string(),
+                },
+                hls: None,
+                dash: None,
+                metrics_bind: "127.0.0.1:9090".to_string(),
+                admin_bind: "127.0.0.1:9091".to_string(),
+            },
+            cameras: vec![CameraConfig {
+                arlo_device_id: CameraId::new("CAM"),
+                stream_name: StreamName::parse("cam").unwrap(),
+                codec_hint: None,
+                cooldown: CooldownConfig::default(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_empty_camera_list() {
+        let mut cfg = one_camera_config();
+        cfg.cameras.clear();
+        let err = StreamerSystem::spawn(
+            &cfg,
+            Arc::new(StubEventSource),
+            Arc::new(StubStreamRequester),
+            Arc::new(StubThumbnails),
+            Arc::new(StubMedia),
+        )
+        .await
+        .expect_err("must reject empty camera list");
+        assert!(matches!(err, DomainError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn spawn_propagates_subscribe_failure() {
+        let cfg = one_camera_config();
+        let err = StreamerSystem::spawn(
+            &cfg,
+            Arc::new(FailingEventSource),
+            Arc::new(StubStreamRequester),
+            Arc::new(StubThumbnails),
+            Arc::new(StubMedia),
+        )
+        .await
+        .expect_err("must surface subscribe failure");
+        assert!(matches!(err, DomainError::AdapterTransport(_)));
+    }
+
+    #[tokio::test]
+    async fn spawn_then_shutdown_drains_cleanly() {
+        let cfg = one_camera_config();
+        let system = StreamerSystem::spawn(
+            &cfg,
+            Arc::new(StubEventSource),
+            Arc::new(StubStreamRequester),
+            Arc::new(StubThumbnails),
+            Arc::new(StubMedia),
+        )
+        .await
+        .expect("spawn ok");
+
+        // Cancellation token is shared with internal tasks.
+        let token = system.cancellation_token();
+        assert!(!token.is_cancelled());
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), system.shutdown())
+            .await
+            .expect("shutdown timed out");
+    }
+}

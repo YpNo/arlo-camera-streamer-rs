@@ -1,0 +1,150 @@
+name: Rust CI
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: '0 0 * * 0'   # weekly security audit on Sundays
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Lint with Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install system build deps (boring-sys + GStreamer)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential libssl-dev libclang-dev nasm golang-go \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: 1.95.0
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings -A dead_code
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install system build deps (boring-sys + GStreamer)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential libssl-dev libclang-dev nasm golang-go chromium-browser \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo test --workspace --all-features
+
+  security:
+    name: Security & License Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: EmbarkStudios/cargo-deny-action@91bf2b620e09e18d6eb78b92e7861937469acedb # v2.0.17
+        with:
+          command: check
+
+  doc:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install system build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential libssl-dev libclang-dev nasm golang-go \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install system build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential libssl-dev libclang-dev nasm golang-go chromium-browser \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install cargo-tarpaulin (binary release)
+        run: |
+          curl -s https://api.github.com/repos/xd009642/tarpaulin/releases/latest \
+            | grep browser_download_url | grep x86_64-unknown-linux-musl \
+            | cut -d '"' -f 4 | xargs curl -L | tar xz -C /usr/local/bin
+      - name: Run cargo-tarpaulin
+        # Exclusions:
+        # - `arlo-camera-streamer` (binary) — composition root, only glue
+        # - `streamer-infra-media` — GStreamer FFI, requires running pipeline
+        # - I/O-heavy infra-arlo files — `boot.rs` async auth, `events.rs`
+        #   live SSE bus, `stream_requester.rs` and `thumbnails.rs` real
+        #   network calls. Their pure logic (`event_mapper.rs`, `error.rs`,
+        #   the `build_rs_arlo_config` and `utf8_path` helpers) IS unit-tested
+        #   inline; the wrappers belong to integration tests against a real
+        #   Arlo account, gated separately in Phase 6.
+        run: |
+          cargo tarpaulin --workspace --all-features --timeout 180 --out xml \
+            --exclude arlo-camera-streamer \
+            --exclude streamer-infra-media \
+            --exclude-files 'crates/streamer-infra-arlo/src/boot.rs' \
+            --exclude-files 'crates/streamer-infra-arlo/src/events.rs' \
+            --exclude-files 'crates/streamer-infra-arlo/src/stream_requester.rs' \
+            --exclude-files 'crates/streamer-infra-arlo/src/thumbnails.rs' \
+            --fail-under 85
+      - uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe # v5.5.4
+        with:
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  sonarqube:
+    name: SonarQube
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

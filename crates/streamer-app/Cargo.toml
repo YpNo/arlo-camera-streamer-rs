@@ -1,0 +1,29 @@
+[package]
+name        = "streamer-app"
+description = "Application-layer use cases: per-camera orchestrator, debouncer, budget tracker."
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[dependencies]
+streamer-domain = { workspace = true }
+
+async-trait = { workspace = true }
+bytes       = { workspace = true }
+chrono      = { workspace = true }
+futures     = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { workspace = true }
+tokio-util  = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+mockall    = { workspace = true }
+rstest     = { workspace = true }
+tokio-test = { workspace = true }

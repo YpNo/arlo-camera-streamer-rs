@@ -1,0 +1,343 @@
+//! Pure state-transition function for the per-camera state machine.
+//!
+//! Given a current [`CameraState`] and an incoming [`StateTransition`]
+//! signal, [`transition`] returns the resulting state. The function is
+//! deterministic, allocation-light, and free of side effects — the
+//! orchestrator (Phase 3) calls it as a reducer and is responsible for
+//! emitting the appropriate signals based on debouncer / budget /
+//! adapter feedback.
+//!
+//! ## Transition matrix (Phase 1 v0.1)
+//!
+//! | From / Signal      | Motion | LiveAttached | LiveReady | CooldownExpired | MaxLiveExceeded | BudgetExhausted | BudgetReset | Failure | BackoffElapsed |
+//! |--------------------|--------|--------------|-----------|-----------------|-----------------|-----------------|-------------|---------|----------------|
+//! | Idle               | Activ. | (ignored)    | (ignored) | (ignored)       | (ignored)       | BatteryProtect  | Idle        | Failed  | (ignored)      |
+//! | Activating         | Activ. | Live         | Activ.    | (ignored)       | (ignored)       | BatteryProtect  | Activ.      | Failed  | (ignored)      |
+//! | Live               | Live   | Live         | Live      | Idle            | Idle            | BatteryProtect  | Live        | Failed  | (ignored)      |
+//! | Cooling (reserved) | Live   | (ignored)    | (ignored) | Idle            | Idle            | BatteryProtect  | Cooling     | Failed  | (ignored)      |
+//! | BatteryProtect     | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | Idle        | Failed  | (ignored)      |
+//! | Failed             | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | (ign.)      | Failed+ | Idle           |
+//!
+//! The `Failed → Failed (Failure)` transition increments the retry counter
+//! so the orchestrator can apply exponential backoff before emitting
+//! `BackoffElapsed`.
+//!
+//! `Cooling` is **declared** in the domain but not produced by this
+//! function in v0.1 — the debouncer collapses Live and Cooling into a
+//! single output state. Reserved for v0.2 telemetry use.
+
+// The compact transition matrix above uses bare type names for legibility;
+// backticking each cell would defeat the table's purpose.
+#![allow(clippy::doc_markdown)]
+// The reducer is organized per source state, so the catch-all
+// `(_, _) => state.clone()` arm appears in several blocks. That layout is
+// the readability win — collapsing across states would obscure which
+// signals each state actually responds to.
+#![allow(clippy::match_same_arms)]
+
+use std::time::Duration;
+
+use streamer_domain::state::{CameraState, StateTransition};
+
+/// Apply `signal` to `state` and return the resulting state.
+///
+/// `BatteryProtect` and `Failed` initial sub-fields are populated with
+/// zeroed sentinels — the orchestrator overwrites them with concrete
+/// values (computed from `chrono::Local::now()` and `CooldownConfig`)
+/// after this pure step returns.
+#[must_use]
+pub fn transition(state: &CameraState, signal: &StateTransition) -> CameraState {
+    use CameraState as S;
+    use StateTransition as T;
+
+    match (state, signal) {
+        // ---------- From Idle ----------
+        (S::Idle, T::MotionDetected) => S::Activating,
+        (S::Idle, T::BudgetExhausted) => battery_protect(),
+        (S::Idle, T::Failure(reason)) => fresh_failed(reason),
+        (S::Idle, _) => S::Idle,
+
+        // ---------- From Activating ----------
+        (S::Activating, T::LiveAttached) => S::Live { since_secs: 0 },
+        (S::Activating, T::Failure(reason)) => fresh_failed(reason),
+        (S::Activating, T::BudgetExhausted) => battery_protect(),
+        (S::Activating, _) => S::Activating,
+
+        // ---------- From Live ----------
+        (S::Live { .. }, T::CooldownExpired | T::MaxLiveExceeded) => S::Idle,
+        (S::Live { .. }, T::BudgetExhausted) => battery_protect(),
+        (S::Live { .. }, T::Failure(reason)) => fresh_failed(reason),
+        (S::Live { .. }, _) => state.clone(),
+
+        // ---------- From Cooling (reserved) ----------
+        (S::Cooling { .. }, T::MotionDetected) => S::Live { since_secs: 0 },
+        (S::Cooling { .. }, T::CooldownExpired | T::MaxLiveExceeded) => S::Idle,
+        (S::Cooling { .. }, T::BudgetExhausted) => battery_protect(),
+        (S::Cooling { .. }, T::Failure(reason)) => fresh_failed(reason),
+        (S::Cooling { .. }, _) => state.clone(),
+
+        // ---------- From BatteryProtect ----------
+        (S::BatteryProtect { .. }, T::BudgetReset) => S::Idle,
+        (S::BatteryProtect { .. }, T::Failure(reason)) => fresh_failed(reason),
+        (S::BatteryProtect { .. }, _) => state.clone(),
+
+        // ---------- From Failed ----------
+        (S::Failed { .. }, T::BackoffElapsed) => S::Idle,
+        (S::Failed { reason: _, retries }, T::Failure(new_reason)) => S::Failed {
+            reason: new_reason.clone(),
+            retries: retries.saturating_add(1),
+        },
+        (S::Failed { .. }, _) => state.clone(),
+    }
+}
+
+fn battery_protect() -> CameraState {
+    CameraState::BatteryProtect {
+        reset_in: Duration::ZERO,
+    }
+}
+
+fn fresh_failed(reason: &str) -> CameraState {
+    CameraState::Failed {
+        reason: reason.to_string(),
+        retries: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    fn live(secs: u64) -> CameraState {
+        CameraState::Live { since_secs: secs }
+    }
+
+    fn cooling(secs: u64) -> CameraState {
+        CameraState::Cooling {
+            remaining: Duration::from_secs(secs),
+        }
+    }
+
+    fn battery() -> CameraState {
+        CameraState::BatteryProtect {
+            reset_in: Duration::from_hours(1),
+        }
+    }
+
+    fn failed(retries: u32) -> CameraState {
+        CameraState::Failed {
+            reason: "boom".to_string(),
+            retries,
+        }
+    }
+
+    // ---------- Idle ----------
+
+    #[test]
+    fn idle_motion_activates() {
+        assert_eq!(
+            transition(&CameraState::Idle, &StateTransition::MotionDetected),
+            CameraState::Activating
+        );
+    }
+
+    #[test]
+    fn idle_budget_exhausted_enters_battery_protect() {
+        assert!(matches!(
+            transition(&CameraState::Idle, &StateTransition::BudgetExhausted),
+            CameraState::BatteryProtect { .. }
+        ));
+    }
+
+    #[test]
+    fn idle_failure_enters_failed_with_zero_retries() {
+        let result = transition(
+            &CameraState::Idle,
+            &StateTransition::Failure("net down".to_string()),
+        );
+        assert!(matches!(result, CameraState::Failed { retries: 0, .. }));
+    }
+
+    #[rstest]
+    #[case(StateTransition::LiveAttached)]
+    #[case(StateTransition::LiveReady)]
+    #[case(StateTransition::CooldownExpired)]
+    #[case(StateTransition::MaxLiveExceeded)]
+    #[case(StateTransition::BudgetReset)]
+    #[case(StateTransition::BackoffElapsed)]
+    fn idle_ignores_irrelevant_signals(#[case] signal: StateTransition) {
+        assert_eq!(transition(&CameraState::Idle, &signal), CameraState::Idle);
+    }
+
+    // ---------- Activating ----------
+
+    #[test]
+    fn activating_live_attached_enters_live() {
+        assert_eq!(
+            transition(&CameraState::Activating, &StateTransition::LiveAttached),
+            live(0)
+        );
+    }
+
+    #[test]
+    fn activating_failure_enters_failed() {
+        let result = transition(
+            &CameraState::Activating,
+            &StateTransition::Failure("rtsp 401".to_string()),
+        );
+        assert!(matches!(result, CameraState::Failed { retries: 0, .. }));
+    }
+
+    #[rstest]
+    #[case(StateTransition::MotionDetected)]
+    #[case(StateTransition::LiveReady)]
+    #[case(StateTransition::CooldownExpired)]
+    #[case(StateTransition::MaxLiveExceeded)]
+    #[case(StateTransition::BudgetReset)]
+    #[case(StateTransition::BackoffElapsed)]
+    fn activating_holds_on_irrelevant_signals(#[case] signal: StateTransition) {
+        assert_eq!(
+            transition(&CameraState::Activating, &signal),
+            CameraState::Activating
+        );
+    }
+
+    // ---------- Live ----------
+
+    #[rstest]
+    #[case(StateTransition::CooldownExpired)]
+    #[case(StateTransition::MaxLiveExceeded)]
+    fn live_returns_to_idle_on_cooldown_or_max(#[case] signal: StateTransition) {
+        assert_eq!(transition(&live(42), &signal), CameraState::Idle);
+    }
+
+    #[test]
+    fn live_holds_on_motion() {
+        let s = live(10);
+        assert_eq!(transition(&s, &StateTransition::MotionDetected), s);
+    }
+
+    #[test]
+    fn live_failure_enters_failed() {
+        let result = transition(
+            &live(5),
+            &StateTransition::Failure("pipeline crash".to_string()),
+        );
+        assert!(matches!(result, CameraState::Failed { retries: 0, .. }));
+    }
+
+    #[test]
+    fn live_budget_exhausted_enters_battery_protect() {
+        assert!(matches!(
+            transition(&live(5), &StateTransition::BudgetExhausted),
+            CameraState::BatteryProtect { .. }
+        ));
+    }
+
+    // ---------- Cooling (reserved) ----------
+
+    #[test]
+    fn cooling_motion_returns_to_live() {
+        assert_eq!(
+            transition(&cooling(30), &StateTransition::MotionDetected),
+            live(0)
+        );
+    }
+
+    #[test]
+    fn cooling_cooldown_expired_returns_to_idle() {
+        assert_eq!(
+            transition(&cooling(30), &StateTransition::CooldownExpired),
+            CameraState::Idle
+        );
+    }
+
+    #[test]
+    fn cooling_budget_exhausted_enters_battery_protect() {
+        assert!(matches!(
+            transition(&cooling(30), &StateTransition::BudgetExhausted),
+            CameraState::BatteryProtect { .. }
+        ));
+    }
+
+    #[test]
+    fn cooling_failure_enters_failed() {
+        let result = transition(
+            &cooling(30),
+            &StateTransition::Failure("rtsp drop".to_string()),
+        );
+        assert!(matches!(result, CameraState::Failed { retries: 0, .. }));
+    }
+
+    #[test]
+    fn cooling_holds_on_irrelevant_signals() {
+        let s = cooling(30);
+        assert_eq!(transition(&s, &StateTransition::LiveAttached), s);
+        assert_eq!(transition(&s, &StateTransition::BudgetReset), s);
+    }
+
+    // ---------- BatteryProtect ----------
+
+    #[test]
+    fn battery_protect_resets_to_idle_on_budget_reset() {
+        assert_eq!(
+            transition(&battery(), &StateTransition::BudgetReset),
+            CameraState::Idle
+        );
+    }
+
+    #[test]
+    fn battery_protect_ignores_motion() {
+        let s = battery();
+        assert_eq!(transition(&s, &StateTransition::MotionDetected), s);
+    }
+
+    #[test]
+    fn battery_protect_failure_enters_failed() {
+        let result = transition(&battery(), &StateTransition::Failure("crash".to_string()));
+        assert!(matches!(result, CameraState::Failed { retries: 0, .. }));
+    }
+
+    // ---------- Failed ----------
+
+    #[test]
+    fn failed_backoff_elapsed_returns_to_idle() {
+        assert_eq!(
+            transition(&failed(3), &StateTransition::BackoffElapsed),
+            CameraState::Idle
+        );
+    }
+
+    #[test]
+    fn failed_failure_increments_retries() {
+        let result = transition(&failed(2), &StateTransition::Failure("again".to_string()));
+        match result {
+            CameraState::Failed { retries, reason } => {
+                assert_eq!(retries, 3);
+                assert_eq!(reason, "again");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_retries_saturates_at_u32_max() {
+        let result = transition(&failed(u32::MAX), &StateTransition::Failure("x".into()));
+        assert!(matches!(
+            result,
+            CameraState::Failed {
+                retries: u32::MAX,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn failed_holds_on_irrelevant_signals() {
+        let s = failed(2);
+        assert_eq!(transition(&s, &StateTransition::MotionDetected), s);
+        assert_eq!(transition(&s, &StateTransition::LiveAttached), s);
+        assert_eq!(transition(&s, &StateTransition::BudgetReset), s);
+    }
+}

@@ -1,0 +1,77 @@
+# ---------------------------------------------------------------------------
+# arlo-camera-streamer example configuration
+#
+# Copy to /etc/arlo-streamer/streamer.toml (or pass `--config <path>`)
+# and edit the marked sections before running. Secrets MUST come from
+# env vars — never write a password into this file.
+# ---------------------------------------------------------------------------
+
+[arlo]
+# Arlo cloud account email (the one used to log into the Arlo app).
+email              = "owner@example.com"
+# Name of the env var holding the Arlo cloud account password.
+# Never write the password into this file directly.
+password_env       = "ARLO_PASSWORD"
+# rs-arlo persists the session token here so MFA isn't required on
+# every restart. Path must be readable + writable by the streamer
+# process. Permissions are forced to 0600 on Unix.
+session_cache_path = "/var/lib/arlo-streamer/session.json"
+
+# MFA strategy for cold-start (when session_cache_path is missing or
+# the cached token has expired). Two options:
+#   kind = "imap"   — headless: poll IMAP for the OTP message
+#   kind = "stdin"  — interactive: prompt on stdin (one-time setup only)
+[arlo.mfa]
+kind         = "imap"
+host         = "imap.example.com"
+user         = "arlo-otp@example.com"
+# Only the *name* of the env var goes here. The streamer reads
+# `std::env::var("ARLO_IMAP_PASSWORD")` at boot.
+password_env = "ARLO_IMAP_PASSWORD"
+# port       = 993                # default
+
+# ---------------------------------------------------------------------------
+# Output endpoints
+# ---------------------------------------------------------------------------
+
+[output]
+# Prometheus /metrics endpoint (per-camera state, transitions, live seconds).
+metrics_bind = "127.0.0.1:9090"
+# Operational /admin HTTP endpoint (force-wake, force-idle, state snapshot).
+admin_bind   = "127.0.0.1:9091"
+
+[output.rtsp]
+bind = "0.0.0.0:8554"
+
+# Optional secondary outputs. Uncomment to enable.
+#
+# [output.hls]
+# dir             = "/var/cache/arlo-streamer/hls"
+# segment_secs    = 2
+# playlist_length = 10
+#
+# [output.dash]
+# dir          = "/var/cache/arlo-streamer/dash"
+# segment_secs = 2
+
+# ---------------------------------------------------------------------------
+# Cameras — one [[cameras]] block per Arlo device you want to expose.
+# `arlo_device_id` is the opaque id from the Arlo cloud (visible in the
+# Arlo iOS / Android app under device info).
+# ---------------------------------------------------------------------------
+
+[[cameras]]
+arlo_device_id = "REPLACE_WITH_DEVICE_ID"
+stream_name    = "front_door"
+# codec_hint   = "h264"   # learned automatically on first stream
+
+[cameras.cooldown]
+debounce_secs       = 60     # hold-live after last motion (debounce window)
+max_continuous_live = 300    # hard cap on continuous live time (battery save)
+daily_live_budget   = 0      # 0 = unlimited; otherwise total live secs/day
+budget_reset        = "00:00"
+
+# Operational note:
+#   Disable the official Arlo app's motion *recording* for every camera
+#   exposed here. Arlo's cloud-recording job competes with our
+#   `start_stream` request and will delay or block live activations.

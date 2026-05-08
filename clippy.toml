@@ -1,0 +1,26 @@
+msrv                           = "1.95.0"
+cognitive-complexity-threshold = 20
+too-many-arguments-threshold   = 8
+type-complexity-threshold      = 250
+
+# Domain proper nouns and technical acronyms permitted in doc comments
+# without backticks (`clippy::doc_markdown`). The default list already
+# covers e.g. `OAuth`, `JSON`, `HTTP`. Append project-specific terms
+# here.
+doc-valid-idents = [
+    "..",
+    "Arlo",
+    "Frigate",
+    "GStreamer",
+    "RTSPS",
+    "IDR",
+    "MFA",
+    "IMAP",
+    "TLS",
+    "HLS",
+    "DASH",
+    "SSE",
+    "PIR",
+    "MPEG",
+    "rs-arlo",
+]

@@ -1,0 +1,27 @@
+[package]
+name        = "streamer-infra-media"
+description = "GStreamer-based MediaMultiplexer adapter (RTSP + HLS + DASH outputs)."
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[dependencies]
+streamer-domain = { workspace = true }
+
+async-trait           = { workspace = true }
+bytes                 = { workspace = true }
+chrono                = { workspace = true }
+futures               = { workspace = true }
+gstreamer             = { workspace = true }
+gstreamer-app         = { workspace = true }
+gstreamer-rtsp        = { workspace = true }
+gstreamer-rtsp-server = { workspace = true }
+thiserror             = { workspace = true }
+tokio                 = { workspace = true }
+tracing               = { workspace = true }
