@@ -53,7 +53,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # ---- Serde / Config ----
 serde = { version = "1", features = ["derive"] }
-toml  = "0.8"
+toml  = "1"
 
 # ---- Time / Dates ----
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
@@ -70,12 +70,12 @@ prometheus = "0.14"
 clap = { version = "4", features = ["derive"] }
 
 # ---- GStreamer (media adapter only) ----
-gstreamer             = "0.23"
-gstreamer-app         = "0.23"
-gstreamer-rtsp        = "0.23"
-gstreamer-rtsp-server = "0.23"
+gstreamer             = "0.25"
+gstreamer-app         = "0.25"
+gstreamer-rtsp        = "0.25"
+gstreamer-rtsp-server = "0.25"
 
 # ---- Test ----
-mockall    = "0.13"
-rstest     = "0.23"
+mockall    = "0.14"
+rstest     = "0.26"
 tokio-test = "0.4"

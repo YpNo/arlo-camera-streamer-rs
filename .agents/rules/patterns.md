@@ -163,6 +163,52 @@ pub enum ApiResponse<T: serde::Serialize> {
 }
 ```
 
+## Idle-to-Live Splicing State Machine
+
+Model the stream lifecycle to ensure smooth transitions:
+
+```rust
+enum StreamState {
+    /// Serving the low-bandwidth idle source.
+    Idle,
+    /// Requesting the live stream from Arlo.
+    RequestingLive { start_time: Instant },
+    /// Active live stream being multiplexed.
+    Live { session_id: String },
+    /// Live stream failed or timed out; falling back to idle.
+    FallingBack { reason: String },
+}
+```
+
+Use a `CameraActor` to drive this state machine based on external triggers (motion events, manual start) and internal timeouts.
+
+## GStreamer Pipeline Builder
+
+Encapsulate complex pipeline construction to avoid string-concatenation errors:
+
+```rust
+pub struct PipelineBuilder {
+    elements: Vec<gst::Element>,
+    // ...
+}
+
+impl PipelineBuilder {
+    pub fn add_source(mut self, src: &str) -> Result<Self> {
+        let element = gst::ElementFactory::make(src).build()?;
+        self.elements.push(element);
+        Ok(self)
+    }
+
+    pub fn link_all(self) -> Result<gst::Pipeline> {
+        // Safe linking logic with error reporting
+        todo!()
+    }
+}
+```
+
 ## References
 
-See skill: `rust-patterns` for comprehensive patterns including ownership, traits, generics, concurrency, and async.
+See skills:
+- `media-specialist`: GStreamer and RTSP patterns.
+- `rust-core`: General Rust and hexagonal patterns.
+- `arlo-orchestrator`: Arlo protocol and event bus patterns.

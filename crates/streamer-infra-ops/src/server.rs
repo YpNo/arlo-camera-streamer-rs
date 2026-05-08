@@ -53,13 +53,17 @@ impl OpsServer {
     ///
     /// # Errors
     ///
-    /// Returns `anyhow::Error` if the bind address is in use, the
+    /// Returns [`crate::error::OpsError`] if the bind address is in use, the
     /// listener cannot be created, or axum reports an error.
-    pub async fn serve(self, addr: SocketAddr, shutdown: CancellationToken) -> anyhow::Result<()> {
+    pub async fn serve(
+        self,
+        addr: SocketAddr,
+        shutdown: CancellationToken,
+    ) -> Result<(), crate::error::OpsError> {
         let app = self.router();
         let listener = tokio::net::TcpListener::bind(addr)
             .await
-            .map_err(|e| anyhow::anyhow!("bind {addr} failed: {e}"))?;
+            .map_err(|source| crate::error::OpsError::Bind { addr, source })?;
         info!(%addr, "ops HTTP server listening");
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
@@ -67,7 +71,7 @@ impl OpsServer {
                 info!("ops HTTP server shutting down");
             })
             .await
-            .map_err(|e| anyhow::anyhow!("axum serve failed: {e}"))?;
+            .map_err(crate::error::OpsError::Serve)?;
         Ok(())
     }
 }

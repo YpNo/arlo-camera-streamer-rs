@@ -28,9 +28,13 @@
 
 #![forbid(unsafe_code)]
 
+/// Error types for the ops module.
+pub mod error;
 pub mod health;
 pub mod metrics;
 pub mod server;
+
+pub use error::OpsError;
 
 pub use health::Readiness;
 pub use metrics::Metrics;
