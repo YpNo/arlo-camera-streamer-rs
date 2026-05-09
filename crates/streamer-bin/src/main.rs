@@ -6,20 +6,22 @@
 //! 2. Initialize tracing subscriber from `RUST_LOG`.
 //! 3. Initialize GStreamer (must run before any `gstreamer::*` call).
 //! 4. Load and parse the TOML config.
-//! 5. Build [`Metrics`] + [`Readiness`].
+//! 5. Build [`Metrics`] + [`Readiness`]; pre-warm per-camera state rows.
 //! 6. Boot the rs-arlo client (`streamer_infra_arlo::boot::boot`) →
 //!    construct the three Arlo port adapters from the shared
 //!    [`std::sync::Arc<rs_arlo::client::ArloClient>`].
 //! 7. Start the embedded RTSP server, build [`GstPipelineRegistry`],
 //!    and wrap it in a [`GstMediaMultiplexer`].
 //! 8. Spawn [`StreamerSystem`] (one orchestrator per camera + the
-//!    event router). This is the moment readiness becomes "started".
+//!    event router) with the metrics recorder injected.
 //! 9. Spawn the `connection_status` watcher → forwards Arlo bus state
-//!    to readiness + metrics.
-//! 10. Spawn the ops HTTP server on `output.metrics_bind` (Phase 5
-//!     binds `/metrics`, `/healthz`, `/readyz` to the same address).
-//! 11. Wait for `Ctrl-C` or for the system token to be cancelled.
-//! 12. Cancel the shared token, await all spawned tasks, drop the
+//!    to readiness, metrics, and the admin actor's shared atomic.
+//! 10. Spawn the ops HTTP server on `output.metrics_bind`
+//!     (`/metrics`, `/healthz`, `/readyz`).
+//! 11. Spawn the admin HTTP server on `output.admin_bind` (`/admin/*`),
+//!     authed with the bearer token from `STREAMER_ADMIN_TOKEN`.
+//! 12. Wait for `Ctrl-C` or for the system token to be cancelled.
+//! 13. Cancel the shared token, await all spawned tasks, drop the
 //!     RTSP server.
 
 #![forbid(unsafe_code)]
@@ -41,15 +43,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use streamer_app::system::StreamerSystem;
 use streamer_domain::config::StreamerConfig;
 use streamer_domain::event::ConnectionStatus;
-use streamer_domain::port::{ArloEventSource, ArloStreamRequester, ArloThumbnailSource};
+use streamer_domain::port::{
+    AdminControl, ArloEventSource, ArloStreamRequester, ArloThumbnailSource, MetricsRecorder,
+};
 use streamer_infra_arlo::{
     ArloEventSourceAdapter, ArloStreamRequesterAdapter, ArloThumbnailSourceAdapter, boot::boot,
 };
 use streamer_infra_media::{GstMediaMultiplexer, GstPipelineRegistry, RtspServer};
-use streamer_infra_ops::{Metrics, OpsServer, Readiness};
+use streamer_infra_ops::{AdminServer, Metrics, OpsServer, Readiness};
+
+/// Env var holding the bearer token for `/admin/*` routes.
+const ADMIN_TOKEN_ENV: &str = "STREAMER_ADMIN_TOKEN";
 
 /// CLI arguments.
 #[derive(Debug, Parser)]
@@ -98,7 +107,14 @@ async fn run(config: StreamerConfig) -> Result<()> {
         Metrics::new(cameras_count, env!("CARGO_PKG_VERSION"))
             .context("failed to construct metrics registry")?,
     );
+    // Pre-warm per-camera gauges so Prometheus rows exist on first scrape.
+    for cam in &config.cameras {
+        metrics.prewarm_camera(&cam.arlo_device_id);
+    }
     let readiness = Arc::new(Readiness::new());
+
+    // -- Admin token --
+    let admin_token = read_admin_token().context("failed to read admin token")?;
 
     // -- Arlo adapter trio --
     let arlo_client = boot(&config.arlo)
@@ -129,23 +145,29 @@ async fn run(config: StreamerConfig) -> Result<()> {
         ));
 
     // -- Application layer --
+    let metrics_recorder: Arc<dyn MetricsRecorder> = metrics.clone();
     let system = StreamerSystem::spawn(
         &config,
         event_source.clone(),
         stream_requester,
         thumbnails,
         media,
+        metrics_recorder,
+        env!("CARGO_PKG_VERSION"),
     )
     .await
     .context("failed to spawn streamer system")?;
     readiness.mark_started();
     let shutdown = system.cancellation_token();
+    let arlo_connected_flag = system.arlo_connected_flag();
+    let admin_actor: Arc<dyn AdminControl> = Arc::new(system.admin_control());
 
     // -- Background watchers --
     let conn_task = spawn_connection_watcher(
         event_source.clone(),
         metrics.clone(),
         readiness.clone(),
+        arlo_connected_flag,
         shutdown.clone(),
     );
 
@@ -162,6 +184,22 @@ async fn run(config: StreamerConfig) -> Result<()> {
             error!(error = %e, "ops HTTP server exited with error");
         }
     });
+
+    // -- Admin HTTP --
+    let admin_addr: SocketAddr = config
+        .output
+        .admin_bind
+        .parse()
+        .with_context(|| format!("invalid admin_bind '{}'", config.output.admin_bind))?;
+    let admin_server =
+        AdminServer::new(admin_actor, admin_token).context("failed to construct admin server")?;
+    let admin_shutdown = shutdown.clone();
+    let admin_task = tokio::spawn(async move {
+        if let Err(e) = admin_server.serve(admin_addr, admin_shutdown).await {
+            error!(error = %e, "admin HTTP server exited with error");
+        }
+    });
+    info!(%admin_addr, "admin endpoints available under /admin/*");
 
     info!("daemon ready; waiting for shutdown signal");
 
@@ -184,17 +222,33 @@ async fn run(config: StreamerConfig) -> Result<()> {
     if let Err(e) = ops_task.await {
         warn!(error = %e, "ops-server join failed");
     }
+    if let Err(e) = admin_task.await {
+        warn!(error = %e, "admin-server join failed");
+    }
     drop(rtsp_server);
     info!("graceful shutdown complete");
     Ok(())
 }
 
+/// Read the admin token from `STREAMER_ADMIN_TOKEN`. Fails if missing
+/// or empty — we never want to run an unauthenticated admin surface.
+fn read_admin_token() -> Result<String> {
+    let token = std::env::var(ADMIN_TOKEN_ENV).with_context(|| {
+        format!("environment variable {ADMIN_TOKEN_ENV} must be set to enable /admin/*")
+    })?;
+    if token.trim().is_empty() {
+        anyhow::bail!("environment variable {ADMIN_TOKEN_ENV} must not be empty");
+    }
+    Ok(token)
+}
+
 /// Subscribe to Arlo's `connection_status` watch and mirror it into
-/// the readiness flag + metrics gauge.
+/// the readiness flag, metrics gauge, and the admin-actor's atomic.
 fn spawn_connection_watcher(
     event_source: Arc<dyn ArloEventSource>,
     metrics: Arc<Metrics>,
     readiness: Arc<Readiness>,
+    arlo_connected_flag: Arc<AtomicBool>,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -213,12 +267,14 @@ fn spawn_connection_watcher(
                         let connected = matches!(status, ConnectionStatus::Connected);
                         readiness.set_arlo_connected(connected);
                         metrics.set_arlo_connected(connected);
+                        arlo_connected_flag.store(connected, Ordering::Relaxed);
                         info!(?status, "arlo connection status changed");
                     }
                     None => {
                         warn!("connection-status stream ended");
                         readiness.set_arlo_connected(false);
                         metrics.set_arlo_connected(false);
+                        arlo_connected_flag.store(false, Ordering::Relaxed);
                         break;
                     }
                 },

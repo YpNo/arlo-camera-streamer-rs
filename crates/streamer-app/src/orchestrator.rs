@@ -52,11 +52,16 @@ use streamer_domain::camera::CameraId;
 use streamer_domain::config::CameraConfig;
 use streamer_domain::error::DomainError;
 use streamer_domain::event::CameraEvent;
-use streamer_domain::port::{ArloStreamRequester, ArloThumbnailSource, MediaMultiplexer};
+use streamer_domain::metrics::{BudgetDecision, MotionOutcome, SpliceOutcome};
+use streamer_domain::port::{
+    ArloStreamRequester, ArloThumbnailSource, MediaMultiplexer, MetricsRecorder,
+};
 use streamer_domain::state::{CameraState, StateTransition};
 
 use crate::budget::{BudgetVerdict, LiveBudgetTracker};
 use crate::debouncer::{DebouncerVerdict, MotionDebouncer};
+#[cfg(test)]
+use crate::metrics_noop::NoopRecorder;
 use crate::transition::transition;
 
 /// Per-camera state-machine task.
@@ -70,7 +75,11 @@ pub struct CameraOrchestrator {
     stream_requester: Arc<dyn ArloStreamRequester>,
     thumbnails: Arc<dyn ArloThumbnailSource>,
     media: Arc<dyn MediaMultiplexer>,
+    metrics: Arc<dyn MetricsRecorder>,
     events: mpsc::Receiver<CameraEvent>,
+    /// Inbound admin commands (e.g. force-idle, manual-wake). The
+    /// admin actor in `crate::admin` enqueues here.
+    admin: mpsc::Receiver<crate::admin::AdminCommand>,
     shutdown: CancellationToken,
 }
 
@@ -79,17 +88,29 @@ impl CameraOrchestrator {
     /// current wall-clock so a same-day restart doesn't re-grant the
     /// quota.
     ///
+    /// `metrics` is optional from the caller's perspective — pass
+    /// [`Arc::new(NoopRecorder)`](crate::metrics_noop::NoopRecorder)
+    /// in tests or when observability is disabled.
+    ///
+    /// `admin` is the inbound mailbox for
+    /// [`AdminCommand`](crate::admin::AdminCommand)s dispatched by
+    /// [`AdminControlActor`](crate::admin::AdminControlActor). Pass a
+    /// never-resolving receiver if admin commands are not used.
+    ///
     /// # Errors
     ///
     /// Returns [`DomainError::InvalidConfig`] when
     /// [`LiveBudgetTracker::new`] rejects the camera's `budget_reset`
     /// or `daily_live_budget` values.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &CameraConfig,
         stream_requester: Arc<dyn ArloStreamRequester>,
         thumbnails: Arc<dyn ArloThumbnailSource>,
         media: Arc<dyn MediaMultiplexer>,
+        metrics: Arc<dyn MetricsRecorder>,
         events: mpsc::Receiver<CameraEvent>,
+        admin: mpsc::Receiver<crate::admin::AdminCommand>,
         shutdown: CancellationToken,
     ) -> Result<Self, DomainError> {
         let now = Local::now().naive_local();
@@ -104,9 +125,39 @@ impl CameraOrchestrator {
             stream_requester,
             thumbnails,
             media,
+            metrics,
             events,
+            admin,
             shutdown,
         })
+    }
+
+    /// Convenience constructor for tests / minimal callers — wires a
+    /// [`NoopRecorder`] and a closed admin mailbox.
+    ///
+    /// # Errors
+    ///
+    /// Forwarded from [`Self::new`].
+    #[cfg(test)]
+    pub fn new_minimal(
+        config: &CameraConfig,
+        stream_requester: Arc<dyn ArloStreamRequester>,
+        thumbnails: Arc<dyn ArloThumbnailSource>,
+        media: Arc<dyn MediaMultiplexer>,
+        events: mpsc::Receiver<CameraEvent>,
+        shutdown: CancellationToken,
+    ) -> Result<Self, DomainError> {
+        let (_admin_tx, admin_rx) = mpsc::channel(1);
+        Self::new(
+            config,
+            stream_requester,
+            thumbnails,
+            media,
+            Arc::new(NoopRecorder),
+            events,
+            admin_rx,
+            shutdown,
+        )
     }
 
     /// Run the orchestrator until cancelled or the event channel closes.
@@ -120,6 +171,11 @@ impl CameraOrchestrator {
             warn!(error = %e, "media register failed; continuing — pipeline may be missing");
         }
 
+        // Tracks whether the admin mailbox is still alive. Once it
+        // closes (e.g. tests that drop the sender immediately), we
+        // skip the admin arm to avoid a busy `Some(None)` loop.
+        let mut admin_open = true;
+
         loop {
             let deadline = self.next_deadline();
 
@@ -131,6 +187,13 @@ impl CameraOrchestrator {
                     self.handle_shutdown().await;
                     return;
                 }
+                cmd = recv_admin(&mut self.admin, admin_open) => match cmd {
+                    Some(cmd) => self.handle_admin(cmd).await,
+                    None => {
+                        debug!("admin channel closed; admin endpoints disabled");
+                        admin_open = false;
+                    }
+                },
                 event = self.events.recv() => match event {
                     Some(event) => {
                         if let Err(e) = self.handle_event(event).await {
@@ -149,6 +212,95 @@ impl CameraOrchestrator {
                 }
             }
         }
+    }
+
+    /// Apply an inbound admin command and reply on its oneshot.
+    ///
+    /// Errors during reply (e.g. caller dropped the future) are logged
+    /// but never surfaced — admin requests are inherently best-effort.
+    async fn handle_admin(&mut self, cmd: crate::admin::AdminCommand) {
+        use crate::admin::AdminCommand;
+        match cmd {
+            AdminCommand::Snapshot { reply } => {
+                let snap = self.snapshot();
+                if reply.send(snap).is_err() {
+                    debug!("admin snapshot reply dropped");
+                }
+            }
+            AdminCommand::ForceIdle { reply } => {
+                if matches!(
+                    self.state,
+                    CameraState::Live { .. }
+                        | CameraState::Cooling { .. }
+                        | CameraState::Activating
+                ) {
+                    let signals = VecDeque::from([StateTransition::CooldownExpired]);
+                    if let Err(e) = self.process_signals(signals).await {
+                        warn!(error = %e, "force-idle failed");
+                    }
+                }
+                if reply.send(()).is_err() {
+                    debug!("admin force-idle reply dropped");
+                }
+            }
+            AdminCommand::ManualWake { reply } => {
+                let signal = self.intercept_budget(StateTransition::MotionDetected);
+                self.debouncer.on_motion(Instant::now());
+                if let Err(e) = self.process_signals(VecDeque::from([signal])).await {
+                    warn!(error = %e, "manual-wake failed");
+                }
+                if reply.send(()).is_err() {
+                    debug!("admin manual-wake reply dropped");
+                }
+            }
+        }
+    }
+
+    /// Build a [`CameraSnapshot`](streamer_domain::admin::CameraSnapshot)
+    /// from the current orchestrator state.
+    fn snapshot(&self) -> streamer_domain::admin::CameraSnapshot {
+        use streamer_domain::admin::CameraSnapshot;
+        let state_label = match &self.state {
+            CameraState::Idle => "idle",
+            CameraState::Activating => "activating",
+            CameraState::Live { .. } => "live",
+            CameraState::Cooling { .. } => "cooling",
+            CameraState::BatteryProtect { .. } => "battery-protect",
+            CameraState::Failed { .. } => "failed",
+        };
+        let cooling_remaining = match &self.state {
+            CameraState::Cooling { remaining } => Some(*remaining),
+            _ => None,
+        };
+        let (last_failure, retries) = match &self.state {
+            CameraState::Failed { reason, retries } => (Some(reason.clone()), *retries),
+            _ => (None, 0),
+        };
+        CameraSnapshot {
+            id: self.camera_id.clone(),
+            stream_name: self.stream_name(),
+            state: state_label.to_string(),
+            live_secs_today: self.budget.spent_secs_today(),
+            daily_budget_secs: self.budget.daily_budget_secs(),
+            cooling_remaining,
+            last_failure,
+            retries,
+        }
+    }
+
+    /// Stream name is captured from config at construction; rebuilt
+    /// here from `camera_id` because we don't currently store it.
+    /// Kept as a separate function so the small workaround is visible.
+    fn stream_name(&self) -> streamer_domain::camera::StreamName {
+        // Best-effort fallback when the camera id is also a valid
+        // stream name — otherwise the snapshot still serializes but
+        // the stream name is left as the camera id. The orchestrator
+        // does not strictly own the stream name today; future work can
+        // pass it in via the config.
+        streamer_domain::camera::StreamName::parse(self.camera_id.as_str()).unwrap_or_else(|_| {
+            streamer_domain::camera::StreamName::parse("unknown")
+                .expect("'unknown' is a valid stream name")
+        })
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -171,7 +323,10 @@ impl CameraOrchestrator {
         let signal = match event {
             CameraEvent::Motion { .. } | CameraEvent::Audio { .. } => {
                 self.debouncer.on_motion(Instant::now());
-                self.intercept_budget(StateTransition::MotionDetected)
+                let signal = self.intercept_budget(StateTransition::MotionDetected);
+                self.metrics
+                    .record_motion(&self.camera_id, classify_motion(&self.state, &signal));
+                signal
             }
             CameraEvent::Online { .. } => {
                 debug!("camera online");
@@ -186,14 +341,23 @@ impl CameraOrchestrator {
 
     /// If the daily budget is exhausted, divert `MotionDetected` into
     /// `BudgetExhausted` so the orchestrator never tries to wake the
-    /// camera in the first place.
+    /// camera in the first place. Side-effect: emits a budget-decision
+    /// metric.
     fn intercept_budget(&mut self, signal: StateTransition) -> StateTransition {
         if !matches!(signal, StateTransition::MotionDetected) {
             return signal;
         }
         match self.budget.poll(Local::now().naive_local()) {
-            BudgetVerdict::Exhausted => StateTransition::BudgetExhausted,
-            BudgetVerdict::Unlimited | BudgetVerdict::Available { .. } => signal,
+            BudgetVerdict::Exhausted => {
+                self.metrics
+                    .record_budget(&self.camera_id, BudgetDecision::Denied);
+                StateTransition::BudgetExhausted
+            }
+            BudgetVerdict::Unlimited | BudgetVerdict::Available { .. } => {
+                self.metrics
+                    .record_budget(&self.camera_id, BudgetDecision::Granted);
+                signal
+            }
         }
     }
 
@@ -226,6 +390,17 @@ impl CameraOrchestrator {
             }
             info!(?from, ?to, ?signal, "state transition");
             self.state = to.clone();
+            self.metrics
+                .record_state_change(&self.camera_id, &from, &to, signal_label(&signal));
+            // Failures: increment retry counter on Failed entry.
+            if let CameraState::Failed { retries, .. } = &to {
+                self.metrics.record_failure(&self.camera_id, *retries);
+            }
+            // Budget reset: surface the reset decision for completeness.
+            if matches!(signal, StateTransition::BudgetReset) {
+                self.metrics
+                    .record_budget(&self.camera_id, BudgetDecision::Reset);
+            }
             let follow_ups = self.apply_state_change(&from, &to).await?;
             for f in follow_ups {
                 signals.push_back(f);
@@ -290,17 +465,26 @@ impl CameraOrchestrator {
 
     /// Sequence of side-effects to bring up a fresh live session.
     async fn start_activation(&mut self) -> Vec<StateTransition> {
+        let started = Instant::now();
         let source = match self.stream_requester.request_live(&self.camera_id).await {
             Ok(s) => s,
             Err(e) => {
-                warn!(error = %e, "request_live failed");
+                let latency = elapsed_ms(started);
+                warn!(error = %e, latency_ms = latency, "request_live failed");
+                self.metrics
+                    .record_splice(&self.camera_id, SpliceOutcome::RequestFailed, latency);
                 return vec![StateTransition::Failure(e.to_string())];
             }
         };
         if let Err(e) = self.media.attach_live(&self.camera_id, source).await {
-            warn!(error = %e, "attach_live failed");
+            let latency = elapsed_ms(started);
+            warn!(error = %e, latency_ms = latency, "attach_live failed");
+            self.metrics
+                .record_splice(&self.camera_id, SpliceOutcome::AttachFailed, latency);
             return vec![StateTransition::Failure(e.to_string())];
         }
+        self.metrics
+            .record_splice(&self.camera_id, SpliceOutcome::Success, elapsed_ms(started));
         vec![StateTransition::LiveAttached]
     }
 
@@ -349,6 +533,60 @@ async fn maybe_sleep_until(deadline: Option<Instant>) {
         Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
         None => std::future::pending::<()>().await,
     }
+}
+
+/// `mpsc::Receiver::recv()` if the channel is still considered open;
+/// otherwise block forever. Lets the `tokio::select!` admin arm be
+/// disabled at runtime by flipping `open` to `false` once the receiver
+/// has reported `None`.
+async fn recv_admin(
+    rx: &mut mpsc::Receiver<crate::admin::AdminCommand>,
+    open: bool,
+) -> Option<crate::admin::AdminCommand> {
+    if open {
+        rx.recv().await
+    } else {
+        std::future::pending::<Option<crate::admin::AdminCommand>>().await
+    }
+}
+
+/// Convert a [`StateTransition`] to a stable kebab-case label for
+/// metrics. Short names keep Prometheus label cardinality bounded.
+fn signal_label(s: &StateTransition) -> &'static str {
+    match s {
+        StateTransition::MotionDetected => "motion-detected",
+        StateTransition::LiveAttached => "live-attached",
+        StateTransition::LiveReady => "live-ready",
+        StateTransition::CooldownExpired => "cooldown-expired",
+        StateTransition::MaxLiveExceeded => "max-live-exceeded",
+        StateTransition::BudgetExhausted => "budget-exhausted",
+        StateTransition::BudgetReset => "budget-reset",
+        StateTransition::Failure(_) => "failure",
+        StateTransition::BackoffElapsed => "backoff-elapsed",
+    }
+}
+
+/// Classify a fresh motion event given the *current* state and the
+/// computed signal so the recorder gets a meaningful outcome:
+/// - in `Failed`: suppressed
+/// - signal diverted to `BudgetExhausted`: budget-exhausted
+/// - already live/cooling: absorbed (debouncer handles it)
+/// - else: triggered
+fn classify_motion(state: &CameraState, signal: &StateTransition) -> MotionOutcome {
+    if matches!(signal, StateTransition::BudgetExhausted) {
+        return MotionOutcome::BudgetExhausted;
+    }
+    match state {
+        CameraState::Failed { .. } => MotionOutcome::SuppressedFailed,
+        CameraState::Live { .. } | CameraState::Cooling { .. } => MotionOutcome::Absorbed,
+        _ => MotionOutcome::Triggered,
+    }
+}
+
+/// Wall-clock milliseconds elapsed since `start`. Saturates to
+/// `u64::MAX` instead of panicking on overflow.
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Exponential backoff capped at 60 s.
@@ -522,9 +760,15 @@ mod tests {
     ) {
         let (tx, rx) = mpsc::channel(32);
         let token = CancellationToken::new();
-        let orch =
-            CameraOrchestrator::new(cfg, sr, Arc::new(StubThumbnails), media, rx, token.clone())
-                .expect("budget config valid");
+        let orch = CameraOrchestrator::new_minimal(
+            cfg,
+            sr,
+            Arc::new(StubThumbnails),
+            media,
+            rx,
+            token.clone(),
+        )
+        .expect("budget config valid");
         (orch, tx, token)
     }
 

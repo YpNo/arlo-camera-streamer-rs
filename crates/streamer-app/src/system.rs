@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -32,9 +33,11 @@ use streamer_domain::config::StreamerConfig;
 use streamer_domain::error::DomainError;
 use streamer_domain::event::CameraEvent;
 use streamer_domain::port::{
-    ArloEventSource, ArloStreamRequester, ArloThumbnailSource, MediaMultiplexer,
+    ArloEventSource, ArloStreamRequester, ArloThumbnailSource, MediaMultiplexer, MetricsRecorder,
 };
 
+use crate::admin::{ADMIN_MAILBOX_CAPACITY, AdminCommand, AdminControlActor, AdminRoute};
+use crate::metrics_noop::NoopRecorder;
 use crate::orchestrator::CameraOrchestrator;
 use crate::router::EventRouter;
 
@@ -48,6 +51,10 @@ pub const MAILBOX_CAPACITY: usize = 32;
 pub struct StreamerSystem {
     handles: Vec<JoinHandle<()>>,
     shutdown: CancellationToken,
+    admin: AdminControlActor,
+    /// Shared with the connection-status watcher in `streamer-bin` so
+    /// the admin snapshot reflects current bus state.
+    arlo_connected: Arc<AtomicBool>,
 }
 
 impl StreamerSystem {
@@ -66,6 +73,8 @@ impl StreamerSystem {
         stream_requester: Arc<dyn ArloStreamRequester>,
         thumbnails: Arc<dyn ArloThumbnailSource>,
         media: Arc<dyn MediaMultiplexer>,
+        metrics: Arc<dyn MetricsRecorder>,
+        version: &'static str,
     ) -> Result<Self, DomainError> {
         if config.cameras.is_empty() {
             return Err(DomainError::InvalidConfig(
@@ -74,13 +83,15 @@ impl StreamerSystem {
         }
 
         let shutdown = CancellationToken::new();
-        let mut routes: HashMap<_, mpsc::Sender<CameraEvent>> = HashMap::new();
+        let mut event_routes: HashMap<_, mpsc::Sender<CameraEvent>> = HashMap::new();
+        let mut admin_routes: HashMap<_, AdminRoute> = HashMap::new();
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
         for camera_cfg in &config.cameras {
-            let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
-            if routes
-                .insert(camera_cfg.arlo_device_id.clone(), tx)
+            let (event_tx, event_rx) = mpsc::channel(MAILBOX_CAPACITY);
+            let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(ADMIN_MAILBOX_CAPACITY);
+            if event_routes
+                .insert(camera_cfg.arlo_device_id.clone(), event_tx)
                 .is_some()
             {
                 warn!(
@@ -88,23 +99,80 @@ impl StreamerSystem {
                     "duplicate [[cameras]] entry; later one wins"
                 );
             }
+            admin_routes.insert(
+                camera_cfg.arlo_device_id.clone(),
+                AdminRoute {
+                    sender: admin_tx,
+                    stream_name: camera_cfg.stream_name.clone(),
+                },
+            );
             let orch = CameraOrchestrator::new(
                 camera_cfg,
                 stream_requester.clone(),
                 thumbnails.clone(),
                 media.clone(),
-                rx,
+                metrics.clone(),
+                event_rx,
+                admin_rx,
                 shutdown.child_token(),
             )?;
             handles.push(tokio::spawn(orch.run()));
         }
 
         let events = event_source.subscribe().await?;
-        let router = EventRouter::new(routes);
+        let router = EventRouter::new(event_routes);
         handles.push(tokio::spawn(router.run(events, shutdown.child_token())));
 
+        let arlo_connected = Arc::new(AtomicBool::new(false));
+        let admin = AdminControlActor::new(admin_routes, version, arlo_connected.clone());
+
         info!(cameras = config.cameras.len(), "streamer system spawned");
-        Ok(Self { handles, shutdown })
+        Ok(Self {
+            handles,
+            shutdown,
+            admin,
+            arlo_connected,
+        })
+    }
+
+    /// Spawn with no observability (passes `NoopRecorder`). Convenience
+    /// wrapper for tests and minimal embeds.
+    ///
+    /// # Errors
+    ///
+    /// See [`StreamerSystem::spawn`].
+    pub async fn spawn_no_metrics(
+        config: &StreamerConfig,
+        event_source: Arc<dyn ArloEventSource>,
+        stream_requester: Arc<dyn ArloStreamRequester>,
+        thumbnails: Arc<dyn ArloThumbnailSource>,
+        media: Arc<dyn MediaMultiplexer>,
+    ) -> Result<Self, DomainError> {
+        Self::spawn(
+            config,
+            event_source,
+            stream_requester,
+            thumbnails,
+            media,
+            Arc::new(NoopRecorder),
+            "0.0.0",
+        )
+        .await
+    }
+
+    /// Borrow the admin-control actor. Keep a clone for the lifetime of
+    /// the HTTP server.
+    #[must_use]
+    pub fn admin_control(&self) -> AdminControlActor {
+        self.admin.clone()
+    }
+
+    /// Shared `Arc<AtomicBool>` reflecting the Arlo bus connection
+    /// state. The composition root updates it from the connection
+    /// watcher; the admin snapshot reads it.
+    #[must_use]
+    pub fn arlo_connected_flag(&self) -> Arc<AtomicBool> {
+        self.arlo_connected.clone()
     }
 
     /// Cancel all tasks and wait for them to drain. Idempotent.
@@ -248,7 +316,7 @@ mod tests {
     async fn spawn_rejects_empty_camera_list() {
         let mut cfg = one_camera_config();
         cfg.cameras.clear();
-        let err = StreamerSystem::spawn(
+        let err = StreamerSystem::spawn_no_metrics(
             &cfg,
             Arc::new(StubEventSource),
             Arc::new(StubStreamRequester),
@@ -263,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_propagates_subscribe_failure() {
         let cfg = one_camera_config();
-        let err = StreamerSystem::spawn(
+        let err = StreamerSystem::spawn_no_metrics(
             &cfg,
             Arc::new(FailingEventSource),
             Arc::new(StubStreamRequester),
@@ -278,7 +346,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_then_shutdown_drains_cleanly() {
         let cfg = one_camera_config();
-        let system = StreamerSystem::spawn(
+        let system = StreamerSystem::spawn_no_metrics(
             &cfg,
             Arc::new(StubEventSource),
             Arc::new(StubStreamRequester),

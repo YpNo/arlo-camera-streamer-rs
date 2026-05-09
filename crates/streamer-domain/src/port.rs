@@ -1,19 +1,29 @@
-//! Driven port traits. Implemented by infrastructure adapters in
-//! `streamer-infra-arlo` (Arlo client wrapper) and `streamer-infra-media`
-//! (GStreamer pipelines), composed against by the application layer.
+//! Port traits — the contracts between the application layer and the
+//! outside world.
+//!
+//! - **Driven ports** (`ArloEventSource`, `ArloStreamRequester`,
+//!   `ArloThumbnailSource`, `MediaMultiplexer`, `MetricsRecorder`) are
+//!   implemented by infrastructure adapters in `streamer-infra-*`
+//!   crates. The application layer drives them.
+//! - **Driving ports** (`AdminControl`) are implemented by the
+//!   application layer and called *into* by inbound adapters
+//!   (the `/admin` axum routes in `streamer-infra-ops`).
 //!
 //! All port methods take `&self` so adapters can be wrapped in
-//! `Arc<dyn Port>` and shared across orchestrator tasks. Internal
-//! mutability is the adapter's responsibility (e.g. `Arc<RwLock<…>>`
-//! around an `ArloClient`).
+//! `Arc<dyn Port>` and shared across tasks. Internal mutability is the
+//! adapter's responsibility (e.g. `Arc<RwLock<…>>` around an
+//! `ArloClient`, or an `mpsc::Sender` for command actors).
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
+use crate::admin::{AdminError, CameraSnapshot, SystemSnapshot};
 use crate::camera::CameraId;
 use crate::error::DomainError;
 use crate::event::{CameraEvent, ConnectionStatus};
+use crate::metrics::{BudgetDecision, MotionOutcome, SpliceOutcome};
+use crate::state::CameraState;
 use crate::stream::StreamSource;
 
 /// Subscription to the inbound event bus from Arlo cloud / local hub.
@@ -115,4 +125,94 @@ pub trait MediaMultiplexer: Send + Sync {
     /// Returns [`DomainError::AdapterTransport`] if the JPEG cannot
     /// be decoded or pushed to the idle source.
     async fn refresh_thumbnail(&self, camera: &CameraId, jpeg: Bytes) -> Result<(), DomainError>;
+}
+
+/// Application-layer instrumentation sink.
+///
+/// The orchestrator and router emit business-level events here so the
+/// infrastructure layer can translate them into Prometheus counters,
+/// log lines, or any other observability backend.
+///
+/// All methods are intentionally **infallible** — instrumentation must
+/// never break the hot path. Adapters log internally on failure.
+pub trait MetricsRecorder: Send + Sync {
+    /// A camera transitioned from `from` to `to` because of `signal`.
+    /// Called *after* the new state is committed.
+    ///
+    /// `signal` is a short kebab-case string (`"motion-detected"`,
+    /// `"cooldown-expired"`, etc.) — the domain crate keeps full enum
+    /// privacy by accepting strings here so future variants don't ripple
+    /// through the recorder.
+    fn record_state_change(
+        &self,
+        camera: &CameraId,
+        from: &CameraState,
+        to: &CameraState,
+        signal: &str,
+    );
+
+    /// A motion / audio event arrived from the bus.
+    fn record_motion(&self, camera: &CameraId, outcome: MotionOutcome);
+
+    /// The orchestrator made a budget decision (live granted / denied
+    /// because exhausted / reset).
+    fn record_budget(&self, camera: &CameraId, decision: BudgetDecision);
+
+    /// The Idle → Live splice resolved with the given outcome.
+    /// `latency_ms` is the wall-clock from the trigger to the call to
+    /// `MediaMultiplexer::attach_live` returning.
+    fn record_splice(&self, camera: &CameraId, outcome: SpliceOutcome, latency_ms: u64);
+
+    /// Camera entered `Failed { retries }` — track for alerting.
+    fn record_failure(&self, camera: &CameraId, retries: u32);
+}
+
+/// Inbound application-layer port for the admin HTTP surface.
+///
+/// Implemented by `streamer-app`. Called *by* `streamer-infra-ops`
+/// when a `/admin/*` request lands on axum.
+///
+/// All methods are async because the app-layer impl forwards the call
+/// to per-camera orchestrator tasks via `mpsc` and awaits the reply.
+#[async_trait]
+pub trait AdminControl: Send + Sync {
+    /// Return a snapshot of the system: per-camera state, debouncer
+    /// remaining, budget left, last failure, etc. Read-only — never
+    /// blocks the orchestrators for long.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::Unavailable`] if any orchestrator is
+    /// unresponsive (the call timed out waiting on its mailbox).
+    async fn snapshot(&self) -> Result<SystemSnapshot, AdminError>;
+
+    /// Snapshot of a single camera. Returns
+    /// [`AdminError::UnknownCamera`] when not configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::UnknownCamera`] when `camera` is not
+    /// configured or [`AdminError::Unavailable`] when the orchestrator
+    /// task did not respond in time.
+    async fn camera_snapshot(&self, camera: &CameraId) -> Result<CameraSnapshot, AdminError>;
+
+    /// Force a camera into `Idle`, detaching any live stream.
+    /// Idempotent: a no-op if already idle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::UnknownCamera`] if `camera` is not
+    /// configured, or [`AdminError::Unavailable`] on a control-plane
+    /// transport failure.
+    async fn force_idle(&self, camera: &CameraId) -> Result<(), AdminError>;
+
+    /// Manually wake the camera (synthetic motion event), respecting
+    /// the daily budget. Useful for healthcheck dashboards.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::UnknownCamera`] if `camera` is not
+    /// configured, or [`AdminError::Unavailable`] on a control-plane
+    /// transport failure.
+    async fn manual_wake(&self, camera: &CameraId) -> Result<(), AdminError>;
 }

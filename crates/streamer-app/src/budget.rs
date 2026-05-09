@@ -123,6 +123,20 @@ impl LiveBudgetTracker {
         }
     }
 
+    /// Total seconds spent in `Live` for the current day window.
+    /// Used by the admin snapshot.
+    #[must_use]
+    pub fn spent_secs_today(&self) -> u64 {
+        u64::try_from(self.spent_today.num_seconds().max(0)).unwrap_or(0)
+    }
+
+    /// Configured daily budget in seconds (`0` when disabled).
+    /// Used by the admin snapshot.
+    #[must_use]
+    pub fn daily_budget_secs(&self) -> u64 {
+        u64::try_from(self.daily_budget.num_seconds().max(0)).unwrap_or(0)
+    }
+
     /// Wall-clock moment of the *next* reset relative to `now`.
     /// The orchestrator schedules a `BudgetReset` signal against this.
     #[must_use]

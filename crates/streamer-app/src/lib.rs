@@ -23,15 +23,19 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admin;
 pub mod budget;
 pub mod debouncer;
+pub mod metrics_noop;
 pub mod orchestrator;
 pub mod router;
 pub mod system;
 pub mod transition;
 
+pub use admin::{AdminCommand, AdminControlActor};
 pub use budget::{BudgetVerdict, LiveBudgetTracker};
 pub use debouncer::{DebouncerVerdict, MotionDebouncer};
+pub use metrics_noop::NoopRecorder;
 pub use orchestrator::CameraOrchestrator;
 pub use router::EventRouter;
 pub use system::{MAILBOX_CAPACITY, StreamerSystem};
