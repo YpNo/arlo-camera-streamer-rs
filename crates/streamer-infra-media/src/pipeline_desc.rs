@@ -5,18 +5,23 @@
 //! them trivially unit-testable and lets ops grep the launch syntax
 //! without instantiating a pipeline.
 //!
-//! ## Splicing strategy (Phase 4)
+//! ## Splicing strategy
 //!
-//! Phase 4 ships a **factory-restart on transition** strategy: each
-//! camera's `RTSPMediaFactory` is bound to either an idle launch
-//! string or a live launch string, and `attach_live` / `detach_live`
-//! swap the binding. Existing RTSP clients reconnect within ~1 s.
+//! Two builders coexist during the Phase-6 cutover:
 //!
-//! Frigate handles the reconnect transparently because its rtsp client
-//! retries on EOS. Trade-off: a brief gap of black frames at the
-//! transition; vastly simpler than a seamless `input-selector` splice.
-//! The seamless variant remains a Phase 6 polish target — the
-//! [`crate::splice::KeyframeWatcher`] scaffolding is in place for it.
+//! - **Phase 4 (legacy, scheduled for removal in Phase 6.6)**:
+//!   [`idle_launch_string`] / [`live_launch_string`] — each camera's
+//!   `RTSPMediaFactory` is rebound between idle and live; existing
+//!   clients reconnect within ~1 s (works for Frigate, breaks VLC).
+//!
+//! - **Phase 6 (seamless)**: [`combined_launch_string`] — one
+//!   persistent factory binding, idle and live both feed an
+//!   `input-selector` switched at an IDR boundary by
+//!   [`crate::splice::KeyframeWatcher`]. Connected clients never
+//!   disconnect. Both video branches use `h264parse config-interval=-1`
+//!   so SPS/PPS inline at every IDR, letting the receiver re-init its
+//!   decoder transparently across the splice (idle's x264 params and
+//!   live's Arlo H.264 params differ).
 //!
 //! ## Audio
 //!
@@ -40,6 +45,42 @@ use streamer_domain::config::{DashOutput, HlsOutput, OutputConfig};
 use streamer_domain::stream::Codec;
 
 use crate::idle_source::{IDLE_FPS, IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH};
+
+/// H.264 RTP payload type pinned on the live video appsrc's caps.
+/// **Must** match `webrtc_pipeline::H264_PT` (pinned in the WebRTC
+/// offer to Arlo); a future cleanup will consolidate the two literals.
+pub(crate) const LIVE_RTP_H264_PT: i32 = 103;
+
+/// Framerate of the **unified** Phase-7 splice: both the idle branch
+/// and the decoded live branch are forced to this rate before the
+/// `input-selector`, so the single downstream `x264enc` sees a
+/// continuous stream regardless of which branch is active.
+pub(crate) const UNIFIED_FPS: u32 = 15;
+
+/// GOP length of the downstream encoder, in frames. 2 s at
+/// [`UNIFIED_FPS`]. A pad-probe-driven force-key-unit at each splice
+/// keeps clients in sync regardless of GOP boundaries.
+pub(crate) const UNIFIED_GOP: u32 = UNIFIED_FPS * 2;
+
+/// Downstream encoder name (looked up by [`crate::gst_pipeline`] at
+/// `media-configure` time so it can dispatch force-key-unit events on
+/// each idle↔live splice).
+pub(crate) const UNIFIED_ENCODER_NAME: &str = "video_enc";
+
+// ── Phase 8 (Opus audio bridging) — deferred ────────────────────────
+// A first attempt fed Arlo's Opus RTP into a second `input-selector`
+// via an `appsrc → rtpopusdepay → opusdec` chain. This blocked
+// gst-rtsp-server's media prep because the decoder can't establish
+// its src caps until the first RTP buffer arrives, so PAUSED preroll
+// never completed and the shared media was rebuilt in a loop (no
+// client could play idle either). Reverted to silent-AAC linear
+// audio to restore the daemon.
+//
+// The clean fix (Phase 8b) is to decode audio + video on the
+// **webrtcbin side** and push **raw samples** (not RTP) through
+// `LiveRtpSink`. The persistent pipeline's appsrc then advertises
+// known raw caps (`I420` / `S16LE`) at construction time, no
+// decoder-waits-for-data preroll issue.
 
 /// Effective sink configuration, materialized per-camera.
 ///
@@ -134,6 +175,12 @@ pub fn idle_video_desc(idle: &IdleKind) -> String {
 /// Idle video — JPEG still loop. The actual JPEG bytes are pushed via
 /// `appsrc` at runtime; the description here covers the post-`appsrc`
 /// chain.
+///
+/// `h264parse config-interval=-1` emits SPS/PPS in front of every IDR
+/// (`key-int-max=1` makes every encoded frame an IDR). This is what
+/// lets a receiver re-initialize its decoder transparently across the
+/// Phase-6 idle↔live splice — the cost over `config-interval=1` is a
+/// negligible ~30 B per frame of SPS/PPS.
 #[must_use]
 pub fn idle_video_jpeg_desc() -> String {
     format!(
@@ -142,11 +189,12 @@ pub fn idle_video_jpeg_desc() -> String {
          ! jpegdec ! videoconvert ! videorate \
          ! video/x-raw,framerate={IDLE_FPS}/1 \
          ! x264enc tune=zerolatency bitrate=512 key-int-max=1 \
-         ! h264parse config-interval=1"
+         ! h264parse config-interval=-1"
     )
 }
 
 /// Idle video — synthetic black frame with a `STANDBY · …` overlay.
+/// See [`idle_video_jpeg_desc`] for the `config-interval=-1` rationale.
 #[must_use]
 pub fn idle_video_synthetic_desc(overlay: &str) -> String {
     let escaped = escape_gst_text(overlay);
@@ -156,7 +204,7 @@ pub fn idle_video_synthetic_desc(overlay: &str) -> String {
          ! textoverlay text=\"{escaped}\" valignment=bottom halignment=center font-desc=\"Sans 24\" \
          ! videoconvert \
          ! x264enc tune=zerolatency bitrate=512 key-int-max=1 \
-         ! h264parse config-interval=1"
+         ! h264parse config-interval=-1"
     )
 }
 
@@ -181,8 +229,11 @@ pub fn live_video_desc(url: &str, codec_hint: Option<Codec>) -> String {
         Some(Codec::H265) => "rtph265depay ! h265parse config-interval=1",
         None => "parsebin",
     };
+    // `protocols=tcp`: the source is our localhost loopback RTSP, which
+    // serves TCP-interleaved only — UDP SETUP attempts would just be
+    // rejected and retried.
     format!(
-        "rtspsrc location=\"{escaped_url}\" latency=200 protocols=tcp+udp \
+        "rtspsrc location=\"{escaped_url}\" latency=200 protocols=tcp \
          do-retransmission=true name=live_src \
          ! {depay_chain}"
     )
@@ -208,9 +259,12 @@ pub fn idle_launch_string(idle: &IdleKind) -> String {
     )
 }
 
-/// Build the live-mode launch string for a camera. The `rtspsrc` must
-/// be reachable; if it isn't, the factory will surface an error on the
-/// next client connect attempt.
+/// Build the legacy Phase-4 live-mode launch string for a camera.
+///
+/// **Video-only.** Used by the factory-rebind splice strategy. Kept
+/// only as a backward-compatible builder for callers that still rely
+/// on the rebind flow; the production registry now uses
+/// [`combined_launch_string`] and never rebinds the factory.
 #[must_use]
 pub fn live_launch_string(url: &str, codec_hint: Option<Codec>) -> String {
     let pay = match codec_hint {
@@ -220,12 +274,105 @@ pub fn live_launch_string(url: &str, codec_hint: Option<Codec>) -> String {
         Some(Codec::H264) | None => "rtph264pay name=pay0 pt=96",
     };
     format!(
-        "( {video} ! {pay} \
-            rtspsrc location=\"{url_audio}\" latency=200 name=live_audio \
-            ! {audio} ! rtpmp4apay name=pay1 pt=97 )",
+        "( {video} ! {pay} )",
         video = live_video_desc(url, codec_hint),
-        url_audio = escape_gst_property(url),
-        audio = live_audio_desc(),
+    )
+}
+
+/// Build the **Phase-7 unified-encoder** per-camera launch string — a
+/// single persistent pipeline where the `input-selector` operates on
+/// **raw I420** and a single `x264enc` downstream produces the H.264
+/// output. Video-only splice; audio is silent AAC at all times (Opus
+/// bridging deferred to Phase 8b — see the module-level note).
+///
+/// ```text
+///   {idle raw I420 chain}                                 ! sel.sink_0
+///   appsrc ! rtph264depay ! avdec_h264 ! normalize-caps   ! sel.sink_1
+///   input-selector name=sel ! x264enc name=video_enc
+///                           ! h264parse ! rtph264pay name=pay0
+///   audiotestsrc wave=silence ...                         ! rtpmp4apay name=pay1
+/// ```
+///
+/// - Both video branches share `video/x-raw, format=I420, {W}x{H},
+///   framerate={UNIFIED_FPS}/1`; switching `active-pad` is a clean
+///   frame-boundary swap.
+/// - A force-key-unit event is sent to `video_enc` on each splice
+///   (in [`crate::gst_pipeline`]) so the encoder emits an IDR right
+///   after the content switch.
+/// - Clients see one continuous H.264 stream with stable SPS/PPS.
+#[must_use]
+pub fn combined_launch_string(idle: &IdleKind) -> String {
+    // `queue` before every selector sink pad: decouples per-branch
+    // streaming threads and prevents an initially-quiet branch (the
+    // live appsrc before any RTP arrives) from blocking downstream
+    // preroll on the active branch.
+    format!(
+        "( {idle_raw} ! queue max-size-buffers=8 leaky=downstream ! sel.sink_0 \
+            {live_decode} ! queue max-size-buffers=8 leaky=downstream ! sel.sink_1 \
+            input-selector name=sel sync-streams=true cache-buffers=false \
+            ! queue max-size-buffers=8 leaky=downstream \
+            ! x264enc name={enc} tune=zerolatency speed-preset=superfast \
+                      bitrate=2048 key-int-max={gop} \
+            ! video/x-h264,stream-format=byte-stream,alignment=au \
+            ! h264parse config-interval=1 \
+            ! rtph264pay name=pay0 pt=96 config-interval=1 \
+            {audio} ! rtpmp4apay name=pay1 pt=97 )",
+        idle_raw = idle_raw_chain(idle),
+        live_decode = live_decode_chain(),
+        enc = UNIFIED_ENCODER_NAME,
+        gop = UNIFIED_GOP,
+        audio = idle_audio_desc(),
+    )
+}
+
+/// Idle producer normalized to the **unified raw caps** (Phase 7).
+/// Same content as the legacy [`idle_video_desc`] but with the
+/// encoder/parser tail stripped — the selector forwards raw frames to
+/// a single downstream encoder.
+fn idle_raw_chain(idle: &IdleKind) -> String {
+    match idle {
+        IdleKind::JpegStill { .. } => format!(
+            "appsrc name=idle_jpeg_src is-live=true format=time \
+             caps=image/jpeg,framerate={IDLE_FPS}/1 \
+             ! jpegdec ! videoconvert ! videoscale ! videorate \
+             ! video/x-raw,format=I420,\
+width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1"
+        ),
+        IdleKind::Synthetic { overlay, .. } => {
+            let escaped = escape_gst_text(overlay);
+            // Pin the full unified caps at the end of the chain so
+            // both branches present identical caps to the selector.
+            // The intermediate width/height/framerate filter forces
+            // videotestsrc to that resolution and rate; the trailing
+            // filter adds `format=I420` once videoconvert has done
+            // the format swap.
+            format!(
+                "videotestsrc pattern=black is-live=true \
+                 ! video/x-raw,\
+width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1 \
+                 ! textoverlay text=\"{escaped}\" valignment=bottom halignment=center \
+                              font-desc=\"Sans 24\" \
+                 ! videoconvert \
+                 ! video/x-raw,format=I420,\
+width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1"
+            )
+        }
+    }
+}
+
+/// Live RTP → decode → normalize-to-unified-caps. Output raw I420
+/// matching [`idle_raw_chain`]'s caps so the selector can splice
+/// cleanly into the shared downstream encoder.
+fn live_decode_chain() -> String {
+    let pt = LIVE_RTP_H264_PT;
+    format!(
+        "appsrc name=live_rtp_src is-live=true do-timestamp=true format=time \
+         caps=\"application/x-rtp,media=video,encoding-name=H264,\
+clock-rate=90000,payload={pt}\" \
+         ! rtph264depay ! avdec_h264 \
+         ! videoconvert ! videoscale ! videorate \
+         ! video/x-raw,format=I420,\
+width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1"
     )
 }
 
@@ -415,5 +562,104 @@ mod tests {
     #[test]
     fn escape_gst_text_passes_through_safe_input() {
         assert_eq!(escape_gst_text("plain text"), "plain text");
+    }
+
+    fn synth_idle() -> IdleKind {
+        IdleKind::Synthetic {
+            stream_name: name(),
+            overlay: "STANDBY".to_string(),
+        }
+    }
+
+    #[test]
+    fn combined_launch_string_has_idle_and_live_video_branches_into_selector() {
+        let s = combined_launch_string(&synth_idle());
+        assert!(s.contains("sel.sink_0"));
+        assert!(s.contains("appsrc name=live_rtp_src"));
+        assert!(s.contains("rtph264depay"));
+        assert!(s.contains("sel.sink_1"));
+        assert!(s.contains("input-selector name=sel"));
+        assert!(s.contains("sync-streams=true"));
+    }
+
+    #[test]
+    fn combined_launch_string_has_exactly_one_video_encoder_and_payloader() {
+        // Phase-7 contract: one downstream video encoder produces the
+        // whole H.264 stream so VLC never sees an SPS/PPS change at
+        // the splice.
+        let s = combined_launch_string(&synth_idle());
+        assert_eq!(s.matches("x264enc").count(), 1);
+        assert!(s.contains(&format!("name={UNIFIED_ENCODER_NAME}")));
+        assert_eq!(s.matches("rtph264pay").count(), 1);
+        assert!(s.contains("rtph264pay name=pay0 pt=96"));
+        assert_eq!(s.matches("h264parse").count(), 1);
+    }
+
+    #[test]
+    fn combined_launch_string_decodes_live_via_avdec_h264() {
+        let s = combined_launch_string(&synth_idle());
+        assert!(s.contains("avdec_h264"));
+        assert!(s.contains("videoscale"));
+        assert!(s.contains("videorate"));
+    }
+
+    #[test]
+    fn combined_launch_string_pins_unified_raw_caps_on_both_video_branches() {
+        let s = combined_launch_string(&synth_idle());
+        let expected = format!(
+            "format=I420,width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1"
+        );
+        assert!(
+            s.matches(&expected).count() >= 2,
+            "expected unified raw video caps on both branches in:\n{s}"
+        );
+    }
+
+    #[test]
+    fn combined_launch_string_emits_silent_audio_pay1() {
+        // Phase 8 Opus bridging is deferred; audio stays silent AAC.
+        let s = combined_launch_string(&synth_idle());
+        assert!(s.contains("audiotestsrc"));
+        assert!(s.contains("wave=silence"));
+        assert!(!s.contains("opusdec"));
+        assert!(!s.contains("rtpopusdepay"));
+        assert!(!s.contains("live_audio_src"));
+        assert!(!s.contains("sel_a"));
+        assert_eq!(s.matches("rtpmp4apay").count(), 1);
+        assert!(s.contains("rtpmp4apay name=pay1 pt=97"));
+    }
+
+    #[test]
+    fn combined_launch_string_pins_live_h264_pt_103() {
+        assert_eq!(LIVE_RTP_H264_PT, 103);
+        let s = combined_launch_string(&synth_idle());
+        assert!(s.contains("payload=103"));
+        assert!(s.contains("encoding-name=H264"));
+    }
+
+    #[test]
+    fn combined_launch_string_jpeg_idle_variant_builds() {
+        let s = combined_launch_string(&IdleKind::JpegStill {
+            jpeg: bytes::Bytes::from_static(&[0]),
+        });
+        assert!(s.contains("appsrc name=idle_jpeg_src"));
+        assert!(s.contains("jpegdec"));
+        assert!(s.contains("sel.sink_0"));
+        assert!(s.contains("appsrc name=live_rtp_src"));
+        assert!(s.contains("sel.sink_1"));
+    }
+
+    #[test]
+    fn combined_launch_string_payloader_has_rtp_level_safety_net() {
+        let s = combined_launch_string(&synth_idle());
+        assert!(s.contains("rtph264pay name=pay0 pt=96 config-interval=1"));
+    }
+
+    #[test]
+    fn combined_launch_string_encoder_uses_unified_gop() {
+        let s = combined_launch_string(&synth_idle());
+        assert!(s.contains(&format!("key-int-max={UNIFIED_GOP}")));
+        assert!(s.contains("tune=zerolatency"));
+        assert!(s.contains("speed-preset=superfast"));
     }
 }

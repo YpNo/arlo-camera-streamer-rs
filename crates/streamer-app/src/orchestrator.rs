@@ -15,9 +15,10 @@
 //!
 //! `Idle → Activating → Live` is asynchronous: the pure
 //! [`transition`](crate::transition()) reducer flips the state to
-//! `Activating`, then the orchestrator drives `request_live` →
-//! `attach_live` and emits a follow-up `LiveAttached` signal that flips
-//! to `Live`. If either call fails the orchestrator emits
+//! `Activating`, then the orchestrator drives `attach_live` (which
+//! owns the WebRTC offer/answer round-trip via the `WebrtcSignaler`)
+//! and emits a follow-up `LiveAttached` signal that flips
+//! to `Live`. If it fails the orchestrator emits
 //! `Failure(reason)` instead, which puts us in `Failed { retries }`
 //! with an exponential backoff timer.
 //!
@@ -54,7 +55,7 @@ use streamer_domain::error::DomainError;
 use streamer_domain::event::CameraEvent;
 use streamer_domain::metrics::{BudgetDecision, MotionOutcome, SpliceOutcome};
 use streamer_domain::port::{
-    ArloStreamRequester, ArloThumbnailSource, MediaMultiplexer, MetricsRecorder,
+    ArloThumbnailSource, MediaMultiplexer, MetricsRecorder, WebrtcSignaler,
 };
 use streamer_domain::state::{CameraState, StateTransition};
 
@@ -72,7 +73,7 @@ pub struct CameraOrchestrator {
     budget: LiveBudgetTracker,
     /// Set when in [`CameraState::Failed`]; cleared on transition out.
     failed_deadline: Option<Instant>,
-    stream_requester: Arc<dyn ArloStreamRequester>,
+    signaler: Arc<dyn WebrtcSignaler>,
     thumbnails: Arc<dyn ArloThumbnailSource>,
     media: Arc<dyn MediaMultiplexer>,
     metrics: Arc<dyn MetricsRecorder>,
@@ -105,7 +106,7 @@ impl CameraOrchestrator {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &CameraConfig,
-        stream_requester: Arc<dyn ArloStreamRequester>,
+        signaler: Arc<dyn WebrtcSignaler>,
         thumbnails: Arc<dyn ArloThumbnailSource>,
         media: Arc<dyn MediaMultiplexer>,
         metrics: Arc<dyn MetricsRecorder>,
@@ -122,7 +123,7 @@ impl CameraOrchestrator {
             debouncer,
             budget,
             failed_deadline: None,
-            stream_requester,
+            signaler,
             thumbnails,
             media,
             metrics,
@@ -141,7 +142,7 @@ impl CameraOrchestrator {
     #[cfg(test)]
     pub fn new_minimal(
         config: &CameraConfig,
-        stream_requester: Arc<dyn ArloStreamRequester>,
+        signaler: Arc<dyn WebrtcSignaler>,
         thumbnails: Arc<dyn ArloThumbnailSource>,
         media: Arc<dyn MediaMultiplexer>,
         events: mpsc::Receiver<CameraEvent>,
@@ -150,7 +151,7 @@ impl CameraOrchestrator {
         let (_admin_tx, admin_rx) = mpsc::channel(1);
         Self::new(
             config,
-            stream_requester,
+            signaler,
             thumbnails,
             media,
             Arc::new(NoopRecorder),
@@ -445,6 +446,7 @@ impl CameraOrchestrator {
                 CameraState::Failed { retries, .. },
             ) => {
                 let _ = self.media.detach_live(&self.camera_id).await;
+                self.stop_arlo_live().await;
                 self.budget.on_live_ended(Local::now().naive_local());
                 self.debouncer.on_idle();
                 self.failed_deadline = Some(Instant::now() + backoff_duration(*retries));
@@ -463,20 +465,16 @@ impl CameraOrchestrator {
         Ok(follow_ups)
     }
 
-    /// Sequence of side-effects to bring up a fresh live session.
+    /// Bring up a fresh live session. The media adapter owns the
+    /// WebRTC offer/answer round-trip (via `signaler`); the orchestrator
+    /// only drives the splice and keeps teardown symmetric.
     async fn start_activation(&mut self) -> Vec<StateTransition> {
         let started = Instant::now();
-        let source = match self.stream_requester.request_live(&self.camera_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                let latency = elapsed_ms(started);
-                warn!(error = %e, latency_ms = latency, "request_live failed");
-                self.metrics
-                    .record_splice(&self.camera_id, SpliceOutcome::RequestFailed, latency);
-                return vec![StateTransition::Failure(e.to_string())];
-            }
-        };
-        if let Err(e) = self.media.attach_live(&self.camera_id, source).await {
+        if let Err(e) = self
+            .media
+            .attach_live(&self.camera_id, self.signaler.as_ref())
+            .await
+        {
             let latency = elapsed_ms(started);
             warn!(error = %e, latency_ms = latency, "attach_live failed");
             self.metrics
@@ -496,6 +494,7 @@ impl CameraOrchestrator {
         if let Err(e) = self.media.detach_live(&self.camera_id).await {
             warn!(error = %e, "detach_live failed");
         }
+        self.stop_arlo_live().await;
         self.budget.on_live_ended(Local::now().naive_local());
         self.debouncer.on_idle();
         match self.thumbnails.last_thumbnail(&self.camera_id).await {
@@ -518,6 +517,20 @@ impl CameraOrchestrator {
                 warn!(error = %e, "detach on shutdown failed");
             }
             self.budget.on_live_ended(Local::now().naive_local());
+        }
+        // Always release any upstream session (also covers `Activating`
+        // mid-negotiation) — idempotent; a leaked WebRTC session keeps
+        // the camera streaming and drains its battery.
+        self.stop_arlo_live().await;
+    }
+
+    /// Best-effort release of the upstream Arlo signaling session.
+    /// Paired with every `media.detach_live` so no live exit — cooldown,
+    /// max-live, failure, or shutdown — can leave a WebRTC session
+    /// draining the camera battery.
+    async fn stop_arlo_live(&self) {
+        if let Err(e) = self.signaler.teardown(&self.camera_id).await {
+            warn!(error = %e, "teardown failed (upstream session may linger)");
         }
     }
 }
@@ -615,7 +628,7 @@ mod tests {
     use streamer_domain::config::CooldownConfig;
     use streamer_domain::event::ConnectionStatus;
     use streamer_domain::port::ArloEventSource;
-    use streamer_domain::stream::StreamSource;
+    use streamer_domain::stream::SignalingAnswer;
     use tokio::sync::Mutex;
 
     // ---------- Hand-written test doubles ----------
@@ -626,33 +639,53 @@ mod tests {
     // Hand-written doubles keep tests readable.
 
     #[derive(Default)]
-    struct StubStreamRequester {
-        responses: Mutex<VecDeque<Result<StreamSource, DomainError>>>,
+    struct StubSignaler {
+        responses: Mutex<VecDeque<Result<SignalingAnswer, DomainError>>>,
         calls: Mutex<u32>,
+        stops: Mutex<u32>,
     }
 
-    impl StubStreamRequester {
-        fn with_responses(rs: Vec<Result<StreamSource, DomainError>>) -> Arc<Self> {
+    impl StubSignaler {
+        fn with_responses(rs: Vec<Result<SignalingAnswer, DomainError>>) -> Arc<Self> {
             Arc::new(Self {
                 responses: Mutex::new(VecDeque::from(rs)),
                 calls: Mutex::new(0),
+                stops: Mutex::new(0),
             })
         }
+        /// Number of `negotiate` calls.
         async fn call_count(&self) -> u32 {
             *self.calls.lock().await
+        }
+        /// Number of `teardown` calls.
+        async fn stop_count(&self) -> u32 {
+            *self.stops.lock().await
         }
     }
 
     #[async_trait]
-    impl ArloStreamRequester for StubStreamRequester {
-        async fn request_live(&self, _camera: &CameraId) -> Result<StreamSource, DomainError> {
+    impl WebrtcSignaler for StubSignaler {
+        async fn ice_servers(
+            &self,
+            _camera: &CameraId,
+        ) -> Result<Vec<streamer_domain::stream::IceServer>, DomainError> {
+            Ok(vec![])
+        }
+        async fn negotiate(
+            &self,
+            _camera: &CameraId,
+            _offer_sdp: String,
+        ) -> Result<SignalingAnswer, DomainError> {
             *self.calls.lock().await += 1;
-            self.responses.lock().await.pop_front().unwrap_or_else(|| {
-                Ok(StreamSource {
-                    url: "rtsps://default".to_string(),
-                    codec_hint: None,
-                })
-            })
+            self.responses
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| Ok(ok_answer()))
+        }
+        async fn teardown(&self, _camera: &CameraId) -> Result<(), DomainError> {
+            *self.stops.lock().await += 1;
+            Ok(())
         }
     }
 
@@ -696,13 +729,17 @@ mod tests {
         }
         async fn attach_live(
             &self,
-            _camera: &CameraId,
-            source: StreamSource,
+            camera: &CameraId,
+            signaler: &dyn WebrtcSignaler,
         ) -> Result<(), DomainError> {
+            // Mirror the real adapter: the media leg owns the WebRTC
+            // offer/answer round-trip. Surfacing the negotiate error as
+            // an attach failure is exactly the production contract.
+            let answer = signaler.negotiate(camera, "offer".to_string()).await?;
             self.events
                 .lock()
                 .await
-                .push(MediaCall::AttachLive(source.url));
+                .push(MediaCall::AttachLive(answer.session_id));
             Ok(())
         }
         async fn detach_live(&self, _camera: &CameraId) -> Result<(), DomainError> {
@@ -751,7 +788,7 @@ mod tests {
 
     fn build(
         cfg: &CameraConfig,
-        sr: Arc<dyn ArloStreamRequester>,
+        sr: Arc<dyn WebrtcSignaler>,
         media: Arc<dyn MediaMultiplexer>,
     ) -> (
         CameraOrchestrator,
@@ -772,10 +809,10 @@ mod tests {
         (orch, tx, token)
     }
 
-    fn ok_source() -> StreamSource {
-        StreamSource {
-            url: "rtsps://test".to_string(),
-            codec_hint: None,
+    fn ok_answer() -> SignalingAnswer {
+        SignalingAnswer {
+            answer_sdp: "v=0\r\n".to_string(),
+            session_id: "sess-test".to_string(),
         }
     }
 
@@ -784,7 +821,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn motion_drives_idle_to_live_to_idle() {
         let cfg = camera_cfg(2, 60);
-        let sr = StubStreamRequester::with_responses(vec![Ok(ok_source())]);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
         let media = RecordingMedia::new();
         let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
 
@@ -810,15 +847,20 @@ mod tests {
         assert!(calls.contains(&MediaCall::Register));
         assert!(calls.iter().any(|c| matches!(c, MediaCall::AttachLive(_))));
         assert!(calls.contains(&MediaCall::DetachLive));
+        // Teardown is symmetric: every detach pairs with a teardown.
+        assert!(
+            sr.stop_count().await >= 1,
+            "teardown must pair with detach on the Live→Idle exit"
+        );
         assert_eq!(sr.call_count().await, 1);
     }
 
     // ---------- Failure path ----------
 
     #[tokio::test(start_paused = true)]
-    async fn request_live_failure_enters_failed_state() {
+    async fn negotiate_failure_enters_failed_state() {
         let cfg = camera_cfg(2, 60);
-        let sr = StubStreamRequester::with_responses(vec![Err(DomainError::AdapterTransport(
+        let sr = StubSignaler::with_responses(vec![Err(DomainError::AdapterTransport(
             "auth lost".to_string(),
         ))]);
         let media = RecordingMedia::new();
@@ -836,8 +878,15 @@ mod tests {
         token.cancel();
         handle.await.unwrap();
 
-        // request_live was called, attach was NOT (since the request failed).
+        // negotiate was called once (inside attach_live); no AttachLive
+        // was recorded since negotiation failed.
         assert_eq!(sr.call_count().await, 1);
+        // The Failed exit must still release the upstream session
+        // (battery safety) even though negotiate errored.
+        assert!(
+            sr.stop_count().await >= 1,
+            "teardown must run on the Failed exit"
+        );
         let calls = media.calls().await;
         assert!(!calls.iter().any(|c| matches!(c, MediaCall::AttachLive(_))));
     }
@@ -848,7 +897,7 @@ mod tests {
     async fn max_live_cap_forces_return_to_idle_under_sustained_motion() {
         // debounce=10s (long), max=2s (short). The cap should win.
         let cfg = camera_cfg(10, 2);
-        let sr = StubStreamRequester::with_responses(vec![Ok(ok_source())]);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
         let media = RecordingMedia::new();
         let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
 
@@ -878,7 +927,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn shutdown_during_idle_exits_cleanly() {
         let cfg = camera_cfg(60, 300);
-        let sr = StubStreamRequester::with_responses(vec![]);
+        let sr = StubSignaler::with_responses(vec![]);
         let media = RecordingMedia::new();
         let (orch, _tx, token) = build(&cfg, sr, media.clone());
 
@@ -908,7 +957,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn online_event_does_not_drive_state() {
         let cfg = camera_cfg(60, 300);
-        let sr = StubStreamRequester::with_responses(vec![]);
+        let sr = StubSignaler::with_responses(vec![]);
         let media = RecordingMedia::new();
         let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
 
@@ -924,7 +973,7 @@ mod tests {
         token.cancel();
         handle.await.unwrap();
 
-        // request_live was never called.
+        // negotiate was never called.
         assert_eq!(sr.call_count().await, 0);
     }
 

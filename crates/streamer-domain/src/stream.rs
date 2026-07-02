@@ -1,11 +1,39 @@
 //! Live-stream source descriptors.
 //!
-//! The [`StreamSource`] is what `ArloStreamRequester::request_live`
-//! returns to the orchestrator — a URL plus an optional codec hint.
-//! The hint short-circuits the GStreamer probe on subsequent
-//! activations once the codec is known.
+//! [`SignalingAnswer`] is the result of a WebRTC offer/answer exchange
+//! with the Arlo gateway, returned by
+//! [`WebrtcSignaler::negotiate`](crate::port::WebrtcSignaler::negotiate).
+//! The media adapter (GStreamer `webrtcbin`) generates the offer, hands
+//! it to the signaler, and applies the returned answer SDP.
+//!
+//! [`StreamSource`] / [`Codec`] are the legacy URL-based descriptors
+//! still used by the GStreamer pipeline registry; they are retired when
+//! the `webrtcbin` media leg lands.
 
 use serde::{Deserialize, Serialize};
+
+/// One ICE (STUN/TURN) server the media adapter must configure on its
+/// WebRTC peer **before** generating the offer. Sourced from Arlo's
+/// `sipInfo` via [`WebrtcSignaler::ice_servers`](crate::port::WebrtcSignaler::ice_servers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IceServer {
+    /// e.g. `stun:host:port` or `turn:host:port?transport=udp`.
+    pub url: String,
+    /// TURN long-term username (`None` for STUN).
+    pub username: Option<String>,
+    /// TURN long-term credential (`None` for STUN).
+    pub credential: Option<String>,
+}
+
+/// The Arlo gateway's WebRTC SDP answer to our offer, plus the session
+/// id it echoed back (needed for teardown / `sessionDisconnected`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalingAnswer {
+    /// `FreeSWITCH`'s SDP answer, applied verbatim by the media adapter.
+    pub answer_sdp: String,
+    /// Opaque session id the gateway assigned to this live call.
+    pub session_id: String,
+}
 
 /// Video codec emitted by an Arlo camera.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -15,6 +43,24 @@ pub enum Codec {
     H264,
     /// H.265 / HEVC (newer Arlo Pro / Ultra models).
     H265,
+}
+
+/// Address-family policy the media adapter applies when configuring the
+/// WebRTC ICE agent's local candidate gathering.
+///
+/// The default is [`Dual`](Self::Dual) — let libnice gather both IPv4
+/// and IPv6 candidates. Some networks (broken IPv6 routing to the Arlo
+/// gateway, restrictive corporate firewalls) benefit from
+/// [`Ipv4`](Self::Ipv4), which restricts gathering to IPv4 only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IceAddressFamily {
+    /// Gather both IPv4 and IPv6 candidates (libnice default).
+    #[default]
+    Dual,
+    /// Gather only IPv4 candidates. Recommended when IPv6 to the Arlo
+    /// gateway is broken or slow to fail over.
+    Ipv4,
 }
 
 /// A live stream the media adapter must attach.

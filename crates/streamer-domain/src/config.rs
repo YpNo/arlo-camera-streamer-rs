@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::camera::{CameraId, StreamName};
-use crate::stream::Codec;
+use crate::stream::{Codec, IceAddressFamily};
 
 /// Top-level streamer configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -18,10 +18,27 @@ pub struct StreamerConfig {
     pub arlo: ArloConfig,
     /// Output endpoints (RTSP / HLS / DASH) and ops sockets.
     pub output: OutputConfig,
+    /// WebRTC ingestion knobs (ICE address family, …). Absent in the
+    /// TOML means `WebrtcConfig::default()` — dual-stack ICE.
+    #[serde(default)]
+    pub webrtc: WebrtcConfig,
     /// Cameras to expose. Empty list is a configuration error caught
     /// at boot in `streamer-bin`.
     #[serde(default)]
     pub cameras: Vec<CameraConfig>,
+}
+
+/// WebRTC-ingestion knobs applied to every camera's `webrtcbin`.
+///
+/// Kept separate from [`OutputConfig`] because these settings feed the
+/// **ingestion** side (offer generation, ICE gathering) rather than an
+/// output sink.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WebrtcConfig {
+    /// Address-family policy for local ICE candidate gathering.
+    /// Default is dual-stack (IPv4 + IPv6).
+    #[serde(default)]
+    pub ice_address_family: IceAddressFamily,
 }
 
 /// Arlo cloud authentication and session-cache configuration.
@@ -43,28 +60,44 @@ pub struct ArloConfig {
     pub mfa: MfaConfig,
 }
 
-/// MFA strategy. `imap` is the production headless choice; `stdin` is
-/// for first-time setup or container debugging.
+/// MFA strategy. `email` is the preferred headless choice; `push`
+/// approves on the Arlo mobile app (also headless); `sms` requires an
+/// interactive stdin prompt.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MfaConfig {
-    /// Headless: poll an IMAP mailbox for the OTP message.
-    Imap(ImapMfaConfig),
-    /// Interactive: prompt on stdin. Not suitable for production.
-    Stdin,
+    /// Email MFA. Uses IMAP polling when a mailbox is locatable
+    /// (`host` or `provider`) and credentials are set; otherwise
+    /// prompts for the OTP on stdin.
+    Email(EmailMfaConfig),
+    /// SMS MFA. Prompts via stdin. Not suitable for headless environments.
+    Sms,
+    /// Push MFA. Arlo sends an approval prompt to the account's Arlo
+    /// mobile app; the streamer polls until the user taps "Approve".
+    /// Fully headless once the app is installed and signed in.
+    Push(PushMfaConfig),
 }
 
-/// IMAP mailbox details for headless MFA. Password is **never** stored
-/// in the TOML file — only the name of the env var holding it.
+/// Email MFA configuration. Password is **never** stored in the TOML
+/// file — only the name of the env var holding it.
+///
+/// IMAP auto-retrieval kicks in when the mailbox is locatable (an
+/// explicit `host` *or* a known `provider`) **and** `user` **and**
+/// `password_env` are all set. Any other shape falls back to a stdin
+/// OTP prompt.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ImapMfaConfig {
-    /// IMAP server host (e.g. `imap.gmail.com`).
-    pub host: String,
-    /// IMAP user / mailbox.
-    pub user: String,
-    /// Name of the env var that holds the password. The streamer reads
-    /// `std::env::var(password_env)` at boot.
-    pub password_env: String,
+pub struct EmailMfaConfig {
+    /// Explicit IMAP server host (e.g. `imap.gmail.com`). Optional when
+    /// `provider` is set; an explicit host always wins over `provider`.
+    pub host: Option<String>,
+    /// Well-known IMAP provider shortcut — one of `gmail`, `outlook`,
+    /// `hotmail`, `yahoo`. Expands to that provider's IMAP host when
+    /// `host` is omitted. Optional.
+    pub provider: Option<String>,
+    /// IMAP user / mailbox. Optional.
+    pub user: Option<String>,
+    /// Name of the env var that holds the password. Optional.
+    pub password_env: Option<String>,
     /// IMAP port (defaults to 993 for IMAPS).
     #[serde(default = "default_imap_port")]
     pub port: u16,
@@ -72,6 +105,36 @@ pub struct ImapMfaConfig {
 
 const fn default_imap_port() -> u16 {
     993
+}
+
+/// Push MFA timing. Both fields are optional in TOML and fall back to
+/// the documented defaults — `[arlo.mfa] kind = "push"` alone is valid.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PushMfaConfig {
+    /// Seconds between `finishAuth` polls while waiting for the user to
+    /// approve the prompt in the Arlo app.
+    #[serde(default = "default_push_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Hard ceiling, in seconds, on the whole push-approval wait before
+    /// boot fails. Long enough for the user to reach their phone.
+    #[serde(default = "default_push_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for PushMfaConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: default_push_poll_interval_secs(),
+            timeout_secs: default_push_timeout_secs(),
+        }
+    }
+}
+
+const fn default_push_poll_interval_secs() -> u64 {
+    3
+}
+const fn default_push_timeout_secs() -> u64 {
+    120
 }
 
 /// All output-side configuration: stream endpoints + ops sockets.
@@ -226,7 +289,7 @@ mod tests {
             session_cache_path = "/tmp/session.json"
 
             [arlo.mfa]
-            kind         = "imap"
+            kind         = "email"
             host         = "imap.example.com"
             user         = "u@example.com"
             password_env = "ARLO_IMAP_PW"
@@ -244,12 +307,163 @@ mod tests {
         assert!(cfg.output.hls.is_none());
         assert!(cfg.output.dash.is_none());
         match &cfg.arlo.mfa {
-            MfaConfig::Imap(imap) => {
-                assert_eq!(imap.host, "imap.example.com");
-                assert_eq!(imap.port, 993);
+            MfaConfig::Email(email_cfg) => {
+                assert_eq!(email_cfg.host.as_deref(), Some("imap.example.com"));
+                assert_eq!(email_cfg.port, 993);
             }
-            MfaConfig::Stdin => panic!("expected imap mfa"),
+            MfaConfig::Sms | MfaConfig::Push(_) => panic!("expected email mfa"),
         }
+    }
+
+    #[test]
+    fn parses_email_mfa_with_provider_shortcut() {
+        let toml_input = r#"
+            [arlo]
+            email              = "owner@example.com"
+            password_env       = "ARLO_PASSWORD"
+            session_cache_path = "/tmp/session.json"
+
+            [arlo.mfa]
+            kind         = "email"
+            provider     = "gmail"
+            user         = "u@example.com"
+            password_env = "ARLO_IMAP_PW"
+
+            [output.rtsp]
+        "#;
+        let cfg: StreamerConfig = toml::from_str(toml_input).expect("valid provider config");
+        match &cfg.arlo.mfa {
+            MfaConfig::Email(email_cfg) => {
+                assert_eq!(email_cfg.provider.as_deref(), Some("gmail"));
+                assert_eq!(email_cfg.host, None);
+                assert_eq!(email_cfg.user.as_deref(), Some("u@example.com"));
+                assert_eq!(email_cfg.port, 993);
+            }
+            MfaConfig::Sms | MfaConfig::Push(_) => panic!("expected email mfa"),
+        }
+    }
+
+    #[test]
+    fn parses_push_mfa_with_default_timing() {
+        let toml_input = r#"
+            [arlo]
+            email              = "owner@example.com"
+            password_env       = "ARLO_PASSWORD"
+            session_cache_path = "/tmp/session.json"
+
+            [arlo.mfa]
+            kind = "push"
+
+            [output.rtsp]
+        "#;
+        let cfg: StreamerConfig = toml::from_str(toml_input).expect("valid push config");
+        match &cfg.arlo.mfa {
+            MfaConfig::Push(push) => {
+                assert_eq!(push.poll_interval_secs, 3);
+                assert_eq!(push.timeout_secs, 120);
+            }
+            MfaConfig::Email(_) | MfaConfig::Sms => panic!("expected push mfa"),
+        }
+    }
+
+    #[test]
+    fn parses_push_mfa_with_explicit_timing() {
+        let toml_input = r#"
+            [arlo]
+            email              = "owner@example.com"
+            password_env       = "ARLO_PASSWORD"
+            session_cache_path = "/tmp/session.json"
+
+            [arlo.mfa]
+            kind              = "push"
+            poll_interval_secs = 5
+            timeout_secs       = 90
+
+            [output.rtsp]
+        "#;
+        let cfg: StreamerConfig = toml::from_str(toml_input).expect("valid push config");
+        match &cfg.arlo.mfa {
+            MfaConfig::Push(push) => {
+                assert_eq!(push.poll_interval_secs, 5);
+                assert_eq!(push.timeout_secs, 90);
+            }
+            MfaConfig::Email(_) | MfaConfig::Sms => panic!("expected push mfa"),
+        }
+    }
+
+    #[test]
+    fn webrtc_defaults_to_dual_stack_when_absent() {
+        // Config with no [webrtc] section falls back to the default
+        // (dual-stack ICE) — this is the migration path for existing
+        // deployments.
+        let toml_input = r#"
+            [arlo]
+            email              = "u@example.com"
+            password_env       = "ARLO_PW"
+            session_cache_path = "/tmp/session.json"
+
+            [arlo.mfa]
+            kind = "sms"
+
+            [output.rtsp]
+
+            [[cameras]]
+            arlo_device_id = "X"
+            stream_name    = "front_door"
+        "#;
+        let cfg: StreamerConfig = toml::from_str(toml_input).expect("valid config");
+        assert_eq!(cfg.webrtc.ice_address_family, IceAddressFamily::Dual);
+    }
+
+    #[test]
+    fn parses_ipv4_only_webrtc_section() {
+        let toml_input = r#"
+            [arlo]
+            email              = "u@example.com"
+            password_env       = "ARLO_PW"
+            session_cache_path = "/tmp/session.json"
+
+            [arlo.mfa]
+            kind = "sms"
+
+            [output.rtsp]
+
+            [webrtc]
+            ice_address_family = "ipv4"
+
+            [[cameras]]
+            arlo_device_id = "X"
+            stream_name    = "front_door"
+        "#;
+        let cfg: StreamerConfig = toml::from_str(toml_input).expect("valid config");
+        assert_eq!(cfg.webrtc.ice_address_family, IceAddressFamily::Ipv4);
+    }
+
+    #[test]
+    fn rejects_unknown_ice_address_family_value() {
+        let toml_input = r#"
+            [arlo]
+            email              = "u@example.com"
+            password_env       = "ARLO_PW"
+            session_cache_path = "/tmp/session.json"
+
+            [arlo.mfa]
+            kind = "sms"
+
+            [output.rtsp]
+
+            [webrtc]
+            ice_address_family = "ipv6"
+
+            [[cameras]]
+            arlo_device_id = "X"
+            stream_name    = "front_door"
+        "#;
+        let err = toml::from_str::<StreamerConfig>(toml_input).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("ipv6"),
+            "expected the unknown variant to surface in the error, got: {err}"
+        );
     }
 
     #[test]
@@ -261,7 +475,7 @@ mod tests {
             session_cache_path = "/tmp/session.json"
 
             [arlo.mfa]
-            kind = "stdin"
+            kind = "sms"
 
             [output.rtsp]
 

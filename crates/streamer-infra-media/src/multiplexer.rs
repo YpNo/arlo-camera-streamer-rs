@@ -26,28 +26,35 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
 use streamer_domain::camera::{CameraId, StreamName};
-use streamer_domain::config::{CameraConfig, OutputConfig};
+use streamer_domain::config::{CameraConfig, OutputConfig, WebrtcConfig};
 use streamer_domain::error::DomainError;
-use streamer_domain::port::MediaMultiplexer;
-use streamer_domain::stream::{Codec, StreamSource};
+use streamer_domain::port::{MediaMultiplexer, WebrtcSignaler};
+use streamer_domain::stream::Codec;
 
 use crate::codec_cache::CodecCache;
 use crate::error::MediaError;
 use crate::idle_source::{IdleKind, select_idle_source};
+use crate::live_rtp_sink::LiveRtpSink;
 use crate::pipeline_desc::{OutputBranches, build_output_branches};
+use crate::webrtc_pipeline::WebrtcLive;
 
 /// Trait that the GStreamer-backed registry implements. The seam keeps
 /// the multiplexer testable without spinning up a real pipeline.
 ///
 /// Implementations are responsible for:
-/// - Building the per-camera pipeline + RTSP mount in `register`.
-/// - Performing the idle ↔ live transition atomically in
-///   `set_live_source` / `clear_live_source`.
+/// - Building the per-camera persistent pipeline + RTSP mount in
+///   `register` (the Phase-6 [`crate::pipeline_desc::combined_launch_string`]:
+///   idle + appsrc-live + input-selector + single payloader).
+/// - Returning a [`LiveRtpSink`] from `attach_live_sink` and wiring the
+///   IDR-aligned `input-selector` swap to live (see
+///   [`crate::splice::KeyframeWatcher`]).
+/// - Returning the camera to idle on `detach_live_sink` — also
+///   IDR-aligned to avoid showing partial GOPs to clients.
 /// - Pushing fresh JPEGs to the idle `appsrc` in `refresh_thumbnail`.
 #[async_trait]
 pub trait PipelineRegistry: Send + Sync {
-    /// Bring up an idle pipeline for `camera`. Must be safe to call
-    /// once per camera; calling twice for the same camera surfaces
+    /// Bring up the persistent pipeline + RTSP mount for `camera`.
+    /// Calling twice for the same camera surfaces
     /// [`MediaError::AlreadyRegistered`] (the multiplexer translates
     /// that into `Ok(())` for the port-level contract).
     async fn register(
@@ -57,16 +64,19 @@ pub trait PipelineRegistry: Send + Sync {
         outputs: OutputBranches,
     ) -> Result<(), MediaError>;
 
-    /// Switch the camera to live mode. The implementation owns the
-    /// IDR-aligned splice (see [`crate::splice::KeyframeWatcher`]).
-    async fn set_live_source(
-        &self,
-        camera: &CameraId,
-        source: StreamSource,
-    ) -> Result<(), MediaError>;
+    /// Arm the camera's live ingestion. Returns a [`LiveRtpSink`] the
+    /// caller pushes inbound H.264 RTP into. The implementation flips
+    /// the camera's `input-selector` to the live branch on the first
+    /// live raw frame — clients connected to the idle stream see a
+    /// seamless transition (no EOS, no reconnect, no client-side
+    /// decoder re-init).
+    async fn attach_live_sink(&self, camera: &CameraId) -> Result<LiveRtpSink, MediaError>;
 
-    /// Revert the camera to idle mode.
-    async fn clear_live_source(&self, camera: &CameraId) -> Result<(), MediaError>;
+    /// Revert the camera to idle. The implementation flips the
+    /// `input-selector` back on the next idle IDR and stops draining
+    /// the live sink. Idempotent: calling on a camera that isn't live
+    /// is `Ok(())`.
+    async fn detach_live_sink(&self, camera: &CameraId) -> Result<(), MediaError>;
 
     /// Replace the idle still frame for the camera (best-effort).
     async fn refresh_thumbnail(&self, camera: &CameraId, jpeg: Bytes) -> Result<(), MediaError>;
@@ -76,6 +86,9 @@ pub trait PipelineRegistry: Send + Sync {
 pub struct GstMediaMultiplexer<R: PipelineRegistry> {
     registry: Arc<R>,
     output: OutputConfig,
+    /// WebRTC ingestion knobs (ICE address family, …) applied to every
+    /// camera's `WebrtcLive`. Read-only after construction.
+    webrtc: WebrtcConfig,
     /// Camera → stream-name mapping captured at boot. Read-only after
     /// construction.
     cameras: HashMap<CameraId, StreamName>,
@@ -84,6 +97,11 @@ pub struct GstMediaMultiplexer<R: PipelineRegistry> {
     /// Codec hint cache (seeded from config, updated by the registry
     /// after first parsebin emission).
     codec_cache: Arc<CodecCache>,
+    /// Active per-camera webrtcbin live pipeline. Present only between
+    /// `attach_live` and `detach_live`. The live RTP byte sink is
+    /// owned by the registry now (Phase 6.3); the multiplexer just
+    /// keeps the WebRTC ingestion pipeline alive for the session.
+    live: tokio::sync::Mutex<HashMap<CameraId, WebrtcLive>>,
 }
 
 impl<R: PipelineRegistry> GstMediaMultiplexer<R> {
@@ -91,7 +109,12 @@ impl<R: PipelineRegistry> GstMediaMultiplexer<R> {
     ///
     /// Builds the camera→stream-name index and seeds the codec cache
     /// from the per-camera `codec_hint` field.
-    pub fn new(registry: Arc<R>, output: OutputConfig, cameras: &[CameraConfig]) -> Self {
+    pub fn new(
+        registry: Arc<R>,
+        output: OutputConfig,
+        webrtc: WebrtcConfig,
+        cameras: &[CameraConfig],
+    ) -> Self {
         let cam_map = cameras
             .iter()
             .map(|c| (c.arlo_device_id.clone(), c.stream_name.clone()))
@@ -103,9 +126,11 @@ impl<R: PipelineRegistry> GstMediaMultiplexer<R> {
         Self {
             registry,
             output,
+            webrtc,
             cameras: cam_map,
             registered: RwLock::new(HashSet::new()),
             codec_cache: Arc::new(CodecCache::with_initial(codec_seed)),
+            live: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -163,34 +188,49 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         }
     }
 
-    #[instrument(skip(self, source), fields(camera = %camera, url = %source.url))]
+    #[instrument(skip(self, signaler), fields(camera = %camera))]
     async fn attach_live(
         &self,
         camera: &CameraId,
-        source: StreamSource,
+        signaler: &dyn WebrtcSignaler,
     ) -> Result<(), DomainError> {
         self.ensure_registered(camera).await?;
-        // Apply cached codec hint when the orchestrator didn't supply one.
-        let source = match source.codec_hint {
-            Some(_) => source,
-            None => StreamSource {
-                url: source.url,
-                codec_hint: self.codec_cache.get(camera).await,
-            },
-        };
-        self.registry
-            .set_live_source(camera, source)
-            .await
-            .map_err(Into::into)
+        // 1. ICE servers (sipInfo) → 2. registry hands back the live
+        // RTP byte sink for the camera's persistent pipeline (the
+        // appsrc on the live branch of the combined launch); the
+        // registry arms its IDR-aligned `input-selector` flip in the
+        // background → 3. webrtcbin builds the offer pushing inbound
+        // RTP into the sink → 4. signaler carries it to Arlo →
+        // 5. answer applied. Connected RTSP clients see a seamless
+        // switch idle → live at the next live IDR.
+        let ice = signaler.ice_servers(camera).await?;
+        let sink = self.registry.attach_live_sink(camera).await?;
+        let webrtc = WebrtcLive::start(camera, &ice, signaler, sink, &self.webrtc).await?;
+        // On a failure above, the registry's pump task naturally exits
+        // once the dropped sink closes the channel; the orchestrator
+        // pairs the failure exit with `WebrtcSignaler::teardown`.
+        self.live.lock().await.insert(camera.clone(), webrtc);
+        // `Codec` import is retained for `codec_cache` use elsewhere;
+        // the live launch no longer takes a codec hint at this layer.
+        let _ = Codec::H264;
+        Ok(())
     }
 
     #[instrument(skip(self), fields(camera = %camera))]
     async fn detach_live(&self, camera: &CameraId) -> Result<(), DomainError> {
         self.ensure_registered(camera).await?;
-        self.registry
-            .clear_live_source(camera)
-            .await
-            .map_err(Into::into)
+        // Arm the reverse splice: the registry flips its
+        // `input-selector` back to the idle branch on the next idle
+        // IDR. Then tear down the webrtcbin pipeline (its appsink
+        // callback stops pushing into the sink; the registry's pump
+        // task exits when the channel closes). The Arlo signaling
+        // session is released by the orchestrator
+        // (`WebrtcSignaler::teardown`, paired with this).
+        let res = self.registry.detach_live_sink(camera).await;
+        if let Some(mut webrtc) = self.live.lock().await.remove(camera) {
+            webrtc.shutdown();
+        }
+        res.map_err(Into::into)
     }
 
     #[instrument(skip(self, jpeg), fields(camera = %camera, bytes = jpeg.len()))]
@@ -211,25 +251,47 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use streamer_domain::config::{CameraConfig, CooldownConfig, OutputConfig, RtspOutput};
-    use streamer_domain::stream::{Codec, StreamSource};
+    use streamer_domain::stream::{Codec, SignalingAnswer};
+
+    /// Minimal `WebrtcSignaler` double — `attach_live` is stubbed in
+    /// Phase 1, so it never actually calls these.
+    struct NoopSignaler;
+    #[async_trait]
+    impl WebrtcSignaler for NoopSignaler {
+        async fn ice_servers(
+            &self,
+            _camera: &CameraId,
+        ) -> Result<Vec<streamer_domain::stream::IceServer>, DomainError> {
+            Ok(vec![])
+        }
+        async fn negotiate(
+            &self,
+            _camera: &CameraId,
+            _offer_sdp: String,
+        ) -> Result<SignalingAnswer, DomainError> {
+            Ok(SignalingAnswer {
+                answer_sdp: "v=0\r\n".to_string(),
+                session_id: "s".to_string(),
+            })
+        }
+        async fn teardown(&self, _camera: &CameraId) -> Result<(), DomainError> {
+            Ok(())
+        }
+    }
 
     /// In-memory recorder for `PipelineRegistry` calls.
     #[derive(Default)]
     struct FakeRegistry {
         registered: Mutex<Vec<(CameraId, IdleKind, OutputBranches)>>,
-        live_set: Mutex<Vec<(CameraId, StreamSource)>>,
-        live_clear: Mutex<Vec<CameraId>>,
+        attached: Mutex<Vec<CameraId>>,
+        detached: Mutex<Vec<CameraId>>,
         thumbs: Mutex<Vec<(CameraId, Bytes)>>,
         register_returns: Mutex<Option<MediaError>>,
-        set_live_returns: Mutex<Option<MediaError>>,
     }
 
     impl FakeRegistry {
         fn rig_register_error(&self, e: MediaError) {
             *self.register_returns.lock().unwrap() = Some(e);
-        }
-        fn rig_set_live_error(&self, e: MediaError) {
-            *self.set_live_returns.lock().unwrap() = Some(e);
         }
     }
 
@@ -250,19 +312,19 @@ mod tests {
                 .push((camera.clone(), idle, outputs));
             Ok(())
         }
-        async fn set_live_source(
+        async fn attach_live_sink(
             &self,
             camera: &CameraId,
-            source: StreamSource,
-        ) -> Result<(), MediaError> {
-            if let Some(e) = self.set_live_returns.lock().unwrap().take() {
-                return Err(e);
-            }
-            self.live_set.lock().unwrap().push((camera.clone(), source));
-            Ok(())
+        ) -> Result<LiveRtpSink, MediaError> {
+            self.attached.lock().unwrap().push(camera.clone());
+            // The receiver is dropped immediately — the multiplexer
+            // test only exercises the `ensure_registered` guard (real
+            // attach drives webrtcbin and isn't unit-tested).
+            let (sink, _rx) = LiveRtpSink::new();
+            Ok(sink)
         }
-        async fn clear_live_source(&self, camera: &CameraId) -> Result<(), MediaError> {
-            self.live_clear.lock().unwrap().push(camera.clone());
+        async fn detach_live_sink(&self, camera: &CameraId) -> Result<(), MediaError> {
+            self.detached.lock().unwrap().push(camera.clone());
             Ok(())
         }
         async fn refresh_thumbnail(
@@ -313,7 +375,7 @@ mod tests {
     }
 
     fn mux(reg: Arc<FakeRegistry>) -> GstMediaMultiplexer<FakeRegistry> {
-        GstMediaMultiplexer::new(reg, output_config(), &cameras())
+        GstMediaMultiplexer::new(reg, output_config(), WebrtcConfig::default(), &cameras())
     }
 
     #[tokio::test]
@@ -367,16 +429,9 @@ mod tests {
         let m = mux(reg.clone());
         // Should succeed at the port level even though the registry returned AlreadyRegistered.
         m.register(&cam("CAM_A")).await.expect("ok");
-        // And subsequent attaches see the camera as registered.
-        m.attach_live(
-            &cam("CAM_A"),
-            StreamSource {
-                url: "rtsps://x".to_string(),
-                codec_hint: Some(Codec::H264),
-            },
-        )
-        .await
-        .expect("attach ok");
+        // And the camera is then recorded as registered (detach no
+        // longer errors with UnknownCamera).
+        m.detach_live(&cam("CAM_A")).await.expect("registered");
     }
 
     #[tokio::test]
@@ -384,95 +439,17 @@ mod tests {
         let reg = Arc::new(FakeRegistry::default());
         let m = mux(reg);
         let err = m
-            .attach_live(
-                &cam("CAM_A"),
-                StreamSource {
-                    url: "rtsps://x".to_string(),
-                    codec_hint: None,
-                },
-            )
+            .attach_live(&cam("CAM_A"), &NoopSignaler)
             .await
             .expect_err("must fail");
         assert!(matches!(err, DomainError::UnknownCamera(_)));
     }
 
-    #[tokio::test]
-    async fn attach_live_uses_explicit_codec_hint_when_present() {
-        let reg = Arc::new(FakeRegistry::default());
-        let m = mux(reg.clone());
-        m.register(&cam("CAM_A")).await.unwrap();
-        m.attach_live(
-            &cam("CAM_A"),
-            StreamSource {
-                url: "rtsps://x".to_string(),
-                codec_hint: Some(Codec::H264),
-            },
-        )
-        .await
-        .unwrap();
-        let calls = reg.live_set.lock().unwrap();
-        assert_eq!(calls[0].1.codec_hint, Some(Codec::H264));
-    }
-
-    #[tokio::test]
-    async fn attach_live_falls_back_to_cached_codec_hint_when_source_missing_one() {
-        let reg = Arc::new(FakeRegistry::default());
-        let m = mux(reg.clone());
-        // CAM_A was seeded with Codec::H265 in cameras().
-        m.register(&cam("CAM_A")).await.unwrap();
-        m.attach_live(
-            &cam("CAM_A"),
-            StreamSource {
-                url: "rtsps://x".to_string(),
-                codec_hint: None,
-            },
-        )
-        .await
-        .unwrap();
-        let calls = reg.live_set.lock().unwrap();
-        assert_eq!(calls[0].1.codec_hint, Some(Codec::H265));
-    }
-
-    #[tokio::test]
-    async fn attach_live_with_no_hint_and_no_cache_passes_through_none() {
-        let reg = Arc::new(FakeRegistry::default());
-        let m = mux(reg.clone());
-        // CAM_B has no configured codec_hint.
-        m.register(&cam("CAM_B")).await.unwrap();
-        m.attach_live(
-            &cam("CAM_B"),
-            StreamSource {
-                url: "rtsps://x".to_string(),
-                codec_hint: None,
-            },
-        )
-        .await
-        .unwrap();
-        let calls = reg.live_set.lock().unwrap();
-        assert!(calls[0].1.codec_hint.is_none());
-    }
-
-    #[tokio::test]
-    async fn attach_live_propagates_registry_failure() {
-        let reg = Arc::new(FakeRegistry::default());
-        reg.rig_set_live_error(MediaError::SpliceTimeout { timeout_secs: 5 });
-        let m = mux(reg.clone());
-        m.register(&cam("CAM_A")).await.unwrap();
-        let err = m
-            .attach_live(
-                &cam("CAM_A"),
-                StreamSource {
-                    url: "rtsps://x".to_string(),
-                    codec_hint: Some(Codec::H264),
-                },
-            )
-            .await
-            .expect_err("must fail");
-        match err {
-            DomainError::AdapterTransport(msg) => assert!(msg.contains("splice timeout")),
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
+    // `attach_live` for a *registered* camera now drives a real
+    // `webrtcbin` pipeline + live signaling — that needs GStreamer and
+    // the camera, so it is exercised by the Phase 4 manual gate, not a
+    // unit test (same rationale as `gst_pipeline.rs` coverage exclusion).
+    // The pre-register guard above stays unit-tested.
 
     #[tokio::test]
     async fn detach_live_before_register_returns_unknown_camera() {
@@ -483,14 +460,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detach_live_clears_registry_when_known() {
+    async fn detach_live_forwards_to_registry_when_known() {
         let reg = Arc::new(FakeRegistry::default());
         let m = mux(reg.clone());
         m.register(&cam("CAM_A")).await.unwrap();
         m.detach_live(&cam("CAM_A")).await.unwrap();
-        let cleared = reg.live_clear.lock().unwrap();
-        assert_eq!(cleared.len(), 1);
-        assert_eq!(cleared[0], cam("CAM_A"));
+        let detached = reg.detached.lock().unwrap();
+        assert_eq!(detached.len(), 1);
+        assert_eq!(detached[0], cam("CAM_A"));
     }
 
     #[tokio::test]

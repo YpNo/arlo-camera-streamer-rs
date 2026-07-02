@@ -33,7 +33,7 @@ use streamer_domain::config::StreamerConfig;
 use streamer_domain::error::DomainError;
 use streamer_domain::event::CameraEvent;
 use streamer_domain::port::{
-    ArloEventSource, ArloStreamRequester, ArloThumbnailSource, MediaMultiplexer, MetricsRecorder,
+    ArloEventSource, ArloThumbnailSource, MediaMultiplexer, MetricsRecorder, WebrtcSignaler,
 };
 
 use crate::admin::{ADMIN_MAILBOX_CAPACITY, AdminCommand, AdminControlActor, AdminRoute};
@@ -70,7 +70,7 @@ impl StreamerSystem {
     pub async fn spawn(
         config: &StreamerConfig,
         event_source: Arc<dyn ArloEventSource>,
-        stream_requester: Arc<dyn ArloStreamRequester>,
+        signaler: Arc<dyn WebrtcSignaler>,
         thumbnails: Arc<dyn ArloThumbnailSource>,
         media: Arc<dyn MediaMultiplexer>,
         metrics: Arc<dyn MetricsRecorder>,
@@ -108,7 +108,7 @@ impl StreamerSystem {
             );
             let orch = CameraOrchestrator::new(
                 camera_cfg,
-                stream_requester.clone(),
+                signaler.clone(),
                 thumbnails.clone(),
                 media.clone(),
                 metrics.clone(),
@@ -144,14 +144,14 @@ impl StreamerSystem {
     pub async fn spawn_no_metrics(
         config: &StreamerConfig,
         event_source: Arc<dyn ArloEventSource>,
-        stream_requester: Arc<dyn ArloStreamRequester>,
+        signaler: Arc<dyn WebrtcSignaler>,
         thumbnails: Arc<dyn ArloThumbnailSource>,
         media: Arc<dyn MediaMultiplexer>,
     ) -> Result<Self, DomainError> {
         Self::spawn(
             config,
             event_source,
-            stream_requester,
+            signaler,
             thumbnails,
             media,
             Arc::new(NoopRecorder),
@@ -204,11 +204,11 @@ mod tests {
     use std::path::PathBuf;
     use streamer_domain::camera::{CameraId, StreamName};
     use streamer_domain::config::{
-        ArloConfig, CameraConfig, CooldownConfig, ImapMfaConfig, MfaConfig, OutputConfig,
-        RtspOutput,
+        ArloConfig, CameraConfig, CooldownConfig, EmailMfaConfig, MfaConfig, OutputConfig,
+        RtspOutput, WebrtcConfig,
     };
     use streamer_domain::event::ConnectionStatus;
-    use streamer_domain::stream::StreamSource;
+    use streamer_domain::stream::SignalingAnswer;
 
     // Minimal stub adapters for spawn-time wiring tests.
     struct StubEventSource;
@@ -237,14 +237,27 @@ mod tests {
         }
     }
 
-    struct StubStreamRequester;
+    struct StubSignaler;
     #[async_trait]
-    impl ArloStreamRequester for StubStreamRequester {
-        async fn request_live(&self, _camera: &CameraId) -> Result<StreamSource, DomainError> {
-            Ok(StreamSource {
-                url: "rtsps://test".to_string(),
-                codec_hint: None,
+    impl WebrtcSignaler for StubSignaler {
+        async fn ice_servers(
+            &self,
+            _camera: &CameraId,
+        ) -> Result<Vec<streamer_domain::stream::IceServer>, DomainError> {
+            Ok(vec![])
+        }
+        async fn negotiate(
+            &self,
+            _camera: &CameraId,
+            _offer_sdp: String,
+        ) -> Result<SignalingAnswer, DomainError> {
+            Ok(SignalingAnswer {
+                answer_sdp: "v=0\r\n".to_string(),
+                session_id: "sess".to_string(),
             })
+        }
+        async fn teardown(&self, _camera: &CameraId) -> Result<(), DomainError> {
+            Ok(())
         }
     }
 
@@ -265,7 +278,7 @@ mod tests {
         async fn attach_live(
             &self,
             _camera: &CameraId,
-            _source: StreamSource,
+            _signaler: &dyn WebrtcSignaler,
         ) -> Result<(), DomainError> {
             Ok(())
         }
@@ -287,10 +300,11 @@ mod tests {
                 email: "u@example.com".to_string(),
                 password_env: "PW".to_string(),
                 session_cache_path: PathBuf::from("/tmp/x.json"),
-                mfa: MfaConfig::Imap(ImapMfaConfig {
-                    host: "h".to_string(),
-                    user: "u".to_string(),
-                    password_env: "IPW".to_string(),
+                mfa: MfaConfig::Email(EmailMfaConfig {
+                    host: Some("h".to_string()),
+                    provider: None,
+                    user: Some("u".to_string()),
+                    password_env: Some("IPW".to_string()),
                     port: 993,
                 }),
             },
@@ -303,6 +317,7 @@ mod tests {
                 metrics_bind: "127.0.0.1:9090".to_string(),
                 admin_bind: "127.0.0.1:9091".to_string(),
             },
+            webrtc: WebrtcConfig::default(),
             cameras: vec![CameraConfig {
                 arlo_device_id: CameraId::new("CAM"),
                 stream_name: StreamName::parse("cam").unwrap(),
@@ -319,7 +334,7 @@ mod tests {
         let err = StreamerSystem::spawn_no_metrics(
             &cfg,
             Arc::new(StubEventSource),
-            Arc::new(StubStreamRequester),
+            Arc::new(StubSignaler),
             Arc::new(StubThumbnails),
             Arc::new(StubMedia),
         )
@@ -334,7 +349,7 @@ mod tests {
         let err = StreamerSystem::spawn_no_metrics(
             &cfg,
             Arc::new(FailingEventSource),
-            Arc::new(StubStreamRequester),
+            Arc::new(StubSignaler),
             Arc::new(StubThumbnails),
             Arc::new(StubMedia),
         )
@@ -349,7 +364,7 @@ mod tests {
         let system = StreamerSystem::spawn_no_metrics(
             &cfg,
             Arc::new(StubEventSource),
-            Arc::new(StubStreamRequester),
+            Arc::new(StubSignaler),
             Arc::new(StubThumbnails),
             Arc::new(StubMedia),
         )

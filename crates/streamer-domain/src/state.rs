@@ -54,8 +54,8 @@ pub enum CameraState {
 pub enum StateTransition {
     /// A motion or audio trigger arrived from the event bus.
     MotionDetected,
-    /// `ArloStreamRequester::request_live` returned a URL and
-    /// `MediaMultiplexer::attach_live` accepted it.
+    /// `MediaMultiplexer::attach_live` succeeded (offer/answer
+    /// negotiated via `WebrtcSignaler` and the live pad switched in).
     LiveAttached,
     /// First IDR frame observed on the live pad — the splice is safe.
     LiveReady,

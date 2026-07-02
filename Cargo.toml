@@ -59,7 +59,7 @@ toml  = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 # ---- HTTP / Bytes (thumbnail fetch, generic transport) ----
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 bytes   = "1"
 
 # ---- HTTP server (ops endpoints) ----
@@ -74,6 +74,8 @@ gstreamer             = "0.25"
 gstreamer-app         = "0.25"
 gstreamer-rtsp        = "0.25"
 gstreamer-rtsp-server = "0.25"
+gstreamer-webrtc      = "0.25"
+gstreamer-sdp         = "0.25"
 
 # ---- Test ----
 mockall    = "0.14"

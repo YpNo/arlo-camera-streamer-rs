@@ -49,10 +49,11 @@ use streamer_app::system::StreamerSystem;
 use streamer_domain::config::StreamerConfig;
 use streamer_domain::event::ConnectionStatus;
 use streamer_domain::port::{
-    AdminControl, ArloEventSource, ArloStreamRequester, ArloThumbnailSource, MetricsRecorder,
+    AdminControl, ArloEventSource, ArloThumbnailSource, MetricsRecorder, WebrtcSignaler,
 };
 use streamer_infra_arlo::{
-    ArloEventSourceAdapter, ArloStreamRequesterAdapter, ArloThumbnailSourceAdapter, boot::boot,
+    ArloEventSourceAdapter, ArloThumbnailSourceAdapter, ArloWebrtcSignalerAdapter, DeviceRegistry,
+    boot::boot,
 };
 use streamer_infra_media::{GstMediaMultiplexer, GstPipelineRegistry, RtspServer};
 use streamer_infra_ops::{AdminServer, Metrics, OpsServer, Readiness};
@@ -126,10 +127,15 @@ async fn run(config: StreamerConfig) -> Result<()> {
         .user_agent(concat!("arlo-camera-streamer/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("failed to build reqwest client")?;
+    // One shared device cache: stream requests resolve CameraId → Device
+    // through it instead of hitting get_devices() on every live request.
+    let device_registry = Arc::new(DeviceRegistry::new(arlo_client.clone()));
     let event_source: Arc<dyn ArloEventSource> =
         Arc::new(ArloEventSourceAdapter::new(arlo_client.clone()));
-    let stream_requester: Arc<dyn ArloStreamRequester> =
-        Arc::new(ArloStreamRequesterAdapter::new(arlo_client.clone()));
+    let signaler: Arc<dyn WebrtcSignaler> = Arc::new(ArloWebrtcSignalerAdapter::new(
+        arlo_client.clone(),
+        device_registry,
+    ));
     let thumbnails: Arc<dyn ArloThumbnailSource> =
         Arc::new(ArloThumbnailSourceAdapter::new(arlo_client, http));
 
@@ -141,6 +147,7 @@ async fn run(config: StreamerConfig) -> Result<()> {
         Arc::new(GstMediaMultiplexer::new(
             pipeline_registry.clone(),
             config.output.clone(),
+            config.webrtc.clone(),
             &config.cameras,
         ));
 
@@ -149,7 +156,7 @@ async fn run(config: StreamerConfig) -> Result<()> {
     let system = StreamerSystem::spawn(
         &config,
         event_source.clone(),
-        stream_requester,
+        signaler,
         thumbnails,
         media,
         metrics_recorder,

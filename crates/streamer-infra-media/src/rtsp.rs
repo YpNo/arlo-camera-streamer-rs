@@ -29,7 +29,7 @@ use std::thread::JoinHandle;
 
 use gstreamer::glib;
 use gstreamer_rtsp_server::prelude::*;
-use gstreamer_rtsp_server::{RTSPMediaFactory, RTSPMountPoints, RTSPServer};
+use gstreamer_rtsp_server::{RTSPMedia, RTSPMediaFactory, RTSPMountPoints, RTSPServer, RTSPSuspendMode};
 use tracing::{debug, info, warn};
 
 use crate::error::MediaError;
@@ -106,6 +106,45 @@ impl RtspServer {
         factory.set_shared(true);
         self.mounts.add_factory(mount_path, factory);
         debug!(mount = %mount_path, "rtsp factory installed");
+        Ok(())
+    }
+
+    /// Install (or replace) a factory whose backing media stays alive
+    /// across client connects/disconnects (`suspend-mode=NONE`) and
+    /// notifies `on_media_configure` once gst-rtsp-server has
+    /// instantiated the pipeline (typically on first client connect).
+    /// The hook is the registry's only way to capture handles to
+    /// elements named in the launch string (e.g. `appsrc` /
+    /// `input-selector`) — they don't exist before construction.
+    ///
+    /// The hook runs on the `GLib` main-loop thread and must not block.
+    ///
+    /// # Errors
+    ///
+    /// Same envelope as [`Self::install_factory`].
+    pub fn install_factory_with_media_hook<F>(
+        &self,
+        mount_path: &str,
+        launch: &str,
+        on_media_configure: F,
+    ) -> Result<(), MediaError>
+    where
+        F: Fn(&RTSPMedia) + Send + Sync + 'static,
+    {
+        self.mounts.remove_factory(mount_path);
+        let factory = RTSPMediaFactory::new();
+        factory.set_launch(launch);
+        factory.set_shared(true);
+        // Keep the pipeline running when the last client disconnects so
+        // the appsrc/input-selector handles captured below stay valid
+        // and so a re-connecting client picks up the existing splice
+        // state without rebuilding.
+        factory.set_suspend_mode(RTSPSuspendMode::None);
+        factory.connect_media_configure(move |_factory, media| {
+            on_media_configure(media);
+        });
+        self.mounts.add_factory(mount_path, factory);
+        debug!(mount = %mount_path, "rtsp factory installed (with media hook)");
         Ok(())
     }
 

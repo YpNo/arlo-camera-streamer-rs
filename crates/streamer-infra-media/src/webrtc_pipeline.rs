@@ -1,0 +1,532 @@
+//! Per-camera GStreamer `webrtcbin` live pipeline.
+//!
+//! Arlo v3 live is a WebRTC call brokered by a **non-bundled
+//! `FreeSWITCH`** gateway. `webrtcbin` (libnice/DTLS/SRTP) is the only
+//! stack that negotiates it (proven against the live camera). This
+//! module owns one persistent pipeline per active camera:
+//!
+//! ```text
+//!  audiotestsrc(silence) ! opusenc ! rtpopuspay ! webrtcbin   (m0 sendrecv)
+//!  webrtcbin (m1 recvonly H.264)  --pad-added(video)--> appsink
+//!                                                          │ RTP bytes
+//!                                                          ▼
+//!                                                    LiveRtpSink
+//!                                                          │
+//!                                                          ▼
+//!                          appsrc inside the camera's persistent
+//!                          gst-rtsp-server media (Phase 6.3 splice).
+//! ```
+//!
+//! The offer is generated here, carried to Arlo via the domain
+//! [`WebrtcSignaler`] (signaling-only rs-arlo), and the answer applied
+//! verbatim. Inbound H.264 RTP is forwarded into a [`LiveRtpSink`]
+//! supplied by the registry; the registry's pump task drains the sink
+//! into the live appsrc on the camera's persistent pipeline. The
+//! audio recv pad is drained to `fakesink` (Opus bridging deferred
+//! to Phase 8b — see `pipeline_desc` note). Teardown of the Arlo
+//! signaling session is the orchestrator's job
+//! (`WebrtcSignaler::teardown`, paired with detach);
+//! [`WebrtcLive::shutdown`] only tears down the local webrtcbin pipeline.
+//!
+//! This file requires a live GStreamer + camera and is excluded from
+//! unit coverage (integration / manual-gate territory), mirroring
+//! `gst_pipeline.rs` / `rtsp.rs`.
+
+#![allow(clippy::module_name_repetitions)]
+
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use bytes::Bytes;
+use gstreamer as gst;
+use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
+use gstreamer_sdp as gst_sdp;
+use gstreamer_webrtc as gst_webrtc;
+use tokio::sync::{Notify, mpsc};
+use tracing::{debug, info, warn};
+
+use streamer_domain::camera::CameraId;
+use streamer_domain::config::WebrtcConfig;
+use streamer_domain::port::WebrtcSignaler;
+use streamer_domain::stream::{IceAddressFamily, IceServer};
+
+use crate::error::MediaError;
+use crate::live_rtp_sink::LiveRtpSink;
+
+/// H.264 payload type pinned in our offer (Arlo's gateway answers 103).
+const H264_PT: i32 = 103;
+/// Opus payload type for the mandatory SIP audio leg.
+const OPUS_PT: i32 = 111;
+/// Periodic keyframe-request cadence (force-key-unit → PLI/FIR).
+const KEYFRAME_INTERVAL: Duration = Duration::from_secs(3);
+/// Max wait from `set-remote-description` to the first inbound RTP.
+const FIRST_RTP_TIMEOUT_SECS: u64 = 20;
+
+/// A running per-camera `webrtcbin` live session. Drop or
+/// [`shutdown`](Self::shutdown) tears down the local pipeline (the
+/// Arlo signaling session is released separately by the orchestrator
+/// via [`WebrtcSignaler::teardown`]; the [`LiveRtpSink`] consumer's
+/// lifetime is the caller's responsibility).
+pub(crate) struct WebrtcLive {
+    pipeline: gst::Pipeline,
+    /// `Notify`-gated tasks (PLI keyframe pump) abort on drop.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl WebrtcLive {
+    /// Stop the pipeline. Idempotent-ish (safe to call once; `Drop`
+    /// also runs it).
+    pub(crate) fn shutdown(&mut self) {
+        for t in self.tasks.drain(..) {
+            t.abort();
+        }
+        if let Err(e) = self.pipeline.set_state(gst::State::Null) {
+            debug!(error = %e, "webrtcbin pipeline → Null failed (ignored)");
+        }
+    }
+
+    /// Build the pipeline, negotiate via `signaler`, and resolve once
+    /// the first inbound H.264 RTP packet has been pushed into `sink`.
+    /// The caller owns whatever drains `sink` (loopback today, an
+    /// `appsrc` after Phase 6).
+    ///
+    /// # Errors
+    ///
+    /// [`MediaError::Pipeline`] on GStreamer/element failure, or
+    /// [`MediaError::SpliceTimeout`] if no RTP arrives in time.
+    pub(crate) async fn start(
+        camera: &CameraId,
+        ice: &[IceServer],
+        signaler: &dyn WebrtcSignaler,
+        sink: LiveRtpSink,
+        cfg: &WebrtcConfig,
+    ) -> Result<Self, MediaError> {
+        let pipeline = gst::Pipeline::default();
+        let webrtcbin = make("webrtcbin")?;
+        webrtcbin.set_property_from_str("bundle-policy", "none");
+        webrtcbin.set_property("latency", 0u32);
+        apply_ice_address_family(&webrtcbin, cfg.ice_address_family);
+        apply_ice(&webrtcbin, ice);
+
+        let audio_caps = rtp_caps("audio", "OPUS", OPUS_PT, 48000);
+        let video_caps = rtp_caps("video", "H264", H264_PT, 90000);
+
+        // m-line 0: audio Opus **sendrecv** (silence) — FreeSWITCH only
+        // relays video once the SIP audio leg exists. Linking the send
+        // chain to webrtcbin creates the (sendrecv) audio transceiver.
+        let src = make("audiotestsrc")?;
+        src.set_property_from_str("wave", "silence");
+        src.set_property("is-live", true);
+        let conv = make("audioconvert")?;
+        let resample = make("audioresample")?;
+        let opusenc = make("opusenc")?;
+        let pay = make("rtpopuspay")?;
+        pay.set_property("pt", u32::try_from(OPUS_PT).unwrap_or(111));
+        let paycaps = make("capsfilter")?;
+        paycaps.set_property("caps", &audio_caps);
+        pipeline
+            .add_many([&src, &conv, &resample, &opusenc, &pay, &paycaps, &webrtcbin])
+            .map_err(|e| MediaError::Pipeline(format!("pipeline add: {e}")))?;
+        gst::Element::link_many([&src, &conv, &resample, &opusenc, &pay, &paycaps])
+            .map_err(|e| MediaError::Pipeline(format!("link audio chain: {e}")))?;
+        let wrb_sink = webrtcbin
+            .request_pad_simple("sink_%u")
+            .ok_or_else(|| MediaError::Pipeline("webrtcbin has no sink request pad".into()))?;
+        paycaps
+            .static_pad("src")
+            .ok_or_else(|| MediaError::Pipeline("capsfilter has no src pad".into()))?
+            .link(&wrb_sink)
+            .map_err(|e| MediaError::Pipeline(format!("link audio → webrtcbin: {e}")))?;
+
+        // m-line 1: video recvonly H.264 (no send pad ⇒ explicit
+        // transceiver). Order matters: audio link first, then this.
+        let _vid_tr = webrtcbin.emit_by_name::<gst_webrtc::WebRTCRTPTransceiver>(
+            "add-transceiver",
+            &[
+                &gst_webrtc::WebRTCRTPTransceiverDirection::Recvonly,
+                &video_caps,
+            ],
+        );
+
+        // Inbound video RTP → appsink → caller-supplied `LiveRtpSink`.
+        // Audio pad is drained to `fakesink` (Opus bridging deferred
+        // to Phase 8b — see `pipeline_desc` module-level note).
+        let got_rtp = Arc::new(AtomicBool::new(false));
+        let first_rtp = Arc::new(Notify::new());
+        // Filled by `pad-added` once the video appsink is linked; the
+        // keyframe pump targets this pad to send PLI/FIR upstream.
+        let kf_pad: Arc<OnceLock<gst::glib::WeakRef<gst::Pad>>> = Arc::new(OnceLock::new());
+        install_recv_branch(
+            &pipeline,
+            &webrtcbin,
+            sink,
+            got_rtp.clone(),
+            first_rtp.clone(),
+            kf_pad.clone(),
+        );
+
+        // Negotiation: on-negotiation-needed → create-offer →
+        // set-local-description; ship the full offer SDP once ICE
+        // gathering completes (non-trickle — FreeSWITCH expects inline
+        // candidates).
+        let (offer_tx, mut offer_rx) = mpsc::unbounded_channel::<String>();
+        install_negotiation(&webrtcbin, offer_tx);
+
+        pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| MediaError::Pipeline(format!("pipeline → Playing: {e}")))?;
+        spawn_bus_watch(&pipeline);
+
+        let offer_sdp = tokio::time::timeout(Duration::from_secs(20), offer_rx.recv())
+            .await
+            .map_err(|_| MediaError::Pipeline("timed out gathering local offer".into()))?
+            .ok_or_else(|| MediaError::Pipeline("offer channel closed".into()))?;
+        info!(%camera, bytes = offer_sdp.len(), "webrtcbin offer ready; negotiating with Arlo");
+
+        let answer = signaler
+            .negotiate(camera, offer_sdp)
+            .await
+            .map_err(|e| MediaError::Pipeline(format!("signaling negotiate: {e}")))?;
+
+        let msg = gst_sdp::SDPMessage::parse_buffer(answer.answer_sdp.as_bytes())
+            .map_err(|e| MediaError::Pipeline(format!("parse answer SDP: {e}")))?;
+        let answer_desc =
+            gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, msg);
+        webrtcbin.emit_by_name::<()>(
+            "set-remote-description",
+            &[&answer_desc, &gst::Promise::new()],
+        );
+        info!(%camera, session = %answer.session_id, "answer applied; awaiting first RTP");
+
+        // Keyframe pump: periodic force-key-unit sent *upstream* into
+        // the appsink sink pad (webrtcbin/rtpbin turns it into RTCP
+        // PLI/FIR so Arlo emits a fresh IDR). Cheap insurance for fast
+        // (re)start — and required: Arlo withholds video until PLI.
+        let tasks = vec![spawn_keyframe_pump(kf_pad)];
+
+        // Resolve once inbound RTP is flowing (matches the port's
+        // "attach resolves when the live branch produces frames").
+        if !got_rtp.load(Ordering::Acquire) {
+            tokio::time::timeout(
+                Duration::from_secs(FIRST_RTP_TIMEOUT_SECS),
+                first_rtp.notified(),
+            )
+            .await
+            .map_err(|_| MediaError::SpliceTimeout {
+                timeout_secs: FIRST_RTP_TIMEOUT_SECS,
+            })?;
+        }
+        info!(%camera, "live webrtcbin ready; first RTP flowing");
+
+        Ok(Self { pipeline, tasks })
+    }
+}
+
+impl Drop for WebrtcLive {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Make an element by factory name, mapping failure to [`MediaError`].
+fn make(factory: &str) -> Result<gst::Element, MediaError> {
+    gst::ElementFactory::make(factory)
+        .build()
+        .map_err(|e| MediaError::Pipeline(format!("make {factory}: {e}")))
+}
+
+fn rtp_caps(media: &str, encoding: &str, pt: i32, clock: i32) -> gst::Caps {
+    gst::Caps::builder("application/x-rtp")
+        .field("media", media)
+        .field("encoding-name", encoding)
+        .field("payload", pt)
+        .field("clock-rate", clock)
+        .build()
+}
+
+/// Restrict local ICE candidate gathering to IPv4 when
+/// [`IceAddressFamily::Ipv4`] is configured. Passing an IPv4 wildcard
+/// (`"0.0.0.0"`) to `GstWebRTCICE::add-local-ip-address` (action
+/// signal, `GStreamer` 1.20+) tells libnice to bind on all IPv4
+/// interfaces and skip IPv6 gathering entirely — useful on networks
+/// where IPv6 to the Arlo gateway is broken or slow to fail over.
+///
+/// [`IceAddressFamily::Dual`] is a no-op — libnice's default gathers
+/// both families.
+fn apply_ice_address_family(webrtcbin: &gst::Element, family: IceAddressFamily) {
+    match family {
+        IceAddressFamily::Dual => {
+            debug!("ICE: dual-stack candidate gathering (libnice default)");
+        }
+        IceAddressFamily::Ipv4 => {
+            let ice: gst::glib::Object = webrtcbin.property("ice");
+            let accepted: bool =
+                ice.emit_by_name("add-local-ip-address", &[&"0.0.0.0"]);
+            debug!(accepted, "ICE: IPv4-only (add-local-ip-address = 0.0.0.0)");
+        }
+    }
+}
+
+/// STUN via property, UDP TURN via `add-turn-server`. Domain
+/// [`IceServer::url`] is `stun:host:port` / `turn:host:port?...`;
+/// webrtcbin wants the `stun://` / `turn://user:pass@host` URI form.
+fn apply_ice(webrtcbin: &gst::Element, ice: &[IceServer]) {
+    for s in ice {
+        if let Some(rest) = s.url.strip_prefix("stun:") {
+            let uri = format!("stun://{rest}");
+            webrtcbin.set_property("stun-server", &uri);
+            debug!(%uri, "ICE: stun-server set");
+        } else if let Some(rest) = s.url.strip_prefix("turn:") {
+            let (Some(u), Some(c)) = (s.username.as_deref(), s.credential.as_deref()) else {
+                continue;
+            };
+            let uri = format!("turn://{}:{}@{rest}", pct(u), pct(c));
+            let ok: bool = webrtcbin.emit_by_name("add-turn-server", &[&uri]);
+            debug!(host = %rest, accepted = ok, "ICE: UDP TURN added");
+        }
+    }
+}
+
+/// Percent-encode RFC 3986 userinfo so `turn://user:pass@host` parses
+/// (Arlo creds contain `: / = +`).
+fn pct(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// On the **video** src pad, forward raw RTP into the caller's
+/// [`LiveRtpSink`] via an `appsink`. The audio src pad (we offer audio
+/// sendrecv, so `FreeSWITCH` sends audio back) is drained into a
+/// `fakesink` — leaving it unlinked causes `GST_FLOW_NOT_LINKED` →
+/// "Internal data stream error" on the audio `nicesrc`. Opus
+/// bridging is deferred to Phase 8b (decode on the webrtc side and
+/// push raw samples into the persistent pipeline).
+fn install_recv_branch(
+    pipeline: &gst::Pipeline,
+    webrtcbin: &gst::Element,
+    sink: LiveRtpSink,
+    got_rtp: Arc<AtomicBool>,
+    first_rtp: Arc<Notify>,
+    kf_pad: Arc<OnceLock<gst::glib::WeakRef<gst::Pad>>>,
+) {
+    let pipeline_w = pipeline.downgrade();
+    webrtcbin.connect_pad_added(move |_wb, pad| {
+        if pad.direction() != gst::PadDirection::Src {
+            return;
+        }
+        let Some(pipeline) = pipeline_w.upgrade() else {
+            return;
+        };
+        let is_video = pad
+            .current_caps()
+            .and_then(|c| c.structure(0).map(structure_is_video))
+            .unwrap_or(false);
+        if !is_video {
+            debug!("draining non-video webrtcbin src pad (audio leg) → fakesink");
+            if let Err(e) = drain_to_fakesink(&pipeline, pad) {
+                warn!(error = %e, "failed to drain audio leg");
+            }
+            return;
+        }
+        if let Err(e) = link_video_appsink(
+            &pipeline,
+            pad,
+            sink.clone(),
+            got_rtp.clone(),
+            first_rtp.clone(),
+            &kf_pad,
+        ) {
+            warn!(error = %e, "failed to attach video appsink");
+        }
+    });
+}
+
+/// Consume the audio recv leg into a fakesink so its transport
+/// `nicesrc` doesn't error with `NOT_LINKED`. Deferred: Phase 8b will
+/// replace this with a decode chain that pushes raw samples into the
+/// persistent pipeline via a second [`LiveRtpSink`].
+fn drain_to_fakesink(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Result<(), MediaError> {
+    let fakesink = make("fakesink")?;
+    fakesink.set_property("sync", false);
+    fakesink.set_property("async", false);
+    pipeline
+        .add(&fakesink)
+        .map_err(|e| MediaError::Pipeline(format!("add fakesink: {e}")))?;
+    fakesink
+        .sync_state_with_parent()
+        .map_err(|e| MediaError::Pipeline(format!("fakesink sync state: {e}")))?;
+    let sink_pad = fakesink
+        .static_pad("sink")
+        .ok_or_else(|| MediaError::Pipeline("fakesink has no sink pad".into()))?;
+    pad.link(&sink_pad)
+        .map_err(|e| MediaError::Pipeline(format!("link audio → fakesink: {e}")))?;
+    Ok(())
+}
+
+fn structure_is_video(s: &gst::StructureRef) -> bool {
+    s.get::<String>("media").is_ok_and(|m| m == "video")
+        || s.get::<String>("encoding-name")
+            .is_ok_and(|e| e.eq_ignore_ascii_case("H264"))
+}
+
+fn link_video_appsink(
+    pipeline: &gst::Pipeline,
+    pad: &gst::Pad,
+    sink: LiveRtpSink,
+    got_rtp: Arc<AtomicBool>,
+    first_rtp: Arc<Notify>,
+    kf_pad: &OnceLock<gst::glib::WeakRef<gst::Pad>>,
+) -> Result<(), MediaError> {
+    let appsink = gst_app::AppSink::builder()
+        .sync(false)
+        .max_buffers(1)
+        .drop(true)
+        .build();
+    appsink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |appsink| {
+                let sample = appsink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let buf = sample.buffer().ok_or(gst::FlowError::Error)?;
+                let map = buf.map_readable().map_err(|_| gst::FlowError::Error)?;
+                let bytes = Bytes::copy_from_slice(map.as_slice());
+                if !got_rtp.swap(true, Ordering::AcqRel) {
+                    first_rtp.notify_one();
+                }
+                // Drop rather than back-pressure the streaming thread;
+                // the keyframe pump recovers playback if a burst is lost.
+                let _ = sink.push(bytes);
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    let appsink_el: gst::Element = appsink.upcast();
+    pipeline
+        .add(&appsink_el)
+        .map_err(|e| MediaError::Pipeline(format!("add appsink: {e}")))?;
+    appsink_el
+        .sync_state_with_parent()
+        .map_err(|e| MediaError::Pipeline(format!("appsink sync state: {e}")))?;
+    let sink_pad = appsink_el
+        .static_pad("sink")
+        .ok_or_else(|| MediaError::Pipeline("appsink has no sink pad".into()))?;
+    pad.link(&sink_pad)
+        .map_err(|e| MediaError::Pipeline(format!("link webrtc video → appsink: {e}")))?;
+    // Keyframe pump sends force-key-unit *upstream* via this webrtcbin
+    // src pad (`send_event` on a src pad routes upstream events into the
+    // element → rtpbin → RTCP PLI).
+    let _ = kf_pad.set(pad.downgrade());
+    debug!("video appsink attached");
+    Ok(())
+}
+
+/// Wire `on-negotiation-needed` → create-offer → set-local-description,
+/// then ship the full SDP once ICE gathering completes.
+fn install_negotiation(webrtcbin: &gst::Element, offer_tx: mpsc::UnboundedSender<String>) {
+    let wb = webrtcbin.clone();
+    webrtcbin.connect("on-negotiation-needed", false, move |_| {
+        let wb2 = wb.clone();
+        let promise = gst::Promise::with_change_func(move |reply| {
+            let Ok(Some(reply)) = reply else {
+                warn!("create-offer failed");
+                return;
+            };
+            let Ok(offer) = reply.get::<gst_webrtc::WebRTCSessionDescription>("offer") else {
+                warn!("create-offer reply missing offer");
+                return;
+            };
+            wb2.emit_by_name::<()>("set-local-description", &[&offer, &gst::Promise::new()]);
+        });
+        wb.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
+        None
+    });
+
+    let sent = Arc::new(AtomicBool::new(false));
+    webrtcbin.connect_notify(Some("ice-gathering-state"), move |wb, _| {
+        let st = wb.property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
+        if st == gst_webrtc::WebRTCICEGatheringState::Complete && !sent.swap(true, Ordering::AcqRel)
+        {
+            let desc = wb.property::<gst_webrtc::WebRTCSessionDescription>("local-description");
+            match desc.sdp().as_text() {
+                Ok(text) => {
+                    let _ = offer_tx.send(text.as_str().to_owned());
+                }
+                Err(e) => warn!(error = %e, "local-description SDP not stringifiable"),
+            }
+        }
+    });
+}
+
+/// Periodic `GstForceKeyUnit` sent via `send_event` on the **webrtcbin
+/// video src pad**. `gst_pad_send_event` routes an upstream event from a
+/// *src* pad into the element (→ rtpbin), which emits RTCP PLI/FIR so
+/// Arlo pushes a fresh IDR. (`push_event` on a src pad, or `send_event`
+/// on the appsink *sink* pad, are both "wrong direction".) `Weak` so
+/// this never keeps the pipeline alive; aborted on shutdown.
+fn spawn_keyframe_pump(
+    kf_pad: Arc<OnceLock<gst::glib::WeakRef<gst::Pad>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(KEYFRAME_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let Some(src_pad) = kf_pad.get().and_then(gst::glib::WeakRef::upgrade) else {
+                continue;
+            };
+            let ev = gst::event::CustomUpstream::new(
+                gst::Structure::builder("GstForceKeyUnit")
+                    .field("all-headers", true)
+                    .build(),
+            );
+            let _ = src_pad.send_event(ev);
+        }
+    })
+}
+
+/// Drain the pipeline bus; surface ERROR/WARNING.
+fn spawn_bus_watch(pipeline: &gst::Pipeline) {
+    let Some(bus) = pipeline.bus() else { return };
+    std::thread::spawn(move || {
+        for msg in bus.iter_timed(gst::ClockTime::NONE) {
+            use gst::MessageView as V;
+            match msg.view() {
+                V::Error(e) => warn!(
+                    src = ?e.src().map(gst::prelude::GstObjectExt::path_string),
+                    error = %e.error(),
+                    "webrtcbin pipeline error"
+                ),
+                V::Eos(_) => {
+                    debug!("webrtcbin pipeline EOS");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `pct` is pure; the rest of this module needs a live GStreamer +
+    // camera (exercised by the Phase 4 manual gate, like
+    // `gst_pipeline.rs` / `rtsp.rs` — excluded from unit coverage).
+    #[test]
+    fn pct_encodes_reserved_userinfo() {
+        assert_eq!(pct("ab-_.~"), "ab-_.~");
+        assert_eq!(pct("a:b/c=d+e"), "a%3Ab%2Fc%3Dd%2Be");
+    }
+}

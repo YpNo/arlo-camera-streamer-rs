@@ -13,10 +13,14 @@ ignore = []
 allow = [
     "MIT",
     "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "ISC",
     "CDLA-Permissive-2.0",
     "Unicode-3.0",
+    "GPL-3.0",
+    "GPL-3.0-or-later",
+    "0BSD",
 ]
 confidence-threshold = 0.8
 
@@ -29,7 +33,7 @@ external-default-features = "allow"
 
 deny = [
     # General legacy/deprecated
-    { crate = "lazy_static", reason = "Use standard library's std::sync::OnceLock or once_cell" },
+    # { crate = "lazy_static", reason = "Use standard library's std::sync::OnceLock or once_cell" },
     { crate = "failure", reason = "Use thiserror or anyhow" },
     { crate = "net2", reason = "Deprecated in favor of socket2" },
     { crate = "futures-cpupool", reason = "Use tokio or rayon" },
@@ -37,6 +41,22 @@ deny = [
     # Security: TLS and Crypto
     { crate = "openssl", reason = "Use rustls for memory-safe TLS" },
     { crate = "native-tls", reason = "Use rustls for memory-safe TLS" },
+]
+
+# Certain crates/versions that will be skipped when doing duplicate detection.
+skip = [
+    # Example: Allowing a specific duplicate version of boring-sys due to upstream constraints
+    { crate = "thiserror@1.0.69", reason = "Required by tokio-socks v0.5.2" },
+    { crate = "thiserror-impl@1.0.69", reason = "Required by thiserror v1.0.69" },
+    { crate = "socket2@0.5.10", reason = "Required by rquest v5.1.0"},
+    { crate = "rand_core@0.9.5", reason = "Required by rand v0.9.4"},
+    { crate = "rand@0.9.4", reason = "Required by rquest headless_chrome v1.0.21"},
+    { crate = "getrandom@0.2.17", reason = "Required by ring v0.17.14"},
+    { crate = "getrandom@0.3.4", reason = "Required by jobserver v0.1.34"},
+    { crate = "cpufeatures@0.2.17", reason = "Required by sha1 v0.10.6"},
+    { crate = "cookie_store@0.21.1", reason = "Required by rquest v5.1.0"},
+    { crate = "itertools@0.13.0", reason = "Required by rquest-util v2.2.1"},
+    { crate = "core-foundation@0.9.4", reason = "Required by rquest-util v2.2.1"},
 ]
 
 [sources]

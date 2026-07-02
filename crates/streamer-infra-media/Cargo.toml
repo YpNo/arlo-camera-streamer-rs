@@ -22,6 +22,8 @@ gstreamer             = { workspace = true }
 gstreamer-app         = { workspace = true }
 gstreamer-rtsp        = { workspace = true }
 gstreamer-rtsp-server = { workspace = true }
+gstreamer-sdp         = { workspace = true }
+gstreamer-webrtc      = { workspace = true }
 thiserror             = { workspace = true }
 tokio                 = { workspace = true }
 tracing               = { workspace = true }

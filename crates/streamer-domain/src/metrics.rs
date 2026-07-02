@@ -65,7 +65,7 @@ pub enum SpliceOutcome {
     /// Live source attached and selector switched. The camera is
     /// streaming to Frigate.
     Success,
-    /// `ArloStreamRequester::request_live` failed.
+    /// `WebrtcSignaler::negotiate` failed (carried inside `attach_live`).
     RequestFailed,
     /// `MediaMultiplexer::attach_live` failed (e.g. SDP / IDR timeout).
     AttachFailed,
