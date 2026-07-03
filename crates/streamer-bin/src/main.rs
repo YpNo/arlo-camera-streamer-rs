@@ -35,6 +35,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -60,6 +61,12 @@ use streamer_infra_ops::{AdminServer, Metrics, OpsServer, Readiness};
 
 /// Env var holding the bearer token for `/admin/*` routes.
 const ADMIN_TOKEN_ENV: &str = "STREAMER_ADMIN_TOKEN";
+
+/// Per-stage graceful-shutdown deadline. Any single drain step that
+/// exceeds this is logged and abandoned so a stuck upstream teardown
+/// (e.g. a WebRTC WS close that never acks) can never wedge process
+/// exit. Generous enough for a clean drain under normal conditions.
+const SHUTDOWN_STAGE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// CLI arguments.
 #[derive(Debug, Parser)]
@@ -221,20 +228,55 @@ async fn run(config: StreamerConfig) -> Result<()> {
     }
 
     // -- Drain --
+    //
+    // Each stage is logged and bounded by `SHUTDOWN_STAGE_TIMEOUT` so a
+    // single hung step can neither hide (no log) nor wedge the process
+    // (no forced kill needed). Order matters: stop *producing* work
+    // (cancel token → actors/router drain) before tearing down the
+    // media plane, and stop the RTSP GLib loop **before** the final
+    // `RtspServer` drop joins its thread — otherwise that join blocks
+    // forever on a still-running loop.
     shutdown.cancel();
-    system.shutdown().await;
-    if let Err(e) = conn_task.await {
-        warn!(error = %e, "connection-watcher join failed");
-    }
-    if let Err(e) = ops_task.await {
-        warn!(error = %e, "ops-server join failed");
-    }
-    if let Err(e) = admin_task.await {
-        warn!(error = %e, "admin-server join failed");
-    }
+
+    drain_stage("streamer-system", system.shutdown()).await;
+    drain_stage("connection-watcher", async {
+        let _ = conn_task.await;
+    })
+    .await;
+    drain_stage("ops-server", async {
+        let _ = ops_task.await;
+    })
+    .await;
+    drain_stage("admin-server", async {
+        let _ = admin_task.await;
+    })
+    .await;
+
+    // Tear down the media plane explicitly: remove RTSP mounts + abort
+    // live pumps, then quit the GLib main loop. Without this the RTSP
+    // server keeps rebuilding each camera's media on a ~20 s loop and
+    // the loop thread never exits.
+    drain_stage("pipeline-registry", pipeline_registry.shutdown()).await;
+    rtsp_server.stop();
     drop(rtsp_server);
+
     info!("graceful shutdown complete");
     Ok(())
+}
+
+/// Await a shutdown stage under [`SHUTDOWN_STAGE_TIMEOUT`], logging
+/// entry, completion, and (if it elapses) the stall — so the daemon
+/// log always shows exactly how far the drain got.
+async fn drain_stage<F: std::future::Future<Output = ()>>(name: &str, fut: F) {
+    info!(stage = name, "shutdown stage started");
+    match tokio::time::timeout(SHUTDOWN_STAGE_TIMEOUT, fut).await {
+        Ok(()) => info!(stage = name, "shutdown stage complete"),
+        Err(_) => warn!(
+            stage = name,
+            timeout_s = SHUTDOWN_STAGE_TIMEOUT.as_secs(),
+            "shutdown stage timed out; abandoning"
+        ),
+    }
 }
 
 /// Read the admin token from `STREAMER_ADMIN_TOKEN`. Fails if missing
