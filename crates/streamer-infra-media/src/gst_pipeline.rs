@@ -44,13 +44,16 @@
 //! (an idle viewer is connected when motion fires) the wiring is
 //! always present.
 //!
-//! ## Thumbnail handling
+//! ## Thumbnail handling (Phase 5)
 //!
-//! [`Self::refresh_thumbnail`] stores the JPEG bytes in per-camera
-//! state for future use (e.g. a `/admin/thumbnail/<cam>` endpoint) but
-//! does **not** push them into the running pipeline. Wiring `appsrc`
-//! for JPEG-still idle output is Phase 5 work; the synthetic overlay
-//! remains the on-air idle source.
+//! [`Self::refresh_thumbnail`] persists the JPEG to a stable per-camera
+//! file and points the synthetic idle branch's `gdkpixbufoverlay`
+//! (`idle_overlay`) at it, so the STANDBY screen shows the camera's
+//! last snapshot instead of a black frame. The overlay is an inline
+//! filter: before the first snapshot it's a transparent pass-through,
+//! so idle preroll is unchanged. A rebuilt media re-applies the file at
+//! `media-configure`. The cached bytes are also kept in per-camera
+//! state for a future `/admin/thumbnail/<cam>` endpoint.
 //!
 //! This file is excluded from coverage in CI — it requires a running
 //! GStreamer environment with `gst-rtsp-server` plugins, which is
@@ -59,6 +62,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
@@ -75,10 +79,12 @@ use tracing::{debug, info, instrument, warn};
 use streamer_domain::camera::CameraId;
 
 use crate::error::MediaError;
-use crate::idle_source::IdleKind;
+use crate::idle_source::{IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH};
 use crate::live_rtp_sink::LiveRtpSink;
 use crate::multiplexer::PipelineRegistry;
-use crate::pipeline_desc::{OutputBranches, UNIFIED_ENCODER_NAME, combined_launch_string};
+use crate::pipeline_desc::{
+    IDLE_OVERLAY_NAME, OutputBranches, UNIFIED_ENCODER_NAME, combined_launch_string,
+};
 use crate::rtsp::RtspServer;
 
 /// Live wiring captured from the gst-rtsp-server media on
@@ -98,6 +104,12 @@ struct LiveWiring {
     /// is an IDR — no garbage P-frames referencing the prior branch's
     /// content.
     encoder: gst::Element,
+    /// The synthetic idle branch's `gdkpixbufoverlay` (Phase 5). Its
+    /// `location` is set to the latest camera snapshot in
+    /// [`GstPipelineRegistry::refresh_thumbnail`] so the STANDBY screen
+    /// shows the last thumbnail. Present only for the synthetic idle
+    /// variant; the JPEG-still idle already shows an image.
+    idle_overlay: Option<gst::Element>,
 }
 
 /// Active live ingestion bookkeeping.
@@ -111,8 +123,8 @@ struct LiveSession {
 struct CameraEntry {
     mount_path: String,
     idle: IdleKind,
-    /// Last known thumbnail JPEG. Stored for ops endpoints; not yet
-    /// wired into the live pipeline (Phase 5).
+    /// Last known thumbnail JPEG. Applied to the idle overlay in
+    /// `refresh_thumbnail` and retained for a future ops endpoint.
     last_thumbnail: Option<Bytes>,
     /// Set when gst-rtsp-server constructs a media for this factory.
     /// Read by `attach_live_sink` to find the appsrc + selector pads.
@@ -196,6 +208,16 @@ impl PipelineRegistry for GstPipelineRegistry {
             move |media: &RTSPMedia| {
                 match build_live_wiring(media) {
                     Ok(w) => {
+                        // Re-apply the last snapshot to a freshly-built
+                        // media so a rebuild between live sessions keeps
+                        // showing the thumbnail rather than reverting to
+                        // the black STANDBY frame.
+                        if let Some(overlay) = &w.idle_overlay {
+                            let path = thumbnail_file_path(&cam_for_cb);
+                            if path.exists() {
+                                apply_thumbnail_overlay(overlay, &path);
+                            }
+                        }
                         *wiring_for_cb.lock().expect("wiring poisoned") = Some(w);
                         debug!(camera = %cam_for_cb, "captured live wiring from media");
                     }
@@ -303,14 +325,32 @@ impl PipelineRegistry for GstPipelineRegistry {
 
     #[instrument(skip(self, jpeg), fields(camera = %camera, bytes = jpeg.len()))]
     async fn refresh_thumbnail(&self, camera: &CameraId, jpeg: Bytes) -> Result<(), MediaError> {
+        // Persist the JPEG to a stable per-camera path, then point the
+        // idle branch's `gdkpixbufoverlay` at it so the STANDBY screen
+        // shows the last snapshot (Phase 5). The write is atomic
+        // (temp + rename) so the overlay never reads a partial file.
+        let path = thumbnail_file_path(camera);
+        write_thumbnail_atomic(&path, &jpeg).await?;
+
         let mut guard = self.state.write().await;
         let entry = guard
             .get_mut(camera)
             .ok_or_else(|| MediaError::UnknownCamera(camera.to_string()))?;
         entry.last_thumbnail = Some(jpeg);
-        // Phase 5: when JPEG-still idle is wired via appsrc, push the
-        // bytes into the running idle source here.
-        debug!("thumbnail stored (Phase 5 will push into appsrc)");
+
+        // Apply to the running media if one is up. If no client has
+        // connected yet the file is already in place and the overlay
+        // is re-applied at the next `media-configure` (see `register`).
+        let wiring = entry.wiring.lock().expect("wiring poisoned").clone();
+        if let Some(overlay) = wiring.and_then(|w| w.idle_overlay) {
+            apply_thumbnail_overlay(&overlay, &path);
+            debug!(path = %path.display(), "thumbnail applied to idle overlay");
+        } else {
+            debug!(
+                path = %path.display(),
+                "thumbnail stored; no live overlay yet (applied on next media build)"
+            );
+        }
         Ok(())
     }
 }
@@ -371,6 +411,8 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
     let encoder = bin
         .by_name(UNIFIED_ENCODER_NAME)
         .ok_or_else(|| MediaError::Pipeline(format!("encoder '{UNIFIED_ENCODER_NAME}' not found")))?;
+    // Optional: only the synthetic idle branch carries the overlay.
+    let idle_overlay = bin.by_name(IDLE_OVERLAY_NAME);
 
     Ok(LiveWiring {
         appsrc,
@@ -378,7 +420,41 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
         sink_idle,
         sink_live,
         encoder,
+        idle_overlay,
     })
+}
+
+/// Stable per-camera path where the latest snapshot JPEG is persisted
+/// for the idle `gdkpixbufoverlay` to load. Lives under the system temp
+/// dir; the camera id is filename-safe (Arlo device ids are `[A-Z0-9]`).
+fn thumbnail_file_path(camera: &CameraId) -> PathBuf {
+    std::env::temp_dir().join(format!("arlo-streamer-thumb-{camera}.jpg"))
+}
+
+/// Atomically write `jpeg` to `path` (write a sibling temp file, then
+/// rename) so the overlay never observes a half-written image.
+async fn write_thumbnail_atomic(path: &Path, jpeg: &Bytes) -> Result<(), MediaError> {
+    let tmp = path.with_extension("jpg.tmp");
+    tokio::fs::write(&tmp, jpeg)
+        .await
+        .map_err(|e| MediaError::Pipeline(format!("thumbnail write failed: {e}")))?;
+    tokio::fs::rename(&tmp, path)
+        .await
+        .map_err(|e| MediaError::Pipeline(format!("thumbnail rename failed: {e}")))
+}
+
+/// Point a `gdkpixbufoverlay` at `path` and scale it to fill the idle
+/// frame. Setting `location` makes the element reload the image
+/// (unconditionally, even for the same path), so this both installs and
+/// refreshes the on-air thumbnail. `overlay-width`/`overlay-height`
+/// **must** be (re)set here rather than at pipeline construction:
+/// gdkpixbufoverlay renders a runtime-loaded image at its native size
+/// unless the target size is set together with the load, which would
+/// otherwise leave a large snapshot cropped to the top-left corner.
+fn apply_thumbnail_overlay(overlay: &gst::Element, path: &Path) {
+    overlay.set_property("location", path.to_string_lossy().as_ref());
+    overlay.set_property("overlay-width", i32::try_from(SYNTHETIC_WIDTH).unwrap_or(0));
+    overlay.set_property("overlay-height", i32::try_from(SYNTHETIC_HEIGHT).unwrap_or(0));
 }
 
 /// Install a single-shot pad probe on the live branch's selector

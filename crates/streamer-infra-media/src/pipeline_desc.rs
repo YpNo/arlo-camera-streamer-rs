@@ -67,6 +67,15 @@ pub(crate) const UNIFIED_GOP: u32 = UNIFIED_FPS * 2;
 /// each idle↔live splice).
 pub(crate) const UNIFIED_ENCODER_NAME: &str = "video_enc";
 
+/// Name of the `gdkpixbufoverlay` in the synthetic idle branch
+/// (Phase 5). [`crate::gst_pipeline`] captures it at `media-configure`
+/// and sets its `location` to the latest camera snapshot so the
+/// STANDBY screen shows the last thumbnail instead of a black frame.
+/// It's an **inline** filter (same class as `textoverlay`): with no
+/// `location` set it's a transparent pass-through, so the idle branch
+/// prerolls exactly as before until the first thumbnail arrives.
+pub(crate) const IDLE_OVERLAY_NAME: &str = "idle_overlay";
+
 // ── Phase 8 (Opus audio bridging) — deferred ────────────────────────
 // A first attempt fed Arlo's Opus RTP into a second `input-selector`
 // via an `appsrc → rtpopusdepay → opusdec` chain. This blocked
@@ -352,6 +361,7 @@ width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1"
 width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1 \
                  ! textoverlay text=\"{escaped}\" valignment=bottom halignment=center \
                               font-desc=\"Sans 24\" \
+                 ! gdkpixbufoverlay name={IDLE_OVERLAY_NAME} \
                  ! videoconvert \
                  ! video/x-raw,format=I420,\
 width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1"
@@ -601,6 +611,23 @@ mod tests {
         assert!(s.contains("avdec_h264"));
         assert!(s.contains("videoscale"));
         assert!(s.contains("videorate"));
+    }
+
+    #[test]
+    fn synthetic_idle_carries_thumbnail_overlay() {
+        // Phase 5: the synthetic idle branch has an inline
+        // gdkpixbufoverlay (named for runtime capture) sized to the
+        // full frame, sitting after the STANDBY textoverlay.
+        let s = combined_launch_string(&synth_idle());
+        assert!(s.contains(&format!("gdkpixbufoverlay name={IDLE_OVERLAY_NAME}")));
+        // Sizing is applied at runtime (see gst_pipeline::apply_thumbnail_overlay)
+        // because gdkpixbufoverlay ignores construction-time overlay-width/height
+        // when a `location` is loaded later.
+        // Overlay must sit after the text overlay and before the final
+        // I420 convert so STANDBY text shows until a snapshot loads.
+        let text = s.find("textoverlay").expect("textoverlay present");
+        let pix = s.find("gdkpixbufoverlay").expect("gdkpixbufoverlay present");
+        assert!(text < pix, "textoverlay should precede gdkpixbufoverlay");
     }
 
     #[test]

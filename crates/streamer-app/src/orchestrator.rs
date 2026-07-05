@@ -171,6 +171,11 @@ impl CameraOrchestrator {
         if let Err(e) = self.media.register(&self.camera_id).await {
             warn!(error = %e, "media register failed; continuing — pipeline may be missing");
         }
+        // Prime the idle overlay with the camera's last snapshot so the
+        // first STANDBY view already shows a thumbnail rather than the
+        // black frame (which otherwise appears until the first live
+        // session ends). Applied to the pipeline at `media-configure`.
+        self.refresh_idle_thumbnail().await;
 
         // Tracks whether the admin mailbox is still alive. Once it
         // closes (e.g. tests that drop the sender immediately), we
@@ -497,6 +502,16 @@ impl CameraOrchestrator {
         self.stop_arlo_live().await;
         self.budget.on_live_ended(Local::now().naive_local());
         self.debouncer.on_idle();
+        self.refresh_idle_thumbnail().await;
+    }
+
+    /// Fetch the camera's latest snapshot and hand it to the media
+    /// adapter so the idle STANDBY screen shows it. Best-effort:
+    /// failures are logged, never propagated — the synthetic
+    /// black-frame fallback covers the missing-image case. Called both
+    /// on startup (so the first idle view already shows a thumbnail)
+    /// and after every live session ends.
+    async fn refresh_idle_thumbnail(&self) {
         match self.thumbnails.last_thumbnail(&self.camera_id).await {
             Ok(Some(jpeg)) => {
                 if let Err(e) = self.media.refresh_thumbnail(&self.camera_id, jpeg).await {
