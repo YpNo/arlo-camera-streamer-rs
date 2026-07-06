@@ -80,7 +80,7 @@ use streamer_domain::camera::CameraId;
 
 use crate::error::MediaError;
 use crate::idle_source::{IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH};
-use crate::live_rtp_sink::LiveRtpSink;
+use crate::live_rtp_sink::{LiveSinkReceivers, LiveSinks};
 use crate::multiplexer::PipelineRegistry;
 use crate::pipeline_desc::{
     IDLE_OVERLAY_NAME, OutputBranches, UNIFIED_ENCODER_NAME, combined_launch_string,
@@ -110,13 +110,19 @@ struct LiveWiring {
     /// shows the last thumbnail. Present only for the synthetic idle
     /// variant; the JPEG-still idle already shows an image.
     idle_overlay: Option<gst::Element>,
+    /// The live audio `appsrc` (`live_audio_rtp_src`, Phase 8b) — Opus
+    /// RTP pushed here is decoded and mixed onto the silent bed by the
+    /// `audiomixer`. No selector flip needed: the mixer reverts to
+    /// silence when live audio stops.
+    audio_appsrc: Option<gst_app::AppSrc>,
 }
 
 /// Active live ingestion bookkeeping.
 struct LiveSession {
-    /// Pump task: drains the [`LiveRtpSink`] receiver into the appsrc.
-    /// Exits when the caller drops the sink or when aborted on detach.
-    pump: tokio::task::JoinHandle<()>,
+    /// Drains the video sink's receiver into the video `appsrc`.
+    video_pump: tokio::task::JoinHandle<()>,
+    /// Drains the audio sink's receiver into the audio `appsrc`.
+    audio_pump: tokio::task::JoinHandle<()>,
 }
 
 /// Per-camera state owned by [`GstPipelineRegistry`].
@@ -171,7 +177,8 @@ impl GstPipelineRegistry {
         for (cam, entry) in guard.drain() {
             self.server.remove_mount(&entry.mount_path);
             if let Some(session) = entry.session {
-                session.pump.abort();
+                session.video_pump.abort();
+                session.audio_pump.abort();
             }
             debug!(camera = %cam, mount = %entry.mount_path, "mount removed during shutdown");
         }
@@ -255,7 +262,7 @@ impl PipelineRegistry for GstPipelineRegistry {
     }
 
     #[instrument(skip(self), fields(camera = %camera))]
-    async fn attach_live_sink(&self, camera: &CameraId) -> Result<LiveRtpSink, MediaError> {
+    async fn attach_live_sink(&self, camera: &CameraId) -> Result<LiveSinks, MediaError> {
         let mut guard = self.state.write().await;
         let entry = guard
             .get_mut(camera)
@@ -266,12 +273,27 @@ impl PipelineRegistry for GstPipelineRegistry {
             )));
         }
 
-        let (sink, rx) = LiveRtpSink::new();
+        let (sinks, rxs) = LiveSinks::new();
+        let LiveSinkReceivers {
+            video: video_rx,
+            audio: audio_rx,
+        } = rxs;
         let wiring_snapshot = entry.wiring.lock().expect("wiring poisoned").clone();
 
-        let pump = if let Some(wiring) = wiring_snapshot {
+        let session = if let Some(wiring) = wiring_snapshot {
             arm_live_switch(&wiring);
-            spawn_pump_to_appsrc(rx, wiring.appsrc)
+            let video_pump = spawn_pump_to_appsrc(video_rx, wiring.appsrc, "video");
+            // Audio has no idle↔live selector — the audiomixer blends
+            // the live Opus onto silence automatically. If the media
+            // predates Phase 8b (no audio appsrc), discard audio bytes.
+            let audio_pump = match wiring.audio_appsrc {
+                Some(a) => spawn_pump_to_appsrc(audio_rx, a, "audio"),
+                None => spawn_discard_pump(audio_rx),
+            };
+            LiveSession {
+                video_pump,
+                audio_pump,
+            }
         } else {
             warn!(
                 camera = %camera,
@@ -279,11 +301,14 @@ impl PipelineRegistry for GstPipelineRegistry {
                  live RTP will be discarded until a client connects \
                  (deferred wiring not implemented)"
             );
-            spawn_discard_pump(rx)
+            LiveSession {
+                video_pump: spawn_discard_pump(video_rx),
+                audio_pump: spawn_discard_pump(audio_rx),
+            }
         };
-        entry.session = Some(LiveSession { pump });
-        info!(mount = %entry.mount_path, "live ingestion armed");
-        Ok(sink)
+        entry.session = Some(session);
+        info!(mount = %entry.mount_path, "live ingestion armed (video + audio)");
+        Ok(sinks)
     }
 
     #[instrument(skip(self), fields(camera = %camera))]
@@ -315,10 +340,13 @@ impl PipelineRegistry for GstPipelineRegistry {
             debug!("input-selector flipped to sink_0 (idle); IDR forced on encoder");
         }
 
-        // Aborting the pump drops the receiver; the GStreamer
-        // streaming thread's appsink callback sees `LiveRtpSink::push`
-        // return `false` and silently discards (no back-pressure).
-        session.pump.abort();
+        // Aborting the pumps drops the receivers; the GStreamer
+        // streaming thread's appsink callbacks see `LiveRtpSink::push`
+        // return `false` and silently discard (no back-pressure). The
+        // audiomixer stops receiving live buffers and reverts to the
+        // silent bed — no explicit audio flip needed.
+        session.video_pump.abort();
+        session.audio_pump.abort();
         info!(mount = %entry.mount_path, "live ingestion released; idle restored");
         Ok(())
     }
@@ -414,6 +442,15 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
     // Optional: only the synthetic idle branch carries the overlay.
     let idle_overlay = bin.by_name(IDLE_OVERLAY_NAME);
 
+    // Optional: live audio appsrc (Phase 8b). Non-blocking push like
+    // the video appsrc so a full queue drops instead of stalling.
+    let audio_appsrc = bin
+        .by_name("live_audio_rtp_src")
+        .and_then(|el| el.dynamic_cast::<gst_app::AppSrc>().ok());
+    if let Some(a) = &audio_appsrc {
+        a.set_property("block", false);
+    }
+
     Ok(LiveWiring {
         appsrc,
         selector,
@@ -421,6 +458,7 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
         sink_live,
         encoder,
         idle_overlay,
+        audio_appsrc,
     })
 }
 
@@ -502,16 +540,17 @@ fn force_keyframe(encoder: &gst::Element) {
 fn spawn_pump_to_appsrc(
     mut rx: mpsc::Receiver<Bytes>,
     appsrc: gst_app::AppSrc,
+    label: &'static str,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
             let buf = gst::Buffer::from_slice(bytes);
             if let Err(e) = appsrc.push_buffer(buf) {
-                debug!(error = %e, "appsrc.push_buffer failed; live pump stopping");
+                debug!(error = %e, kind = label, "appsrc.push_buffer failed; live pump stopping");
                 break;
             }
         }
-        debug!("live RTP pump exited");
+        debug!(kind = label, "live RTP pump exited");
     })
 }
 

@@ -43,6 +43,42 @@ impl LiveRtpSink {
     }
 }
 
+/// Paired video + audio RTP sinks handed to [`crate::webrtc_pipeline`]
+/// (Phase 8b). The WebRTC recv branch pushes inbound H.264 RTP into
+/// `video` and inbound Opus RTP into `audio`; the registry drains each
+/// receiver into its matching `appsrc` on the persistent pipeline.
+#[derive(Clone)]
+pub struct LiveSinks {
+    /// Inbound H.264 RTP → the persistent pipeline's `live_rtp_src`.
+    pub video: LiveRtpSink,
+    /// Inbound Opus RTP → the persistent pipeline's `live_audio_rtp_src`.
+    pub audio: LiveRtpSink,
+}
+
+/// The receiver halves paired with a [`LiveSinks`], one per media.
+pub struct LiveSinkReceivers {
+    /// Drains into the video live `appsrc`.
+    pub video: mpsc::Receiver<Bytes>,
+    /// Drains into the audio live `appsrc`.
+    pub audio: mpsc::Receiver<Bytes>,
+}
+
+impl LiveSinks {
+    /// Build the video+audio sink pair and their paired receivers.
+    #[must_use]
+    pub fn new() -> (Self, LiveSinkReceivers) {
+        let (video, video_rx) = LiveRtpSink::new();
+        let (audio, audio_rx) = LiveRtpSink::new();
+        (
+            Self { video, audio },
+            LiveSinkReceivers {
+                video: video_rx,
+                audio: audio_rx,
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

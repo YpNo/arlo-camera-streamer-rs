@@ -34,7 +34,7 @@ use streamer_domain::stream::Codec;
 use crate::codec_cache::CodecCache;
 use crate::error::MediaError;
 use crate::idle_source::{IdleKind, select_idle_source};
-use crate::live_rtp_sink::LiveRtpSink;
+use crate::live_rtp_sink::LiveSinks;
 use crate::pipeline_desc::{OutputBranches, build_output_branches};
 use crate::webrtc_pipeline::WebrtcLive;
 
@@ -64,13 +64,14 @@ pub trait PipelineRegistry: Send + Sync {
         outputs: OutputBranches,
     ) -> Result<(), MediaError>;
 
-    /// Arm the camera's live ingestion. Returns a [`LiveRtpSink`] the
-    /// caller pushes inbound H.264 RTP into. The implementation flips
-    /// the camera's `input-selector` to the live branch on the first
-    /// live raw frame — clients connected to the idle stream see a
-    /// seamless transition (no EOS, no reconnect, no client-side
-    /// decoder re-init).
-    async fn attach_live_sink(&self, camera: &CameraId) -> Result<LiveRtpSink, MediaError>;
+    /// Arm the camera's live ingestion. Returns a [`LiveSinks`] pair the
+    /// caller pushes inbound H.264 RTP (`video`) and Opus RTP (`audio`)
+    /// into. The implementation flips the camera's `input-selector` to
+    /// the live video branch on the first live raw frame and mixes the
+    /// live audio onto the silent bed — clients connected to the idle
+    /// stream see a seamless transition (no EOS, no reconnect, no
+    /// client-side decoder re-init).
+    async fn attach_live_sink(&self, camera: &CameraId) -> Result<LiveSinks, MediaError>;
 
     /// Revert the camera to idle. The implementation flips the
     /// `input-selector` back on the next idle IDR and stops draining
@@ -204,8 +205,8 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         // 5. answer applied. Connected RTSP clients see a seamless
         // switch idle → live at the next live IDR.
         let ice = signaler.ice_servers(camera).await?;
-        let sink = self.registry.attach_live_sink(camera).await?;
-        let webrtc = WebrtcLive::start(camera, &ice, signaler, sink, &self.webrtc).await?;
+        let sinks = self.registry.attach_live_sink(camera).await?;
+        let webrtc = WebrtcLive::start(camera, &ice, signaler, sinks, &self.webrtc).await?;
         // On a failure above, the registry's pump task naturally exits
         // once the dropped sink closes the channel; the orchestrator
         // pairs the failure exit with `WebrtcSignaler::teardown`.
@@ -315,13 +316,13 @@ mod tests {
         async fn attach_live_sink(
             &self,
             camera: &CameraId,
-        ) -> Result<LiveRtpSink, MediaError> {
+        ) -> Result<LiveSinks, MediaError> {
             self.attached.lock().unwrap().push(camera.clone());
-            // The receiver is dropped immediately — the multiplexer
+            // The receivers are dropped immediately — the multiplexer
             // test only exercises the `ensure_registered` guard (real
             // attach drives webrtcbin and isn't unit-tested).
-            let (sink, _rx) = LiveRtpSink::new();
-            Ok(sink)
+            let (sinks, _rxs) = LiveSinks::new();
+            Ok(sinks)
         }
         async fn detach_live_sink(&self, camera: &CameraId) -> Result<(), MediaError> {
             self.detached.lock().unwrap().push(camera.clone());

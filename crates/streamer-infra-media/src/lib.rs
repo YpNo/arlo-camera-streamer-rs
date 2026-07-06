@@ -53,7 +53,7 @@ pub use codec_cache::CodecCache;
 pub use error::MediaError;
 pub use gst_pipeline::GstPipelineRegistry;
 pub use idle_source::{IDLE_FPS, IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH, select_idle_source};
-pub use live_rtp_sink::LiveRtpSink;
+pub use live_rtp_sink::{LiveRtpSink, LiveSinkReceivers, LiveSinks};
 pub use multiplexer::{GstMediaMultiplexer, PipelineRegistry};
 pub use pipeline_desc::{
     DashBranchConfig, HlsBranchConfig, OutputBranches, build_output_branches, idle_audio_desc,

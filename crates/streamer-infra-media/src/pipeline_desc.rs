@@ -76,6 +76,28 @@ pub(crate) const UNIFIED_ENCODER_NAME: &str = "video_enc";
 /// prerolls exactly as before until the first thumbnail arrives.
 pub(crate) const IDLE_OVERLAY_NAME: &str = "idle_overlay";
 
+/// Downstream audio encoder name — a named handle keeps the audio
+/// wiring symmetric with the video side (no force-key-unit: AAC frames
+/// are independent).
+pub(crate) const UNIFIED_AUDIO_ENCODER_NAME: &str = "audio_enc";
+
+/// Opus RTP payload type pinned on the live audio appsrc's caps.
+/// **Must** match `webrtc_pipeline::OPUS_PT` (the audio transceiver's
+/// PT in our offer to Arlo).
+pub(crate) const LIVE_RTP_OPUS_PT: i32 = 111;
+
+// ── Phase 8b (Opus audio bridging) — via `audiomixer` ────────────────
+// Live audio uses an `audiomixer`, NOT a second `input-selector`. A
+// second selector stalls gst-rtsp-server's media prepare (an empty
+// inactive live pad never advances, so the SDP caps on `pay1` never
+// resolve). `audiomixer` always produces output from the always-on
+// silent bed, so `pay1` gets caps immediately and preroll completes.
+// The camera's Opus is mixed onto silence (silence = 0, so the sum is
+// just the live audio); when the WebRTC leg tears down the mixer
+// simply stops receiving live buffers and reverts to silence — no
+// active-pad switch, no detach flip. Raw audio is pinned to F32LE
+// (avenc_aac's only accepted input) on every branch.
+
 // ── Phase 8 (Opus audio bridging) — deferred ────────────────────────
 // A first attempt fed Arlo's Opus RTP into a second `input-selector`
 // via an `appsrc → rtpopusdepay → opusdec` chain. This blocked
@@ -325,12 +347,20 @@ pub fn combined_launch_string(idle: &IdleKind) -> String {
             ! video/x-h264,stream-format=byte-stream,alignment=au \
             ! h264parse config-interval=1 \
             ! rtph264pay name=pay0 pt=96 config-interval=1 \
-            {audio} ! rtpmp4apay name=pay1 pt=97 )",
+            {idle_audio} ! queue max-size-buffers=32 leaky=downstream ! amix.sink_0 \
+            {live_audio} ! queue max-size-buffers=32 leaky=downstream ! amix.sink_1 \
+            audiomixer name=amix \
+            ! audioconvert \
+            ! avenc_aac name={aenc} bitrate=64000 \
+            ! aacparse \
+            ! rtpmp4apay name=pay1 pt=97 )",
         idle_raw = idle_raw_chain(idle),
         live_decode = live_decode_chain(),
         enc = UNIFIED_ENCODER_NAME,
         gop = UNIFIED_GOP,
-        audio = idle_audio_desc(),
+        idle_audio = idle_audio_raw_chain(),
+        live_audio = live_audio_decode_chain(),
+        aenc = UNIFIED_AUDIO_ENCODER_NAME,
     )
 }
 
@@ -383,6 +413,34 @@ clock-rate=90000,payload={pt}\" \
          ! videoconvert ! videoscale ! videorate \
          ! video/x-raw,format=I420,\
 width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1"
+    )
+}
+
+/// Idle audio bed — silent 48 kHz stereo `F32LE`, always on. Feeds
+/// `amix.sink_0` so the audio branch always produces output (and thus
+/// `pay1` always has caps) regardless of whether live audio is
+/// flowing. `F32LE` is `avenc_aac`'s only accepted input format.
+fn idle_audio_raw_chain() -> &'static str {
+    "audiotestsrc wave=silence is-live=true \
+     ! audioconvert ! audioresample \
+     ! audio/x-raw,format=F32LE,rate=48000,channels=2"
+}
+
+/// Live Opus RTP → decode → normalize to the unified raw audio caps.
+/// A bare `appsrc` (fed by [`crate::webrtc_pipeline`]) carrying Opus
+/// RTP, decoded and pinned to `F32LE` stereo so the `audiomixer` sees
+/// matching caps on both pads. Mirrors [`live_decode_chain`] on the
+/// video side. Until the first Opus buffer arrives this branch is
+/// silent and the mixer emits the idle bed alone.
+fn live_audio_decode_chain() -> String {
+    let pt = LIVE_RTP_OPUS_PT;
+    format!(
+        "appsrc name=live_audio_rtp_src is-live=true do-timestamp=true format=time \
+         caps=\"application/x-rtp,media=audio,encoding-name=OPUS,\
+clock-rate=48000,payload={pt}\" \
+         ! rtpopusdepay ! opusdec \
+         ! audioconvert ! audioresample \
+         ! audio/x-raw,format=F32LE,rate=48000,channels=2"
     )
 }
 
@@ -643,17 +701,32 @@ mod tests {
     }
 
     #[test]
-    fn combined_launch_string_emits_silent_audio_pay1() {
-        // Phase 8 Opus bridging is deferred; audio stays silent AAC.
+    fn combined_launch_string_emits_single_audio_pay1() {
+        // One silent bed + one live Opus branch mix into one AAC pay1.
         let s = combined_launch_string(&synth_idle());
         assert!(s.contains("audiotestsrc"));
         assert!(s.contains("wave=silence"));
-        assert!(!s.contains("opusdec"));
-        assert!(!s.contains("rtpopusdepay"));
-        assert!(!s.contains("live_audio_src"));
-        assert!(!s.contains("sel_a"));
         assert_eq!(s.matches("rtpmp4apay").count(), 1);
         assert!(s.contains("rtpmp4apay name=pay1 pt=97"));
+        assert_eq!(s.matches("avenc_aac").count(), 1);
+    }
+
+    #[test]
+    fn combined_launch_string_bridges_live_audio_via_audiomixer() {
+        // Phase 8b: live audio uses an audiomixer (never a second
+        // input-selector, which stalls gst-rtsp-server prepare). The
+        // silent bed feeds sink_0, the decoded Opus feeds sink_1.
+        let s = combined_launch_string(&synth_idle());
+        assert!(s.contains("audiomixer name=amix"));
+        assert!(s.contains("amix.sink_0"));
+        assert!(s.contains("amix.sink_1"));
+        assert!(s.contains("appsrc name=live_audio_rtp_src"));
+        assert!(s.contains("rtpopusdepay ! opusdec"));
+        // No second input-selector anywhere.
+        assert!(!s.contains("sel_a"));
+        assert_eq!(s.matches("input-selector").count(), 1);
+        // Both mixer inputs pinned to F32LE (avenc_aac's only format).
+        assert!(s.matches("format=F32LE,rate=48000,channels=2").count() >= 2);
     }
 
     #[test]

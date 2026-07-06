@@ -7,25 +7,22 @@
 //!
 //! ```text
 //!  audiotestsrc(silence) ! opusenc ! rtpopuspay ! webrtcbin   (m0 sendrecv)
-//!  webrtcbin (m1 recvonly H.264)  --pad-added(video)--> appsink
+//!  webrtcbin (m1 recvonly H.264)  --pad-added(video)--> appsink → video sink
+//!  webrtcbin (m0 recv Opus)       --pad-added(audio)--> appsink → audio sink
 //!                                                          │ RTP bytes
 //!                                                          ▼
-//!                                                    LiveRtpSink
-//!                                                          │
-//!                                                          ▼
-//!                          appsrc inside the camera's persistent
-//!                          gst-rtsp-server media (Phase 6.3 splice).
+//!                          appsrc pair inside the camera's persistent
+//!                          gst-rtsp-server media (Phase 6.3 / 8b).
 //! ```
 //!
 //! The offer is generated here, carried to Arlo via the domain
 //! [`WebrtcSignaler`] (signaling-only rs-arlo), and the answer applied
-//! verbatim. Inbound H.264 RTP is forwarded into a [`LiveRtpSink`]
-//! supplied by the registry; the registry's pump task drains the sink
-//! into the live appsrc on the camera's persistent pipeline. The
-//! audio recv pad is drained to `fakesink` (Opus bridging deferred
-//! to Phase 8b — see `pipeline_desc` note). Teardown of the Arlo
-//! signaling session is the orchestrator's job
-//! (`WebrtcSignaler::teardown`, paired with detach);
+//! verbatim. Inbound H.264 RTP is forwarded into `sinks.video` and the
+//! camera's Opus RTP into `sinks.audio` (Phase 8b); the registry's pump
+//! tasks drain each into the matching live appsrc on the persistent
+//! pipeline (video → decode → I420 splice; audio → decode → mix onto
+//! silence). Teardown of the Arlo signaling session is the
+//! orchestrator's job (`WebrtcSignaler::teardown`, paired with detach);
 //! [`WebrtcLive::shutdown`] only tears down the local webrtcbin pipeline.
 //!
 //! This file requires a live GStreamer + camera and is excluded from
@@ -54,7 +51,7 @@ use streamer_domain::port::WebrtcSignaler;
 use streamer_domain::stream::{IceAddressFamily, IceServer};
 
 use crate::error::MediaError;
-use crate::live_rtp_sink::LiveRtpSink;
+use crate::live_rtp_sink::{LiveRtpSink, LiveSinks};
 
 /// H.264 payload type pinned in our offer (Arlo's gateway answers 103).
 const H264_PT: i32 = 103;
@@ -101,7 +98,7 @@ impl WebrtcLive {
         camera: &CameraId,
         ice: &[IceServer],
         signaler: &dyn WebrtcSignaler,
-        sink: LiveRtpSink,
+        sinks: LiveSinks,
         cfg: &WebrtcConfig,
     ) -> Result<Self, MediaError> {
         let pipeline = gst::Pipeline::default();
@@ -162,7 +159,7 @@ impl WebrtcLive {
         install_recv_branch(
             &pipeline,
             &webrtcbin,
-            sink,
+            sinks,
             got_rtp.clone(),
             first_rtp.clone(),
             kf_pad.clone(),
@@ -307,17 +304,17 @@ fn pct(s: &str) -> String {
     out
 }
 
-/// On the **video** src pad, forward raw RTP into the caller's
-/// [`LiveRtpSink`] via an `appsink`. The audio src pad (we offer audio
-/// sendrecv, so `FreeSWITCH` sends audio back) is drained into a
-/// `fakesink` — leaving it unlinked causes `GST_FLOW_NOT_LINKED` →
-/// "Internal data stream error" on the audio `nicesrc`. Opus
-/// bridging is deferred to Phase 8b (decode on the webrtc side and
-/// push raw samples into the persistent pipeline).
+/// On the **video** src pad, forward raw RTP into `sinks.video`; on the
+/// **audio** src pad (we offer audio sendrecv, so `FreeSWITCH` sends the
+/// camera's Opus back), forward raw RTP into `sinks.audio` (Phase 8b).
+/// Both go through an `appsink`; leaving either unlinked would cause
+/// `GST_FLOW_NOT_LINKED` → "Internal data stream error" on that leg's
+/// `nicesrc`. The persistent pipeline decodes each: H.264→I420 and
+/// Opus→AAC.
 fn install_recv_branch(
     pipeline: &gst::Pipeline,
     webrtcbin: &gst::Element,
-    sink: LiveRtpSink,
+    sinks: LiveSinks,
     got_rtp: Arc<AtomicBool>,
     first_rtp: Arc<Notify>,
     kf_pad: Arc<OnceLock<gst::glib::WeakRef<gst::Pad>>>,
@@ -334,45 +331,64 @@ fn install_recv_branch(
             .current_caps()
             .and_then(|c| c.structure(0).map(structure_is_video))
             .unwrap_or(false);
-        if !is_video {
-            debug!("draining non-video webrtcbin src pad (audio leg) → fakesink");
-            if let Err(e) = drain_to_fakesink(&pipeline, pad) {
-                warn!(error = %e, "failed to drain audio leg");
+        if is_video {
+            if let Err(e) = link_video_appsink(
+                &pipeline,
+                pad,
+                sinks.video.clone(),
+                got_rtp.clone(),
+                first_rtp.clone(),
+                &kf_pad,
+            ) {
+                warn!(error = %e, "failed to attach video appsink");
             }
-            return;
-        }
-        if let Err(e) = link_video_appsink(
-            &pipeline,
-            pad,
-            sink.clone(),
-            got_rtp.clone(),
-            first_rtp.clone(),
-            &kf_pad,
-        ) {
-            warn!(error = %e, "failed to attach video appsink");
+        } else {
+            debug!("attaching audio recv leg (Opus RTP → audio sink)");
+            if let Err(e) = link_audio_appsink(&pipeline, pad, sinks.audio.clone()) {
+                warn!(error = %e, "failed to attach audio appsink");
+            }
         }
     });
 }
 
-/// Consume the audio recv leg into a fakesink so its transport
-/// `nicesrc` doesn't error with `NOT_LINKED`. Deferred: Phase 8b will
-/// replace this with a decode chain that pushes raw samples into the
-/// persistent pipeline via a second [`LiveRtpSink`].
-fn drain_to_fakesink(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Result<(), MediaError> {
-    let fakesink = make("fakesink")?;
-    fakesink.set_property("sync", false);
-    fakesink.set_property("async", false);
+/// Forward the audio recv leg's Opus RTP into `sink` via an `appsink`
+/// (Phase 8b). Mirrors [`link_video_appsink`] but with no keyframe pump
+/// and no first-RTP gating — video drives the "live ready" signal;
+/// audio is best-effort and joins whenever `FreeSWITCH` relays it.
+fn link_audio_appsink(
+    pipeline: &gst::Pipeline,
+    pad: &gst::Pad,
+    sink: LiveRtpSink,
+) -> Result<(), MediaError> {
+    let appsink = gst_app::AppSink::builder()
+        .sync(false)
+        .max_buffers(1)
+        .drop(true)
+        .build();
+    appsink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |appsink| {
+                let sample = appsink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let buf = sample.buffer().ok_or(gst::FlowError::Error)?;
+                let map = buf.map_readable().map_err(|_| gst::FlowError::Error)?;
+                let _ = sink.push(Bytes::copy_from_slice(map.as_slice()));
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    let appsink_el: gst::Element = appsink.upcast();
     pipeline
-        .add(&fakesink)
-        .map_err(|e| MediaError::Pipeline(format!("add fakesink: {e}")))?;
-    fakesink
+        .add(&appsink_el)
+        .map_err(|e| MediaError::Pipeline(format!("add audio appsink: {e}")))?;
+    appsink_el
         .sync_state_with_parent()
-        .map_err(|e| MediaError::Pipeline(format!("fakesink sync state: {e}")))?;
-    let sink_pad = fakesink
+        .map_err(|e| MediaError::Pipeline(format!("audio appsink sync state: {e}")))?;
+    let sink_pad = appsink_el
         .static_pad("sink")
-        .ok_or_else(|| MediaError::Pipeline("fakesink has no sink pad".into()))?;
+        .ok_or_else(|| MediaError::Pipeline("audio appsink has no sink pad".into()))?;
     pad.link(&sink_pad)
-        .map_err(|e| MediaError::Pipeline(format!("link audio → fakesink: {e}")))?;
+        .map_err(|e| MediaError::Pipeline(format!("link webrtc audio → appsink: {e}")))?;
+    debug!("audio appsink attached");
     Ok(())
 }
 
