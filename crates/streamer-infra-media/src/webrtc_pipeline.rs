@@ -129,8 +129,19 @@ impl WebrtcLive {
             .map_err(|e| MediaError::Pipeline(format!("pipeline add: {e}")))?;
         gst::Element::link_many([&src, &conv, &resample, &opusenc, &pay, &paycaps])
             .map_err(|e| MediaError::Pipeline(format!("link audio chain: {e}")))?;
+        // Request the send sink pad **with caps**. GStreamer 1.28
+        // accepts a name-only `request_pad_simple("sink_%u")`, but
+        // 1.22 (Debian 12) webrtcbin returns NULL unless the media caps
+        // are supplied at request time — it needs them to create the
+        // transceiver. Passing `audio_caps` is the portable path and is
+        // harmless on 1.28; we fall back to the name-only request just
+        // in case a build lacks the template lookup.
+        let sink_templ = webrtcbin.pad_template("sink_%u").ok_or_else(|| {
+            MediaError::Pipeline("webrtcbin has no 'sink_%u' pad template".into())
+        })?;
         let wrb_sink = webrtcbin
-            .request_pad_simple("sink_%u")
+            .request_pad(&sink_templ, None, Some(&audio_caps))
+            .or_else(|| webrtcbin.request_pad_simple("sink_%u"))
             .ok_or_else(|| MediaError::Pipeline("webrtcbin has no sink request pad".into()))?;
         paycaps
             .static_pad("src")
