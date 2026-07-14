@@ -35,6 +35,14 @@ password_env = "ARLO_IMAP_PASSWORD"
 # ---------------------------------------------------------------------------
 
 [output]
+# H.264 encoder for the live/idle pipeline. This encoder runs continuously
+# per connected camera, so it dominates CPU (see the README "Performance"
+# section).
+#   "x264"  — software encoding, works everywhere (default).
+#   "vaapi" — Intel/AMD GPU (QuickSync/VAAPI); near-zero CPU per camera.
+#             Requires the `gstreamer1.0-vaapi` plugin and a `/dev/dri`
+#             render node on the host.
+video_encoder = "x264"
 # Prometheus /metrics endpoint (per-camera state, transitions, live seconds).
 metrics_bind = "127.0.0.1:9090"
 # Operational /admin HTTP endpoint (force-wake, force-idle, state snapshot).

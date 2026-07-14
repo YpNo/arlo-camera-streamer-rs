@@ -314,6 +314,7 @@ mod tests {
                 },
                 hls: None,
                 dash: None,
+                video_encoder: streamer_domain::config::VideoEncoder::X264,
                 metrics_bind: "127.0.0.1:9090".to_string(),
                 admin_bind: "127.0.0.1:9091".to_string(),
             },

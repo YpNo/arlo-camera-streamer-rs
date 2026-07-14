@@ -251,7 +251,9 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use streamer_domain::config::{CameraConfig, CooldownConfig, OutputConfig, RtspOutput};
+    use streamer_domain::config::{
+        CameraConfig, CooldownConfig, OutputConfig, RtspOutput, VideoEncoder,
+    };
     use streamer_domain::stream::{Codec, SignalingAnswer};
 
     /// Minimal `WebrtcSignaler` double — `attach_live` is stubbed in
@@ -313,10 +315,7 @@ mod tests {
                 .push((camera.clone(), idle, outputs));
             Ok(())
         }
-        async fn attach_live_sink(
-            &self,
-            camera: &CameraId,
-        ) -> Result<LiveSinks, MediaError> {
+        async fn attach_live_sink(&self, camera: &CameraId) -> Result<LiveSinks, MediaError> {
             self.attached.lock().unwrap().push(camera.clone());
             // The receivers are dropped immediately — the multiplexer
             // test only exercises the `ensure_registered` guard (real
@@ -353,6 +352,7 @@ mod tests {
             },
             hls: None,
             dash: None,
+            video_encoder: VideoEncoder::X264,
             metrics_bind: "127.0.0.1:9090".to_string(),
             admin_bind: "127.0.0.1:9091".to_string(),
         }

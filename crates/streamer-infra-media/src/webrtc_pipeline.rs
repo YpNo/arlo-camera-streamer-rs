@@ -271,8 +271,7 @@ fn apply_ice_address_family(webrtcbin: &gst::Element, family: IceAddressFamily) 
         }
         IceAddressFamily::Ipv4 => {
             let ice: gst::glib::Object = webrtcbin.property("ice");
-            let accepted: bool =
-                ice.emit_by_name("add-local-ip-address", &[&"0.0.0.0"]);
+            let accepted: bool = ice.emit_by_name("add-local-ip-address", &[&"0.0.0.0"]);
             debug!(accepted, "ICE: IPv4-only (add-local-ip-address = 0.0.0.0)");
         }
     }

@@ -149,7 +149,10 @@ async fn run(config: StreamerConfig) -> Result<()> {
     // -- Media adapter --
     let rtsp_server =
         RtspServer::start(&config.output.rtsp.bind).context("failed to start RTSP server")?;
-    let pipeline_registry = Arc::new(GstPipelineRegistry::new(rtsp_server.clone()));
+    let pipeline_registry = Arc::new(GstPipelineRegistry::new(
+        rtsp_server.clone(),
+        config.output.video_encoder,
+    ));
     let media: Arc<dyn streamer_domain::port::MediaMultiplexer> =
         Arc::new(GstMediaMultiplexer::new(
             pipeline_registry.clone(),

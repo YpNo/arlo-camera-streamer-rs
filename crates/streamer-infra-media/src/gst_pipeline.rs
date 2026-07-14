@@ -77,6 +77,7 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, instrument, warn};
 
 use streamer_domain::camera::CameraId;
+use streamer_domain::config::VideoEncoder;
 
 use crate::error::MediaError;
 use crate::idle_source::{IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH};
@@ -144,15 +145,20 @@ struct CameraEntry {
 /// GStreamer-backed [`PipelineRegistry`].
 pub struct GstPipelineRegistry {
     server: Arc<RtspServer>,
+    /// H.264 encoder backend (software `x264` or GPU `vaapi`) baked into
+    /// every camera's persistent launch string.
+    video_encoder: VideoEncoder,
     state: RwLock<HashMap<CameraId, CameraEntry>>,
 }
 
 impl GstPipelineRegistry {
-    /// Construct from a started RTSP server.
+    /// Construct from a started RTSP server and the configured video
+    /// encoder backend.
     #[must_use]
-    pub fn new(server: Arc<RtspServer>) -> Self {
+    pub fn new(server: Arc<RtspServer>, video_encoder: VideoEncoder) -> Self {
         Self {
             server,
+            video_encoder,
             state: RwLock::new(HashMap::new()),
         }
     }
@@ -203,7 +209,7 @@ impl PipelineRegistry for GstPipelineRegistry {
         // Refresh the standby clock so the very first frame after
         // register reflects the current time.
         let idle = Self::refresh_overlay_timestamp(&idle);
-        let launch = combined_launch_string(&idle);
+        let launch = combined_launch_string(&idle, self.video_encoder);
         debug!(camera = %camera, launch_string = %launch, "combined launch string");
 
         let wiring: Arc<StdMutex<Option<LiveWiring>>> = Arc::new(StdMutex::new(None));
@@ -436,9 +442,9 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
     let sink_live = selector
         .static_pad("sink_1")
         .ok_or_else(|| MediaError::Pipeline("input-selector has no sink_1".into()))?;
-    let encoder = bin
-        .by_name(UNIFIED_ENCODER_NAME)
-        .ok_or_else(|| MediaError::Pipeline(format!("encoder '{UNIFIED_ENCODER_NAME}' not found")))?;
+    let encoder = bin.by_name(UNIFIED_ENCODER_NAME).ok_or_else(|| {
+        MediaError::Pipeline(format!("encoder '{UNIFIED_ENCODER_NAME}' not found"))
+    })?;
     // Optional: only the synthetic idle branch carries the overlay.
     let idle_overlay = bin.by_name(IDLE_OVERLAY_NAME);
 
@@ -492,7 +498,10 @@ async fn write_thumbnail_atomic(path: &Path, jpeg: &Bytes) -> Result<(), MediaEr
 fn apply_thumbnail_overlay(overlay: &gst::Element, path: &Path) {
     overlay.set_property("location", path.to_string_lossy().as_ref());
     overlay.set_property("overlay-width", i32::try_from(SYNTHETIC_WIDTH).unwrap_or(0));
-    overlay.set_property("overlay-height", i32::try_from(SYNTHETIC_HEIGHT).unwrap_or(0));
+    overlay.set_property(
+        "overlay-height",
+        i32::try_from(SYNTHETIC_HEIGHT).unwrap_or(0),
+    );
 }
 
 /// Install a single-shot pad probe on the live branch's selector

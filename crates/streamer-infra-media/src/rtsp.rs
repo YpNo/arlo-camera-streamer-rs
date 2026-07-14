@@ -29,7 +29,9 @@ use std::thread::JoinHandle;
 
 use gstreamer::glib;
 use gstreamer_rtsp_server::prelude::*;
-use gstreamer_rtsp_server::{RTSPMedia, RTSPMediaFactory, RTSPMountPoints, RTSPServer, RTSPSuspendMode};
+use gstreamer_rtsp_server::{
+    RTSPMedia, RTSPMediaFactory, RTSPMountPoints, RTSPServer, RTSPSuspendMode,
+};
 use tracing::{debug, info, warn};
 
 use crate::error::MediaError;

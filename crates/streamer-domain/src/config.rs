@@ -137,6 +137,24 @@ const fn default_push_timeout_secs() -> u64 {
     120
 }
 
+/// H.264 encoder for the unified splice pipeline.
+///
+/// The encoder runs continuously per connected camera (see the README
+/// "Performance" section), so it dominates CPU. `x264` is portable
+/// software encoding; `vaapi` offloads to an Intel/AMD GPU
+/// (QuickSync/VAAPI), cutting the per-camera cost to near-zero — but it
+/// requires the `gstreamer1.0-vaapi` plugin and a working `/dev/dri`
+/// render node on the host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoEncoder {
+    /// Software `x264enc` (default; works everywhere).
+    #[default]
+    X264,
+    /// Hardware `vaapih264enc` (Intel/AMD GPU via VAAPI).
+    Vaapi,
+}
+
 /// All output-side configuration: stream endpoints + ops sockets.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OutputConfig {
@@ -148,6 +166,9 @@ pub struct OutputConfig {
     /// MPEG-DASH sink — optional secondary output.
     #[serde(default)]
     pub dash: Option<DashOutput>,
+    /// H.264 encoder for the live/idle pipeline (software or GPU).
+    #[serde(default)]
+    pub video_encoder: VideoEncoder,
     /// Bind address for the Prometheus `/metrics` endpoint.
     #[serde(default = "default_metrics_bind")]
     pub metrics_bind: String,
@@ -269,6 +290,26 @@ fn default_budget_reset() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_encoder_parses_lowercase_and_defaults_to_x264() {
+        #[derive(Deserialize)]
+        struct W {
+            #[serde(default)]
+            e: VideoEncoder,
+        }
+        assert_eq!(VideoEncoder::default(), VideoEncoder::X264);
+        assert_eq!(toml::from_str::<W>("").unwrap().e, VideoEncoder::X264);
+        assert_eq!(
+            toml::from_str::<W>("e = \"x264\"").unwrap().e,
+            VideoEncoder::X264
+        );
+        assert_eq!(
+            toml::from_str::<W>("e = \"vaapi\"").unwrap().e,
+            VideoEncoder::Vaapi
+        );
+        assert!(toml::from_str::<W>("e = \"nvenc\"").is_err());
+    }
 
     #[test]
     fn cooldown_default_matches_documented_values() {
