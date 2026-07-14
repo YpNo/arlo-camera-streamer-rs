@@ -58,7 +58,10 @@ FROM debian:bookworm-slim AS runtime
 
 # Runtime libraries: GStreamer base + plugins required by the idle and
 # live pipelines (videotestsrc, jpegdec, x264enc, h264parse, h265parse,
-# rtspserver). Bring `tini` as PID 1 so signals propagate cleanly.
+# rtspserver), the WebRTC transport (`gstreamer1.0-nice` = libnice ICE,
+# required by webrtcbin for live streaming), and `chromium` for rs-arlo's
+# headless-browser authentication. Bring `tini` as PID 1 so signals
+# propagate cleanly.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         tini \
@@ -68,7 +71,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gstreamer1.0-plugins-ugly \
         gstreamer1.0-libav \
         gstreamer1.0-rtsp \
+        gstreamer1.0-nice \
         gstreamer1.0-tools \
+        chromium \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user: uid 10001 keeps us out of the typical host uid space.

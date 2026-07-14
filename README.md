@@ -40,24 +40,62 @@ streamer-bin           — composition root (the daemon binary)
 ```
 
 Read [`crates/streamer-domain/src/port.rs`](./crates/streamer-domain/src/port.rs)
-to see the contracts. Two ADRs document the load-bearing decisions:
+to see the contracts. The ADRs document the load-bearing decisions:
 
-- [docs/adr/0001-factory-restart-splice.md](./docs/adr/0001-factory-restart-splice.md)
+- [docs/adr/0001-factory-restart-splice.md](./docs/adr/0001-factory-restart-splice.md) — *superseded by 0003*
 - [docs/adr/0002-rtsp-only-output-v1.md](./docs/adr/0002-rtsp-only-output-v1.md)
+- [docs/adr/0003-seamless-input-selector-splice.md](./docs/adr/0003-seamless-input-selector-splice.md)
 
 ## Prerequisites
 
 - **Rust** ≥ 1.95 (`rustup toolchain install 1.95.0`).
-- **GStreamer 1.22+** with the standard plugin set:
+- **GStreamer 1.22+** with the plugin set below.
   - `gstreamer1.0-plugins-base`
-  - `gstreamer1.0-plugins-good`
-  - `gstreamer1.0-plugins-bad`
+  - `gstreamer1.0-plugins-good` (also provides `gdkpixbufoverlay` for the idle thumbnail)
+  - `gstreamer1.0-plugins-bad` (`webrtcbin`, DTLS/SRTP)
   - `gstreamer1.0-plugins-ugly`
-  - `gstreamer1.0-libav`
-  - `gstreamer1.0-rtsp` (the rtsp-server library)
+  - `gstreamer1.0-libav` (`avdec_h264`, `avenc_aac`)
+  - **`gstreamer1.0-nice`** — libnice ICE for `webrtcbin`. **Required for live streaming.** Without it, live fails at motion with `pipeline error: webrtcbin has no sink request pad` (the idle stream still works, which makes it easy to miss).
+  - the `gst-rtsp-server` library (Debian: `libgstrtspserver-1.0-0`).
+  - *Optional* `gstreamer1.0-vaapi` — Intel/AMD hardware H.264 encode (QuickSync/VAAPI); big CPU win for multi-camera (see [Performance](#performance)).
+- **A Chromium/Chrome browser** — rs-arlo drives a headless browser for
+  Arlo authentication (it is *not* bundled). Found on `PATH` (`chromium`,
+  `google-chrome`, …) or via the `CHROME` env var. Missing it fails at
+  startup with a "could not find chrome" launch error.
 - An Arlo cloud account with at least one camera.
 - An IMAP mailbox you can poll for the Arlo MFA OTP, or be ready to
   type the OTP on stdin (cold-start only).
+
+### Runtime dependencies — quick install
+
+**Debian/Ubuntu:**
+
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+  gstreamer1.0-libav gstreamer1.0-nice \
+  libgstrtspserver-1.0-0 gstreamer1.0-tools \
+  chromium
+# optional — Intel/AMD hardware H.264 encode:
+sudo apt-get install -y gstreamer1.0-vaapi
+```
+
+**macOS (Homebrew):** the `gstreamer` formula bundles every plugin
+above (including `gst-rtsp-server` and libnice) in one package.
+
+```bash
+brew install gstreamer
+brew install --cask google-chrome   # or: brew install chromium
+```
+
+Sanity-check the WebRTC transport plugins are present (these are the
+ones most often missing on a fresh box):
+
+```bash
+for e in webrtcbin nicesrc dtlssrtpenc srtpenc; do \
+  printf '%-12s ' "$e"; gst-inspect-1.0 "$e" >/dev/null 2>&1 && echo OK || echo MISSING; done
+```
 
 ## Installation
 
@@ -198,9 +236,41 @@ curl -H "Authorization: Bearer $STREAMER_ADMIN_TOKEN" \
   again — make sure that mailbox is reachable.
 - **RTSP latency** is typically 2–4 s during live, dominated by the
   Arlo cloud's H.264 chunk size, not by us.
-- **Splice strategy is factory-restart.** When transitioning Idle→Live
-  the RTSP factory is rebuilt, which means Frigate sees a brief
-  reconnect (~1 s). This is intentional — see ADR 0001.
+- **Splice strategy is a seamless `input-selector`.** Idle↔Live
+  transitions happen inside one persistent RTSP pipeline (both branches
+  decoded to raw and re-encoded by a single downstream encoder), so
+  connected clients — VLC *and* Frigate — see one continuous stream
+  with no reconnect. See [ADR 0003](./docs/adr/0003-seamless-input-selector-splice.md)
+  (supersedes ADR 0001). The cost is an always-on encoder — see
+  [Performance](#performance).
+
+## Performance
+
+Measured on an Intel i5-6500T (4 cores, Skylake) with **software**
+`x264enc` at 720p15, one camera:
+
+| State                            | CPU (share of one core) |
+|----------------------------------|-------------------------|
+| No RTSP client connected         | ~0%                     |
+| Idle stream, client connected    | ~0.6 core               |
+| Live stream                      | ~0.85 core              |
+
+The dominant cost is the **always-on H.264 encoder**: it runs whenever a
+client is connected (Frigate stays connected 24/7), so idle and live
+cost almost the same — live only adds the decode (~0.25 core). CPU
+therefore scales with the number of **connected** cameras, not with how
+many are live. On a 4-core box that is a ceiling of roughly **6 idle /
+4–5 concurrently live** cameras.
+
+For more cameras, offload H.264 encoding to the GPU. Set
+`[output] video_encoder = "vaapi"` to use the Intel/AMD QuickSync encoder
+(`vaapih264enc`) instead of software `x264enc` — it drops the ~0.6
+core/camera to near-zero. Requires the `gstreamer1.0-vaapi` plugin and a
+`/dev/dri` render node (pass `--device /dev/dri` to the container).
+
+> The `gupnp … 1900: Address already in use` warnings at live start are
+> harmless — libnice's UPnP probe colliding with local bridge
+> interfaces; live streaming is unaffected.
 
 ## Testing
 

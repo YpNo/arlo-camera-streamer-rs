@@ -2,21 +2,27 @@
 //!
 //! Each registered camera owns one entry in the embedded
 //! `gst-rtsp-server`'s mount-point table. The factory at
-//! `/<stream_name>` is bound to one of two launch strings:
+//! `/<stream_name>` is bound to **one persistent** launch string
+//! ([`pipeline_desc::combined_launch_string`]) that hosts both the idle
+//! and live sources behind an `input-selector` (video) and an
+//! `audiomixer` (audio):
 //!
 //! ```text
-//!  Idle  : ( videotestsrc + textoverlay → x264enc → rtph264pay name=pay0
-//!          + audiotestsrc wave=silence  → avenc_aac → rtpmp4apay name=pay1 )
-//!
-//!  Live  : ( rtspsrc {camera_url} → {parsebin | rtph26{4,5}depay} → rtph26{4,5}pay name=pay0
-//!          + rtspsrc {camera_url} → rtpmp4adepay → rtpmp4apay name=pay1 )
+//!  idle video: synthetic STANDBY + thumbnail → raw I420 ─┐
+//!  live video: appsrc(H.264 RTP) → decode → raw I420  ───┤→ sel → x264enc → pay0
+//!  idle audio: audiotestsrc silence ─┐
+//!  live audio: appsrc(Opus RTP) → decode ─┤→ audiomixer → avenc_aac → pay1
 //! ```
 //!
-//! Transitioning between idle and live atomically swaps the factory's
-//! launch string. Connected RTSP clients see a brief EOS and reconnect
-//! within ~1 s — Frigate handles this transparently. The seamless
-//! `input-selector` splice (with IDR-aligned pad probe) is scaffolded
-//! by [`splice::KeyframeWatcher`] and remains a Phase 6 polish target.
+//! Idle↔live transitions flip the selector's `active-pad` on the first
+//! decoded live frame (with a force-key-unit for a clean IDR); audio is
+//! simply mixed onto the silent bed. Because it's **one persistent
+//! pipeline**, connected RTSP clients (VLC *and* Frigate) see a
+//! continuous stream with no reconnect. The live H.264 + Opus RTP is
+//! delivered by the per-camera [`webrtc_pipeline`] leg. See
+//! `docs/adr/0003-seamless-input-selector-splice.md`. The legacy
+//! factory-restart builders remain in [`pipeline_desc`] but are off the
+//! production path.
 //!
 //! ## Crate layout
 //!

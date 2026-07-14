@@ -1,10 +1,17 @@
 # ADR 0001 — Factory-restart splice (Idle → Live transition)
 
-- **Status:** Accepted
+- **Status:** Superseded
 - **Date:** 2026-05-09
 - **Deciders:** Senior architect, project owner
 - **Supersedes:** —
-- **Superseded by:** —
+- **Superseded by:** [ADR 0003](./0003-seamless-input-selector-splice.md)
+
+> **Superseded (2026-07-12).** v1 shipped factory-restart as described
+> below, but the ~1 s reconnect broke plain RTSP clients (VLC) and lost
+> the first second of every live segment. The seamless `input-selector`
+> splice was implemented and is now the production strategy — see
+> [ADR 0003](./0003-seamless-input-selector-splice.md). The rest of this
+> document is retained as the original record.
 
 ## Context
 
