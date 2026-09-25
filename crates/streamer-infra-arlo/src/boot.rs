@@ -192,6 +192,8 @@ fn build_arlo_rs_config(
             user_agent: None,
             session_cache_path: Some(session_cache_path),
             headless: Some(true),
+            // Default transport is the browser-less `wreq` client; opt-in only.
+            use_browser: None,
             upstream_proxy: None,
             // Pin to the modern v3 API. arlo-rs auto-falls-back to
             // Legacy at runtime if the v2 device endpoints 403/404.
