@@ -123,6 +123,7 @@ mod tests {
             presigned_last_image_url: None,
             x_cloud_id: Some(format!("xc-{id}")),
             automation_revision: None,
+            allowed_mqtt_topics: vec![],
             connectivity: None,
         }
     }

@@ -77,6 +77,7 @@ mod tests {
             properties,
             source: None,
             trans_id: None,
+            active_mode: None,
         }
     }
 
