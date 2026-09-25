@@ -34,8 +34,8 @@ streamer-infra-arlo  = { path = "crates/streamer-infra-arlo" }
 streamer-infra-media = { path = "crates/streamer-infra-media" }
 streamer-infra-ops   = { path = "crates/streamer-infra-ops" }
 
-# ---- Sibling project (rs-arlo client) ----
-rs-arlo = { path = "../rs-arlo" }
+# ---- Sibling project (arlo-rs client) ----
+arlo-rs = { path = "../arlo-rs" }
 
 # ---- Async runtime ----
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs"] }

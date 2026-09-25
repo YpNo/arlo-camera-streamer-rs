@@ -1,4 +1,4 @@
-//! [`WebrtcSignaler`] implementation backed by rs-arlo's signaling
+//! [`WebrtcSignaler`] implementation backed by arlo-rs's signaling
 //! primitives (`sip_info` + `webrtc_negotiate` + `SignalingSocket`).
 //!
 //! v3 Arlo live is a WebRTC call brokered by a `FreeSWITCH` gateway. The
@@ -21,9 +21,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rs_arlo::client::ArloClient;
-use rs_arlo::client::livestream::SignalingSocket;
-use rs_arlo::models::sip::SipInfo;
+use arlo_rs::client::ArloClient;
+use arlo_rs::client::livestream::SignalingSocket;
+use arlo_rs::models::sip::SipInfo;
 use tokio::sync::Mutex;
 use tracing::debug;
 
@@ -35,7 +35,7 @@ use streamer_domain::stream::{IceServer, SignalingAnswer};
 use crate::device_registry::DeviceRegistry;
 use crate::error::arlo_to_domain;
 
-/// Adapter exposing rs-arlo's WebRTC signaling as the domain
+/// Adapter exposing arlo-rs's WebRTC signaling as the domain
 /// [`WebrtcSignaler`] port, owning the per-camera signaling socket.
 pub struct ArloWebrtcSignalerAdapter {
     client: Arc<ArloClient>,

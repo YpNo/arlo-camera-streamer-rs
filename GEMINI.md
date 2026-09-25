@@ -35,7 +35,7 @@
 ### `crates/streamer-infra-arlo/` — Protocol Adapter
 | File | Responsibility |
 |---|---|
-| `boot.rs` | Lifecycle management of the `rs-arlo` client. |
+| `boot.rs` | Lifecycle management of the `arlo-rs` client. |
 | `event_mapper.rs` | Translating raw Arlo events into streamer-domain events. |
 
 ## Knowledge Map

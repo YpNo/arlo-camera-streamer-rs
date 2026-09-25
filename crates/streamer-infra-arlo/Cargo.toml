@@ -1,6 +1,6 @@
 [package]
 name        = "streamer-infra-arlo"
-description = "rs-arlo adapter implementing the Arlo driven ports for the streamer."
+description = "arlo-rs adapter implementing the Arlo driven ports for the streamer."
 
 version.workspace      = true
 edition.workspace      = true
@@ -13,7 +13,7 @@ workspace = true
 
 [dependencies]
 streamer-domain = { workspace = true }
-rs-arlo         = { workspace = true }
+arlo-rs         = { workspace = true }
 
 async-trait  = { workspace = true }
 bytes        = { workspace = true }

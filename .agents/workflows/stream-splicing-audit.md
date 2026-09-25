@@ -7,7 +7,7 @@ Verify that the transition from the "Idle" dummy stream to the "Live" Arlo feed 
 ## Triggers
 - Modification of `crates/streamer-infra-media/src/splice.rs`.
 - Changes to GStreamer pipeline descriptions in `crates/streamer-infra-media/src/pipeline_desc.rs`.
-- Updates to `rs-arlo` that affect stream startup time.
+- Updates to `arlo-rs` that affect stream startup time.
 
 ## Steps
 

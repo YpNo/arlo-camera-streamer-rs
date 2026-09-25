@@ -59,7 +59,7 @@ FROM debian:bookworm-slim AS runtime
 # Runtime libraries: GStreamer base + plugins required by the idle and
 # live pipelines (videotestsrc, jpegdec, x264enc, h264parse, h265parse,
 # rtspserver), the WebRTC transport (`gstreamer1.0-nice` = libnice ICE,
-# required by webrtcbin for live streaming), and `chromium` for rs-arlo's
+# required by webrtcbin for live streaming), and `chromium` for arlo-rs's
 # headless-browser authentication. Bring `tini` as PID 1 so signals
 # propagate cleanly.
 RUN apt-get update && apt-get install -y --no-install-recommends \

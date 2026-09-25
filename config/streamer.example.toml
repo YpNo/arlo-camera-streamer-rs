@@ -12,7 +12,7 @@ email              = "owner@example.com"
 # Name of the env var holding the Arlo cloud account password.
 # Never write the password into this file directly.
 password_env       = "ARLO_PASSWORD"
-# rs-arlo persists the session token here so MFA isn't required on
+# arlo-rs persists the session token here so MFA isn't required on
 # every restart. Path must be readable + writable by the streamer
 # process. Permissions are forced to 0600 on Unix.
 session_cache_path = "/var/lib/arlo-streamer/session.json"

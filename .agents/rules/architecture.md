@@ -13,7 +13,7 @@
 
 - **Infrastructure Layer (`streamer-infra-*`)**:
     - Implementation of Output Ports using specialized crates.
-    - **`streamer-infra-arlo`**: Adapter for `rs-arlo` protocol library.
+    - **`streamer-infra-arlo`**: Adapter for `arlo-rs` protocol library.
     - **`streamer-infra-media`**: GStreamer pipelines, RTSP server, and splicing engine.
     - **`streamer-infra-ops`**: Prometheus metrics and axum health checks.
 

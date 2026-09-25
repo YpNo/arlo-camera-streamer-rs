@@ -121,7 +121,7 @@ jobs:
         # - I/O-heavy infra-arlo files — `boot.rs` async auth, `events.rs`
         #   live SSE bus, `stream_requester.rs` and `thumbnails.rs` real
         #   network calls. Their pure logic (`event_mapper.rs`, `error.rs`,
-        #   the `build_rs_arlo_config` and `utf8_path` helpers) IS unit-tested
+        #   the `build_arlo_rs_config` and `utf8_path` helpers) IS unit-tested
         #   inline; the wrappers belong to integration tests against a real
         #   Arlo account, gated separately in Phase 6.
         run: |

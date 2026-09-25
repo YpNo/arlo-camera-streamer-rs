@@ -22,5 +22,5 @@ doc-valid-idents = [
     "SSE",
     "PIR",
     "MPEG",
-    "rs-arlo",
+    "arlo-rs",
 ]

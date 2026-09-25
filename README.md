@@ -33,7 +33,7 @@ Hexagonal Rust workspace, six crates:
 ```
 streamer-domain        — pure types & port traits (no I/O)
 streamer-app           — orchestrator + state machine + budget tracker
-streamer-infra-arlo    — adapter for the rs-arlo client
+streamer-infra-arlo    — adapter for the arlo-rs client
 streamer-infra-media   — GStreamer pipelines + embedded RTSP server
 streamer-infra-ops     — /metrics, /healthz, /readyz, /admin/*
 streamer-bin           — composition root (the daemon binary)
@@ -58,7 +58,7 @@ to see the contracts. The ADRs document the load-bearing decisions:
   - **`gstreamer1.0-nice`** — libnice ICE for `webrtcbin`. **Required for live streaming.** Without it, live fails at motion with `pipeline error: webrtcbin has no sink request pad` (the idle stream still works, which makes it easy to miss).
   - the `gst-rtsp-server` library (Debian: `libgstrtspserver-1.0-0`).
   - *Optional* `gstreamer1.0-vaapi` — Intel/AMD hardware H.264 encode (QuickSync/VAAPI); big CPU win for multi-camera (see [Performance](#performance)).
-- **A Chromium/Chrome browser** — rs-arlo drives a headless browser for
+- **A Chromium/Chrome browser** — arlo-rs drives a headless browser for
   Arlo authentication (it is *not* bundled). Found on `PATH` (`chromium`,
   `google-chrome`, …) or via the `CHROME` env var. Missing it fails at
   startup with a "could not find chrome" launch error.

@@ -51,7 +51,7 @@ pub struct ArloConfig {
     /// The streamer reads `std::env::var(password_env)` at boot; the
     /// password is **never** written to TOML.
     pub password_env: String,
-    /// Filesystem path where the rs-arlo session token snapshot is
+    /// Filesystem path where the arlo-rs session token snapshot is
     /// persisted across restarts. Must be readable + writable by the
     /// streamer process.
     pub session_cache_path: PathBuf,

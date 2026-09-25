@@ -1,6 +1,6 @@
-//! [`ArloEventSource`] implementation backed by `rs_arlo::events::EventBus`.
+//! [`ArloEventSource`] implementation backed by `arlo_rs::events::EventBus`.
 //!
-//! Wraps the broadcast / watch channels exposed by rs-arlo behind
+//! Wraps the broadcast / watch channels exposed by arlo-rs behind
 //! [`futures::Stream`]s, and translates each [`ArloEvent`] into the
 //! domain [`CameraEvent`] vocabulary via
 //! [`crate::event_mapper::map_event`].
@@ -15,14 +15,14 @@
 //! re-fire on the next motion pulse, and connection-state changes are
 //! observed via the dedicated watch channel.
 //!
-//! [`ArloEvent`]: rs_arlo::models::events::ArloEvent
+//! [`ArloEvent`]: arlo_rs::models::events::ArloEvent
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
-use rs_arlo::client::ArloClient;
-use rs_arlo::events::ConnectionState as ArloConnectionState;
+use arlo_rs::client::ArloClient;
+use arlo_rs::events::ConnectionState as ArloConnectionState;
 use tokio_stream::wrappers::{BroadcastStream, WatchStream};
 use tracing::warn;
 
@@ -33,7 +33,7 @@ use streamer_domain::port::ArloEventSource;
 use crate::error::arlo_to_domain;
 use crate::event_mapper::map_event;
 
-/// Adapter that exposes the rs-arlo SSE event bus as the domain
+/// Adapter that exposes the arlo-rs SSE event bus as the domain
 /// [`ArloEventSource`] port.
 pub struct ArloEventSourceAdapter {
     client: Arc<ArloClient>,

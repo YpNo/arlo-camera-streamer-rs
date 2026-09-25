@@ -1,6 +1,6 @@
-//! `rs-arlo` adapter — implements the Arlo driven ports.
+//! `arlo-rs` adapter — implements the Arlo driven ports.
 //!
-//! Composes a single shared `Arc<rs_arlo::client::ArloClient>` behind
+//! Composes a single shared `Arc<arlo_rs::client::ArloClient>` behind
 //! three independent port impls, plus a [`boot()`] entry point that
 //! handles auth, session-cache restore, and IMAP MFA cold-start.
 //!
@@ -8,7 +8,7 @@
 //!
 //! - [`mod@boot`] — top-level orchestration: build + authenticate
 //! - [`device_registry`] — shared `CameraId → Device` cache
-//! - [`event_mapper`] — pure `rs_arlo::ArloEvent` → domain `CameraEvent`
+//! - [`event_mapper`] — pure `arlo_rs::ArloEvent` → domain `CameraEvent`
 //! - [`events`] — [`ArloEventSource`](streamer_domain::port::ArloEventSource) impl
 //! - [`stream_requester`] — [`WebrtcSignaler`](streamer_domain::port::WebrtcSignaler) impl
 //! - [`thumbnails`] — [`ArloThumbnailSource`](streamer_domain::port::ArloThumbnailSource) impl

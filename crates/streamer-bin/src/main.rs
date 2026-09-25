@@ -7,9 +7,9 @@
 //! 3. Initialize GStreamer (must run before any `gstreamer::*` call).
 //! 4. Load and parse the TOML config.
 //! 5. Build [`Metrics`] + [`Readiness`]; pre-warm per-camera state rows.
-//! 6. Boot the rs-arlo client (`streamer_infra_arlo::boot::boot`) →
+//! 6. Boot the arlo-rs client (`streamer_infra_arlo::boot::boot`) →
 //!    construct the three Arlo port adapters from the shared
-//!    [`std::sync::Arc<rs_arlo::client::ArloClient>`].
+//!    [`std::sync::Arc<arlo_rs::client::ArloClient>`].
 //! 7. Start the embedded RTSP server, build [`GstPipelineRegistry`],
 //!    and wrap it in a [`GstMediaMultiplexer`].
 //! 8. Spawn [`StreamerSystem`] (one orchestrator per camera + the
@@ -127,7 +127,7 @@ async fn run(config: StreamerConfig) -> Result<()> {
     // -- Arlo adapter trio --
     let arlo_client = boot(&config.arlo)
         .await
-        .context("failed to boot rs-arlo client")?;
+        .context("failed to boot arlo-rs client")?;
     // One shared reqwest client so connection pooling kicks in across
     // cameras when fetching presigned thumbnail URLs from S3.
     let http = reqwest::Client::builder()

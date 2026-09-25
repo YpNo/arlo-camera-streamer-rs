@@ -14,7 +14,7 @@
 //! Anything that doesn't match returns [`None`]. The orchestrator
 //! never sees these — they're filtered out at the adapter boundary.
 
-use rs_arlo::models::events::ArloEvent;
+use arlo_rs::models::events::ArloEvent;
 use serde_json::Value;
 
 use streamer_domain::camera::CameraId;

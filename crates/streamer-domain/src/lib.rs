@@ -3,7 +3,7 @@
 //! This crate contains only types, state-machine descriptors, and port
 //! traits. It has zero I/O, no async runtime spawning, and no
 //! infrastructure dependencies. Adapters in `streamer-infra-*` implement
-//! the ports defined here against external systems (rs-arlo, GStreamer).
+//! the ports defined here against external systems (arlo-rs, GStreamer).
 //!
 //! # Layering
 //!

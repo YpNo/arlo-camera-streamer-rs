@@ -1,7 +1,7 @@
 //! Inbound camera events — normalized vocabulary the application layer
 //! reasons about.
 //!
-//! Adapters translate vendor-specific events (e.g. `rs_arlo::ArloEvent`)
+//! Adapters translate vendor-specific events (e.g. `arlo_rs::ArloEvent`)
 //! into these variants so that the orchestrator never sees Arlo-specific
 //! shapes.
 

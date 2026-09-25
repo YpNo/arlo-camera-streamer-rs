@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This document outlines the architecture and development plan for arlo-streamer-rs, a Rust-based daemon that bridges the Arlo camera ecosystem with Frigate. It leverages the highly capable rs-arlo library to securely authenticate, listen to events, and decrypt media, while exposing standard video streams (RTSP, HLS, DASH) for NVR consumption.
+This document outlines the architecture and development plan for arlo-streamer-rs, a Rust-based daemon that bridges the Arlo camera ecosystem with Frigate. It leverages the highly capable arlo-rs library to securely authenticate, listen to events, and decrypt media, while exposing standard video streams (RTSP, HLS, DASH) for NVR consumption.
 
 ## Architectural Analysis & Challenges (The "Challenge")
 
@@ -15,7 +15,7 @@ The Solution (Stream Splicing / Fallback Multiplexer): Our bridge must decouple 
 
 - Idle State: The Rust app serves a locally generated 1 FPS dummy stream (e.g., a black frame, or the last detected snapshot) to Frigate. This keeps Frigate's Ffmpeg process alive without waking the camera.
 
-- Active State: When the rs-arlo SSE Event Bus emits a Motion or Audio event, the app triggers a stream request, intercepts the encrypted chunks, decrypts them via rs-arlo::client::library, and dynamically splices the live H.264/H.265 frames into the continuous pipeline.
+- Active State: When the arlo-rs SSE Event Bus emits a Motion or Audio event, the app triggers a stream request, intercepts the encrypted chunks, decrypts them via arlo-rs::client::library, and dynamically splices the live H.264/H.265 frames into the continuous pipeline.
 
 - Cooldown: Once the event completes, the pipeline seamlessly transitions back to the dummy frame.
 
@@ -30,15 +30,15 @@ We should not reinvent the media serving wheel, but we also want to keep the arc
 
 ### Challenge 3: Encryption & Local Hub vs. Cloud
 
-The Problem: As noted in the rs-arlo context, Arlo encrypts media chunks, and fetching them involves complex S3 chunking or local RATLS.
+The Problem: As noted in the arlo-rs context, Arlo encrypts media chunks, and fetching them involves complex S3 chunking or local RATLS.
 
-The Solution: We must rigorously use rs-arlo's Media Library for decryption and abstract the source. The streamer should not care if the chunk came from LocalHubClient (LAN) or CloudScraperTransport (WAN) — it only expects raw decrypted frames.
+The Solution: We must rigorously use arlo-rs's Media Library for decryption and abstract the source. The streamer should not care if the chunk came from LocalHubClient (LAN) or CloudScraperTransport (WAN) — it only expects raw decrypted frames.
 
 ## Proposed System Architecture
 
 Components
 
-### Arlo Controller (rs-arlo wrapper):
+### Arlo Controller (arlo-rs wrapper):
 
 - Manages the 6-step MFA OAuth ceremony via MfaHandler.
 
@@ -46,7 +46,7 @@ Components
 
 ### Event Orchestrator:
 
-- Hooks into the rs-arlo SSE EventBus.
+- Hooks into the arlo-rs SSE EventBus.
 
 - Maps Arlo device IDs to local Frigate stream identities.
 
@@ -54,7 +54,7 @@ Components
 
 - DummySrc: A GStreamer element (e.g., `videotestsrc` or `appsrc` with a static frame) generating idle frames at 1 FPS.
 
-- LiveSrc: `appsrc` element receiving decrypted byte arrays from `rs-arlo::client::library`.
+- LiveSrc: `appsrc` element receiving decrypted byte arrays from `arlo-rs::client::library`.
 
 - SwitchingLogic: GStreamer `input-selector` or dynamic pad linking to safely switch streams without dropping sequence numbers or breaking NAL units.
 
@@ -68,14 +68,14 @@ Phase 1: Foundation & Event Bridging
 
 - Task 1.1: Initialize the application using tokio and tracing. Setup configuration parsing (mapping Arlo Device IDs to friendly names).
 
-- Task 1.2: Integrate rs-arlo initialization. Hook up ImapMfaHandler or StdinMfaHandler for automated headless login.
+- Task 1.2: Integrate arlo-rs initialization. Hook up ImapMfaHandler or StdinMfaHandler for automated headless login.
 
-- Task 1.3: Subscribe to the rs-arlo SSE EventBus. Create a reactive loop that logs ConnectionState and Motion events to standard out.
+- Task 1.3: Subscribe to the arlo-rs SSE EventBus. Create a reactive loop that logs ConnectionState and Motion events to standard out.
 
 Phase 2: Decryption & Media Ingestion
-- Task 2.1: On motion event, trigger get_stream via rs-arlo.
+- Task 2.1: On motion event, trigger get_stream via arlo-rs.
 
-- Task 2.2: Pipe the encrypted S3 chunks/Local Hub stream through rs-arlo::client::library.
+- Task 2.2: Pipe the encrypted S3 chunks/Local Hub stream through arlo-rs::client::library.
 
 - Task 2.3: Buffer and identify the NAL units (Network Abstraction Layer) of the decrypted H.264/H.265 stream.
 
@@ -96,7 +96,7 @@ rtsp://localhost:8554/{camera_name}
 - Task 4.3: Document the Frigate go2rtc and cameras: yaml configuration mapping. Since Frigate handles RTSP seamlessly, we only need to expose the RTSP endpoint.
 
 Phase 5: Hardening & Containerization
-- Task 5.1: Implement auto-reconnect logic for when rs-arlo Pinger fails or session expires.
+- Task 5.1: Implement auto-reconnect logic for when arlo-rs Pinger fails or session expires.
 - Task 5.2: Create a minimal Dockerfile multi-stage build (bringing in rs-cloudscraper dependencies and GStreamer runtime libraries).
 - Task 5.3: Finalize CI/CD pipelines ensuring no unsafe code and passing cargo clippy.
 

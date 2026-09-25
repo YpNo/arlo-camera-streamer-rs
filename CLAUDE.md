@@ -6,7 +6,7 @@
 - **Type**: Workspace (Crates: `streamer-domain`, `streamer-app`, `streamer-infra-media`, `streamer-infra-arlo`, `streamer-infra-ops`, `streamer-bin`)
 - **Domain**: Media Streaming & Home Automation
 - **Primary adapters (inbound)**: RTSP Server, Metrics/Health API
-- **Driven adapters (outbound)**: `rs-arlo` client, GStreamer Pipelines
+- **Driven adapters (outbound)**: `arlo-rs` client, GStreamer Pipelines
 - **MSRV**: 1.95.0
 - **Async runtime**: tokio
 
@@ -18,7 +18,7 @@
 - `streamer-domain`: Owns the camera entities, configuration models, and port definitions.
 - `streamer-app`: Owns the orchestration logic and the camera state machine actors.
 - `streamer-infra-media`: Owns GStreamer pipeline management, RTSP delivery, and Idle-to-Live splicing.
-- `streamer-infra-arlo`: Owns the integration with the `rs-arlo` protocol library.
+- `streamer-infra-arlo`: Owns the integration with the `arlo-rs` protocol library.
 - `streamer-infra-ops`: Owns metrics (Prometheus) and health checks (axum).
 - `streamer-bin`: The composition root and CLI entry point.
 

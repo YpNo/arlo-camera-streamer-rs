@@ -16,7 +16,7 @@
 //! ```
 //!
 //! The offer is generated here, carried to Arlo via the domain
-//! [`WebrtcSignaler`] (signaling-only rs-arlo), and the answer applied
+//! [`WebrtcSignaler`] (signaling-only arlo-rs), and the answer applied
 //! verbatim. Inbound H.264 RTP is forwarded into `sinks.video` and the
 //! camera's Opus RTP into `sinks.audio` (Phase 8b); the registry's pump
 //! tasks drain each into the matching live appsrc on the persistent

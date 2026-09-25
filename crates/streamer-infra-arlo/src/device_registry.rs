@@ -1,6 +1,6 @@
 //! Shared, lazily-populated `CameraId → Device` cache.
 //!
-//! rs-arlo's v3 `start_stream` takes a full [`Device`] (it needs
+//! arlo-rs's v3 `start_stream` takes a full [`Device`] (it needs
 //! `parent_id` for the `to:` field and `x_cloud_id` for the `xcloudId`
 //! header), not a bare id string. Resolving a [`CameraId`] therefore
 //! requires a `get_devices()` cloud round-trip. Those identity fields
@@ -9,7 +9,7 @@
 //! on a cache miss — a camera provisioned after boot is still picked up
 //! on its first stream request.
 //!
-//! The cache stores `Arc<Device>` (rs-arlo's `Device` is not `Clone`):
+//! The cache stores `Arc<Device>` (arlo-rs's `Device` is not `Clone`):
 //! [`DeviceRegistry::resolve`] clones the cheap `Arc`, releases the
 //! lock, and only *then* lets the caller await `start_stream`. The
 //! `std::sync::RwLock` is therefore never held across an `.await`.
@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use rs_arlo::client::ArloClient;
-use rs_arlo::models::api::Device;
+use arlo_rs::client::ArloClient;
+use arlo_rs::models::api::Device;
 
 use streamer_domain::camera::CameraId;
 use streamer_domain::error::DomainError;
@@ -44,7 +44,7 @@ impl DeviceLister for ArloClient {
     }
 }
 
-/// Shared cache mapping a [`CameraId`] to its full rs-arlo [`Device`].
+/// Shared cache mapping a [`CameraId`] to its full arlo-rs [`Device`].
 pub struct DeviceRegistry {
     lister: Arc<dyn DeviceLister>,
     cache: RwLock<HashMap<String, Arc<Device>>>,

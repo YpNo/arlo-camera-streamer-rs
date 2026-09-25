@@ -1,4 +1,4 @@
-//! Translation layer between `rs_arlo::error::ArloError` and the
+//! Translation layer between `arlo_rs::error::ArloError` and the
 //! domain-level [`DomainError`].
 //!
 //! Keeps infrastructure error variants out of the domain crate while
@@ -7,7 +7,7 @@
 //! application layer can act on them; the rest fall through to
 //! [`DomainError::AdapterTransport`].
 
-use rs_arlo::error::ArloError;
+use arlo_rs::error::ArloError;
 use streamer_domain::error::DomainError;
 
 /// Map an [`ArloError`] into a [`DomainError`].
