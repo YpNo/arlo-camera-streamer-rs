@@ -33,6 +33,7 @@ use arlo_rs::client::ArloClient;
 use arlo_rs::config as rs_config;
 use tracing::{info, warn};
 
+use arlo_rs::secrecy::SecretString;
 use streamer_domain::config::{ArloConfig, EmailMfaConfig, MfaConfig};
 use streamer_domain::error::DomainError;
 
@@ -154,7 +155,7 @@ fn build_arlo_rs_config(
 ) -> rs_config::ArloConfig {
     let credentials = rs_config::CredentialsConfig {
         email: Some(cfg.email.clone()),
-        password: Some(secrets.arlo_password.clone()),
+        password: Some(SecretString::from(secrets.arlo_password.clone())),
     };
 
     let mfa = match (&cfg.mfa, secrets.imap_password.as_ref()) {
@@ -166,7 +167,7 @@ fn build_arlo_rs_config(
                 host: email.host.clone(),
                 port: Some(email.port),
                 username: email.user.clone(),
-                password: Some(pw.clone()),
+                password: Some(SecretString::from(pw.clone())),
                 delete_after_read: Some(false),
             }),
         },
@@ -206,6 +207,7 @@ fn build_arlo_rs_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arlo_rs::secrecy::ExposeSecret;
     use std::path::PathBuf;
     use streamer_domain::config::{EmailMfaConfig, PushMfaConfig};
 
@@ -255,7 +257,10 @@ mod tests {
 
         let creds = rs_cfg.credentials.expect("credentials present");
         assert_eq!(creds.email.as_deref(), Some("owner@example.com"));
-        assert_eq!(creds.password.as_deref(), Some("arlo_pw"));
+        assert_eq!(
+            creds.password.as_ref().map(ExposeSecret::expose_secret),
+            Some("arlo_pw")
+        );
 
         let mfa = rs_cfg.mfa.expect("mfa present");
         assert_eq!(mfa.preferred_method.as_deref(), Some("email"));
@@ -265,7 +270,10 @@ mod tests {
         assert_eq!(imap.provider, None);
         assert_eq!(imap.port, Some(993));
         assert_eq!(imap.username.as_deref(), Some("u@example.com"));
-        assert_eq!(imap.password.as_deref(), Some("imap_pw"));
+        assert_eq!(
+            imap.password.as_ref().map(ExposeSecret::expose_secret),
+            Some("imap_pw")
+        );
         assert_eq!(imap.enabled, Some(true));
 
         let client = rs_cfg.client.expect("client section present");
