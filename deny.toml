@@ -18,9 +18,9 @@ allow = [
     "ISC",
     "CDLA-Permissive-2.0",
     "Unicode-3.0",
-    "GPL-3.0",
-    "GPL-3.0-or-later",
     "0BSD",
+    # foldhash (hashbrown 0.17, under indexmap/h2). OSI-approved, permissive.
+    "Zlib",
 ]
 confidence-threshold = 0.8
 
@@ -45,18 +45,22 @@ deny = [
 
 # Certain crates/versions that will be skipped when doing duplicate detection.
 skip = [
-    # Example: Allowing a specific duplicate version of boring-sys due to upstream constraints
-    { crate = "thiserror@1.0.69", reason = "Required by tokio-socks v0.5.2" },
+    # Duplicate-version allowances, one per older version, each naming the
+    # crate that still requires it. Re-derive with
+    # `cargo tree -i <crate>@<version>` after a lockfile change.
+    { crate = "block-buffer@0.10.4", reason = "Required by digest v0.10 (sha1 v0.10, tungstenite); sha2 v0.11 (stealthscraper-rs) is on digest 0.11" },
+    { crate = "cpufeatures@0.2.17", reason = "Required by sha1 v0.10 (tungstenite); sha2 v0.11 is on cpufeatures 0.3" },
+    { crate = "crypto-common@0.1.7", reason = "Required by digest v0.10 (sha1 v0.10, tungstenite)" },
+    { crate = "digest@0.10.7", reason = "Required by sha1 v0.10 (tungstenite v0.28); sha2 v0.11 (stealthscraper-rs) is on digest 0.11" },
+    { crate = "getrandom@0.2.17", reason = "Required by ring v0.17" },
+    { crate = "getrandom@0.3.4", reason = "Required by rand_core v0.9 (tungstenite) and jobserver" },
+    { crate = "itertools@0.13.0", reason = "Required by bindgen v0.72 (btls-sys build dependency)" },
+    { crate = "syn@2.0.117", reason = "Every proc-macro crate except futures-macro v0.3.34, which moved to syn 3" },
+    { crate = "rand@0.9.4", reason = "Required by tungstenite v0.28 (stealthscraper-rs is on rand 0.10)" },
+    { crate = "rand_core@0.9.5", reason = "Required by rand v0.9.4" },
+    { crate = "thiserror@1.0.69", reason = "Required by tokio-socks v0.5" },
     { crate = "thiserror-impl@1.0.69", reason = "Required by thiserror v1.0.69" },
-    { crate = "socket2@0.5.10", reason = "Required by rquest v5.1.0"},
-    { crate = "rand_core@0.9.5", reason = "Required by rand v0.9.4"},
-    { crate = "rand@0.9.4", reason = "Required by rquest headless_chrome v1.0.21"},
-    { crate = "getrandom@0.2.17", reason = "Required by ring v0.17.14"},
-    { crate = "getrandom@0.3.4", reason = "Required by jobserver v0.1.34"},
-    { crate = "cpufeatures@0.2.17", reason = "Required by sha1 v0.10.6"},
-    { crate = "cookie_store@0.21.1", reason = "Required by rquest v5.1.0"},
-    { crate = "itertools@0.13.0", reason = "Required by rquest-util v2.2.1"},
-    { crate = "core-foundation@0.9.4", reason = "Required by rquest-util v2.2.1"},
+    { crate = "webpki-roots@0.26.11", reason = "Required by tokio-tungstenite v0.28 (arlo-rs); reqwest is on 1.0" },
 ]
 
 [sources]
