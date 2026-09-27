@@ -117,7 +117,14 @@ Order agreed with the user; items 1–4 are done (4 pending its live capture), 5
    race the first-RTP wait against an early loss so an attach that dies
    during ICE fails with the real reason instead of the 20 s timeout.
 4. **Two event contexts, two domain events** — built 2026-09-27 (ADR 0005),
-   **capture pending**. `CameraEvent::ManualStream` / `ManualStreamEnded`
+   **captured 2026-09-27: event side confirmed, media side refuted** —
+   Arlo refuses our WebRTC leg (error 14001 "RTSP Streaming in progress,
+   SIP Streaming is not allowed") while the app streams over RTSP. Next:
+   ADR 0006, RTSP pick-up of the app's stream via `get_stream_url` +
+   an `rtspsrc` live-source kind in the media adapter. Run
+   `cargo run --example peek_stream_url` in `../arlo-rs` (branch
+   `feat/stream-peek-probe`) while streaming from the app to learn the
+   URL shape first. `CameraEvent::ManualStream` / `ManualStreamEnded`
    from `activityState == "userStreamActive"` / `"idle"`; `LiveTrigger`
    field on the orchestrator; manual sessions: no debounce (debouncer
    `Held`), cap only, budget never charged, motion absorbed, activation

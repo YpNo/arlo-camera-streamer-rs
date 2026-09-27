@@ -1,6 +1,8 @@
 # ADR 0005 — Piggy-backing on a user's live view (manual stream)
 
-- **Status:** Accepted (wire signal pending live confirmation, see §Consequences)
+- **Status:** Accepted for the event side; **the media side is superseded
+  in practice** — see "Live capture, 2026-09-27" below. An ADR 0006 will
+  decide the RTSP pick-up.
 - **Date:** 2026-09-27
 - **Deciders:** Senior architect, project owner
 - **Supersedes:** —
@@ -125,3 +127,37 @@ MQTT bus carries the same payload shape as the retired SSE bus.
   capture may revisit it.
 - **A separate `max_manual_live` cap or a new counter.** No evidence yet
   that the existing cap and the signal label are insufficient.
+
+## Live capture, 2026-09-27
+
+Run from the phone with the debug capture target. Findings:
+
+1. **Wire signal confirmed.** Opening a live view publishes
+   `cameras/<id>` with `activityState: "startUserStream"` (unmapped, as
+   designed) followed ~200 ms later by `"userStreamActive"` (mapped to
+   `ManualStream`). Closing the app publishes `"idle"` twice.
+2. **Our own WebRTC leg is refused while the app streams.** The
+   `sipInfo` call fails with Arlo error `14001`: *"RTSP Streaming in
+   progress, SIP Streaming is not allowed, try after some time"*. The
+   mobile app therefore streams through the legacy RTSP path, and Arlo
+   allows one transport per camera at a time. The one-uplink-many-legs
+   assumption behind this ADR does not hold across transports.
+   Consequence: the piggy-back can only be an **RTSP pick-up** of the
+   app's own stream, which is exactly what `ArloClient::get_stream_url`
+   (action `get` on `/startStream`) exists for. That is the original
+   feature request from the handoff, and it needs a second live-source
+   kind in the media adapter (`rtspsrc` instead of `webrtcbin`).
+3. **Echo guard exercised.** A second `userStreamActive` arrived 400 ms
+   after the failed attach and was dropped by the guard.
+4. **An MQTT event without `action`** was dropped by arlo-rs at the
+   moment the app closed. arlo-rs now logs such events' keys and
+   resource; the `peek_stream_url` probe in `../arlo-rs` shows both the
+   peeked URL and the redacted bus events for the next capture.
+5. Motion-triggered wakes still fail the same way while the app streams
+   (pre-existing, now understood): the `Failed` state and its backoff
+   absorb it.
+
+What stays valid from this ADR: the two events, the trigger field, the
+free budget, the cap-only timers, the `idle`-first end signal and the
+echo guard. What changes: how the manual session's media is obtained.
+
