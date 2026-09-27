@@ -24,7 +24,8 @@ Frigate's pull from Arlo's push**:
 The transition is driven by Arlo's **MQTT event bus**: when the camera
 fires a motion event, the daemon negotiates a WebRTC session with Arlo's
 gateway, splices the live H.264 into the persistent GStreamer pipeline,
-and reverts to idle once the camera goes quiet.
+and reverts to idle once the camera goes quiet, or as soon as the live
+source itself dies (ADR 0004).
 
 ## Architecture
 
@@ -45,6 +46,7 @@ to see the contracts. The ADRs document the load-bearing decisions:
 - [docs/adr/0001-factory-restart-splice.md](./docs/adr/0001-factory-restart-splice.md) — *superseded by 0003*
 - [docs/adr/0002-rtsp-only-output-v1.md](./docs/adr/0002-rtsp-only-output-v1.md)
 - [docs/adr/0003-seamless-input-selector-splice.md](./docs/adr/0003-seamless-input-selector-splice.md)
+- [ADR 0004 — Live-loss feedback](./docs/adr/0004-live-lost-feedback.md): a dead live source returns the camera to idle within the stall timeout instead of the debounce or the continuous-live cap.
 
 ## Prerequisites
 
@@ -125,6 +127,7 @@ holding the values.
 | `arlo.mfa.host` / `.provider` / `.user` / `.password_env` / `.port` | strings | (port: 993) | IMAP mailbox for `kind = "email"`; without them the OTP is prompted on stdin. |
 | `arlo.mfa.poll_interval_secs` / `.timeout_secs` | u64  | `3` / `120`          | Approval polling for `kind = "push"`.                    |
 | `webrtc.ice_address_family`         | `dual`/`ipv4`  | `dual`               | ICE candidate gathering; `ipv4` when IPv6 to Arlo is broken. |
+| `webrtc.live_stall_timeout_secs`    | u64            | `10` (floor 4)       | Seconds without inbound video before the live source is declared lost and the output returns to idle (ADR 0004). |
 | `output.video_encoder`              | `x264`/`vaapi` | `x264`               | Software or Intel/AMD GPU H.264 encode (see Performance). |
 | `output.rtsp.bind`                  | `host:port`    | `0.0.0.0:8554`       | Embedded RTSP server.                                    |
 | `output.metrics_bind`               | `host:port`    | `127.0.0.1:9090`     | Prometheus + healthchecks.                               |

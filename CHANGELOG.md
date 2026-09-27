@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configurable H.264 encoder (`x264` software, `vaapi` hardware) and ICE
   address-family policy (`dual`, `ipv4`).
 - Multi-stage Docker image running as a non-root user.
+- Live-loss feedback (ADR 0004): `attach_live` returns a `LiveSession`
+  handle; a stall watchdog, the pipeline bus and the WebRTC connection
+  state report a dead source and the camera returns to idle within
+  `webrtc.live_stall_timeout_secs` (default 10) instead of waiting for
+  the debounce or the continuous-live cap. The reason is visible as the
+  `live-lost-<reason>` signal on the state-transition metric.
 
 ### Changed
 - Toolchain and MSRV raised to 1.98.1 to follow `arlo-rs` 0.2.0, which is

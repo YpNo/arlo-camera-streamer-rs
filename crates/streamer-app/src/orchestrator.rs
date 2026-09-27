@@ -28,6 +28,18 @@
 //! mid-flight state divergence between the recursive call returning
 //! and the outer arm completing.
 //!
+//! # Live-loss feedback (ADR 0004)
+//!
+//! `attach_live` returns a [`LiveSession`] handle that resolves when
+//! the media adapter detects the source died (no RTP, pipeline error,
+//! end-of-stream, peer disconnected). The orchestrator holds it exactly
+//! while the camera is `Live`/`Cooling` (invariant enforced in
+//! `process_signals`), awaits it as one `select!` arm, and turns a
+//! resolution into `StateTransition::LiveLost`, which reuses the
+//! ordinary `Live → Idle` exit (detach + teardown + thumbnail refresh).
+//! Dropping the handle on every live exit is what makes late reports
+//! from a finished session unobservable — no generation counters.
+//!
 //! [`EventRouter`]: crate::router::EventRouter
 
 // `tokio::select!` arms with terminal `None` paths are clearer as
@@ -57,7 +69,8 @@ use streamer_domain::metrics::{BudgetDecision, MotionOutcome, SpliceOutcome};
 use streamer_domain::port::{
     ArloThumbnailSource, MediaMultiplexer, MetricsRecorder, WebrtcSignaler,
 };
-use streamer_domain::state::{CameraState, StateTransition};
+use streamer_domain::state::{CameraState, LiveLossReason, StateTransition};
+use streamer_domain::stream::LiveSession;
 
 use crate::budget::{BudgetVerdict, LiveBudgetTracker};
 use crate::debouncer::{DebouncerVerdict, MotionDebouncer};
@@ -73,6 +86,13 @@ pub struct CameraOrchestrator {
     budget: LiveBudgetTracker,
     /// Set when in [`CameraState::Failed`]; cleared on transition out.
     failed_deadline: Option<Instant>,
+    /// Handle to the attached live session (ADR 0004).
+    ///
+    /// Invariant: `Some` iff `state` is `Live` or `Cooling`. Set by
+    /// `start_activation`, cleared in `process_signals` the moment the
+    /// state leaves live, so a report from a finished session can never
+    /// be observed.
+    live: Option<LiveSession>,
     signaler: Arc<dyn WebrtcSignaler>,
     thumbnails: Arc<dyn ArloThumbnailSource>,
     media: Arc<dyn MediaMultiplexer>,
@@ -123,6 +143,7 @@ impl CameraOrchestrator {
             debouncer,
             budget,
             failed_deadline: None,
+            live: None,
             signaler,
             thumbnails,
             media,
@@ -200,6 +221,15 @@ impl CameraOrchestrator {
                         admin_open = false;
                     }
                 },
+                reason = live_lost(self.live.as_mut()) => {
+                    // Take the handle first: a resolved handle resolves
+                    // again immediately (as `AdapterDropped`) and would
+                    // busy-loop the select — same rule as `admin_open`.
+                    self.live = None;
+                    if let Err(e) = self.handle_live_lost(reason).await {
+                        warn!(error = %e, "live-lost handling failed");
+                    }
+                }
                 event = self.events.recv() => match event {
                     Some(event) => {
                         if let Err(e) = self.handle_event(event).await {
@@ -345,6 +375,18 @@ impl CameraOrchestrator {
         self.process_signals(VecDeque::from([signal])).await
     }
 
+    /// The media adapter reported the attached source dead. Route it
+    /// through the reducer as `LiveLost`; the `Live → Idle` side effects
+    /// (detach, teardown, thumbnail refresh) are the ordinary ones.
+    async fn handle_live_lost(&mut self, reason: LiveLossReason) -> Result<(), DomainError> {
+        warn!(
+            reason = reason.as_label(),
+            "live source lost; returning to idle"
+        );
+        self.process_signals(VecDeque::from([StateTransition::LiveLost(reason)]))
+            .await
+    }
+
     /// If the daily budget is exhausted, divert `MotionDetected` into
     /// `BudgetExhausted` so the orchestrator never tries to wake the
     /// camera in the first place. Side-effect: emits a budget-decision
@@ -396,6 +438,12 @@ impl CameraOrchestrator {
             }
             info!(?from, ?to, ?signal, "state transition");
             self.state = to.clone();
+            // ADR 0004 invariant: the session handle lives exactly as
+            // long as the camera is live. Dropping it here, before any
+            // side effect awaits, makes a late report unobservable.
+            if !matches!(to, CameraState::Live { .. } | CameraState::Cooling { .. }) {
+                self.live = None;
+            }
             self.metrics
                 .record_state_change(&self.camera_id, &from, &to, signal_label(&signal));
             // Failures: increment retry counter on Failed entry.
@@ -475,20 +523,28 @@ impl CameraOrchestrator {
     /// only drives the splice and keeps teardown symmetric.
     async fn start_activation(&mut self) -> Vec<StateTransition> {
         let started = Instant::now();
-        if let Err(e) = self
+        match self
             .media
             .attach_live(&self.camera_id, self.signaler.as_ref())
             .await
         {
-            let latency = elapsed_ms(started);
-            warn!(error = %e, latency_ms = latency, "attach_live failed");
-            self.metrics
-                .record_splice(&self.camera_id, SpliceOutcome::AttachFailed, latency);
-            return vec![StateTransition::Failure(e.to_string())];
+            Ok(session) => {
+                self.live = Some(session);
+                self.metrics.record_splice(
+                    &self.camera_id,
+                    SpliceOutcome::Success,
+                    elapsed_ms(started),
+                );
+                vec![StateTransition::LiveAttached]
+            }
+            Err(e) => {
+                let latency = elapsed_ms(started);
+                warn!(error = %e, latency_ms = latency, "attach_live failed");
+                self.metrics
+                    .record_splice(&self.camera_id, SpliceOutcome::AttachFailed, latency);
+                vec![StateTransition::Failure(e.to_string())]
+            }
         }
-        self.metrics
-            .record_splice(&self.camera_id, SpliceOutcome::Success, elapsed_ms(started));
-        vec![StateTransition::LiveAttached]
     }
 
     /// Detach the live source and refresh the idle thumbnail.
@@ -524,6 +580,9 @@ impl CameraOrchestrator {
     }
 
     async fn handle_shutdown(&mut self) {
+        // The task ends here; drop the session handle so a report that
+        // races the shutdown is never acted upon.
+        self.live = None;
         if matches!(
             self.state,
             CameraState::Live { .. } | CameraState::Cooling { .. }
@@ -563,6 +622,16 @@ async fn maybe_sleep_until(deadline: Option<Instant>) {
     }
 }
 
+/// Await the live session's loss report, or block forever when there is
+/// no session — so the `select!` arm never fires (and never busy-loops)
+/// in `Idle` / `Activating` / `BatteryProtect` / `Failed`.
+async fn live_lost(session: Option<&mut LiveSession>) -> LiveLossReason {
+    match session {
+        Some(s) => s.lost().await,
+        None => std::future::pending::<LiveLossReason>().await,
+    }
+}
+
 /// `mpsc::Receiver::recv()` if the channel is still considered open;
 /// otherwise block forever. Lets the `tokio::select!` admin arm be
 /// disabled at runtime by flipping `open` to `false` once the receiver
@@ -591,6 +660,7 @@ fn signal_label(s: &StateTransition) -> &'static str {
         StateTransition::BudgetReset => "budget-reset",
         StateTransition::Failure(_) => "failure",
         StateTransition::BackoffElapsed => "backoff-elapsed",
+        StateTransition::LiveLost(reason) => reason.signal_label(),
     }
 }
 
@@ -717,6 +787,13 @@ mod tests {
     #[derive(Default)]
     struct RecordingMedia {
         events: Mutex<Vec<MediaCall>>,
+        /// One notifier per `attach_live`, in order. Retained on purpose:
+        /// a double that dropped it would resolve the session as
+        /// `AdapterDropped` and flip the orchestrator to Idle at once.
+        notifiers: Mutex<Vec<streamer_domain::stream::LiveLossNotifier>>,
+        /// When `false`, notifiers are dropped immediately — simulates an
+        /// adapter that vanishes under a live session.
+        retain_notifiers: std::sync::atomic::AtomicBool,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -729,10 +806,25 @@ mod tests {
 
     impl RecordingMedia {
         fn new() -> Arc<Self> {
+            let m = Self::default();
+            m.retain_notifiers
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Arc::new(m)
+        }
+        fn dropping_notifiers() -> Arc<Self> {
             Arc::new(Self::default())
         }
         async fn calls(&self) -> Vec<MediaCall> {
             std::mem::take(&mut *self.events.lock().await)
+        }
+        /// Report the `idx`-th session (0-based, in attach order) lost.
+        /// Returns what the notifier returned (`false` = unobservable).
+        async fn fail_live(&self, idx: usize, reason: LiveLossReason) -> bool {
+            let notifiers = self.notifiers.lock().await;
+            match notifiers.get(idx) {
+                Some(n) => n.notify(reason),
+                None => panic!("no session #{idx} attached"),
+            }
         }
     }
 
@@ -746,7 +838,7 @@ mod tests {
             &self,
             camera: &CameraId,
             signaler: &dyn WebrtcSignaler,
-        ) -> Result<(), DomainError> {
+        ) -> Result<LiveSession, DomainError> {
             // Mirror the real adapter: the media leg owns the WebRTC
             // offer/answer round-trip. Surfacing the negotiate error as
             // an attach failure is exactly the production contract.
@@ -755,7 +847,14 @@ mod tests {
                 .lock()
                 .await
                 .push(MediaCall::AttachLive(answer.session_id));
-            Ok(())
+            let (session, notifier) = LiveSession::new();
+            if self
+                .retain_notifiers
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.notifiers.lock().await.push(notifier);
+            }
+            Ok(session)
         }
         async fn detach_live(&self, _camera: &CameraId) -> Result<(), DomainError> {
             self.events.lock().await.push(MediaCall::DetachLive);
@@ -850,6 +949,11 @@ mod tests {
 
         // Yield enough times for activation to run + state to settle.
         tokio::time::sleep(Duration::from_millis(10)).await;
+        // Still live: the session handle must not have resolved on its
+        // own (guards the "doubles retain the notifier" rule).
+        let before = media.calls().await;
+        assert!(before.iter().any(|c| matches!(c, MediaCall::AttachLive(_))));
+        assert!(!before.contains(&MediaCall::DetachLive));
 
         // Advance past the debounce deadline (debounce=2s).
         tokio::time::advance(Duration::from_secs(3)).await;
@@ -859,8 +963,7 @@ mod tests {
         handle.await.unwrap();
 
         let calls = media.calls().await;
-        assert!(calls.contains(&MediaCall::Register));
-        assert!(calls.iter().any(|c| matches!(c, MediaCall::AttachLive(_))));
+        assert!(before.contains(&MediaCall::Register));
         assert!(calls.contains(&MediaCall::DetachLive));
         // Teardown is symmetric: every detach pairs with a teardown.
         assert!(
@@ -868,6 +971,161 @@ mod tests {
             "teardown must pair with detach on the Live→Idle exit"
         );
         assert_eq!(sr.call_count().await, 1);
+    }
+
+    // ---------- Live-loss feedback (ADR 0004) ----------
+
+    async fn drive_to_live(tx: &mpsc::Sender<CameraEvent>) {
+        tx.send(CameraEvent::Motion {
+            device_id: CameraId::new("CAM"),
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_lost_in_live_detaches_and_tears_down_before_debounce() {
+        // debounce=60s: without the feedback path the output would stay
+        // on the dead pad for a minute.
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        drive_to_live(&tx).await;
+        assert!(!media.calls().await.contains(&MediaCall::DetachLive));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(media.fail_live(0, LiveLossReason::RtpStalled).await);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // `StubThumbnails` yields no image, so the idle refresh after the
+        // detach makes no media call; the detach itself is the proof.
+        let calls = media.calls().await;
+        assert_eq!(
+            calls,
+            vec![MediaCall::DetachLive],
+            "loss must detach well before the debounce"
+        );
+        assert_eq!(
+            sr.stop_count().await,
+            1,
+            "teardown pairs with the loss exit"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_lost_after_cooldown_exit_is_unobservable() {
+        let cfg = camera_cfg(2, 60);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        drive_to_live(&tx).await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let calls = media.calls().await;
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| **c == MediaCall::DetachLive)
+                .count(),
+            1
+        );
+
+        // The orchestrator dropped the handle on the cooldown exit: the
+        // late report has nowhere to go and nothing else happens.
+        assert!(!media.fail_live(0, LiveLossReason::EndOfStream).await);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(media.calls().await.is_empty());
+        assert_eq!(sr.stop_count().await, 1);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_loss_does_not_kill_the_next_session() {
+        let cfg = camera_cfg(2, 60);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer()), Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        // Session 1 → cooldown → Idle.
+        drive_to_live(&tx).await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Session 2.
+        drive_to_live(&tx).await;
+        media.calls().await; // drain
+
+        assert!(!media.fail_live(0, LiveLossReason::PeerDisconnected).await);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            media.calls().await.is_empty(),
+            "session 1's notifier must not touch session 2"
+        );
+
+        assert!(media.fail_live(1, LiveLossReason::PeerDisconnected).await);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(media.calls().await.contains(&MediaCall::DetachLive));
+        assert_eq!(sr.stop_count().await, 2);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adapter_dropping_its_notifier_returns_camera_to_idle() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::dropping_notifiers();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        drive_to_live(&tx).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Fail closed: no report, but the notifier is gone → Idle.
+        let calls = media.calls().await;
+        assert!(calls.contains(&MediaCall::DetachLive));
+        assert_eq!(sr.stop_count().await, 1);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_orchestrator_makes_no_media_calls_over_a_long_wait() {
+        // The live-lost arm must be pending, not firing, when idle.
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        let (orch, _tx, token) = build(&cfg, sr, media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::advance(Duration::from_hours(6)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        token.cancel();
+        handle.await.unwrap();
+        assert_eq!(media.calls().await, vec![MediaCall::Register]);
+    }
+
+    #[test]
+    fn signal_label_live_lost_carries_the_reason() {
+        assert_eq!(
+            signal_label(&StateTransition::LiveLost(LiveLossReason::RtpStalled)),
+            "live-lost-rtp-stalled"
+        );
     }
 
     // ---------- Failure path ----------

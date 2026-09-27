@@ -56,6 +56,11 @@ password_env = "ARLO_IMAP_PASSWORD"
 #   "ipv4" — IPv4 only; use it when IPv6 towards Arlo's gateway is broken
 #            or slow to fail over (live activation then stalls on ICE).
 ice_address_family = "dual"
+# Seconds without inbound video from the camera (after the first frame)
+# before the live source is declared lost and the output returns to the
+# idle still. Default 10; values below 4 are raised to 4. Raise it on a
+# slow TURN path if you see spurious `live-lost-rtp-stalled` transitions.
+live_stall_timeout_secs = 10
 
 # ---------------------------------------------------------------------------
 # Output endpoints

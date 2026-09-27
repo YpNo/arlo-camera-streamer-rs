@@ -71,4 +71,94 @@ pub enum StateTransition {
     Failure(String),
     /// Backoff window elapsed; orchestrator may retry from `Idle`.
     BackoffElapsed,
+    /// The media adapter reported the attached live source dead (see
+    /// [`LiveSession`](crate::stream::LiveSession)). Only meaningful in
+    /// `Live` / `Cooling`; ignored everywhere else.
+    LiveLost(LiveLossReason),
+}
+
+/// Why an attached live source stopped delivering usable media.
+///
+/// Fieldless and `Copy` so it doubles as a bounded metrics label: the
+/// transition metric's `signal` value is
+/// [`signal_label`](Self::signal_label), one per variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LiveLossReason {
+    /// No inbound video RTP for `webrtc.live_stall_timeout_secs` after
+    /// the first packet — the gateway ended the call or the camera slept.
+    RtpStalled,
+    /// The ingestion pipeline posted an `ERROR` on its bus.
+    PipelineError,
+    /// The ingestion pipeline reached end-of-stream.
+    EndOfStream,
+    /// The peer or ICE connection reached a terminal state
+    /// (`failed` / `closed`).
+    PeerDisconnected,
+    /// The adapter dropped its notifier without reporting. Treated as a
+    /// loss so the camera never stays `Live` on a vanished session.
+    AdapterDropped,
+}
+
+impl LiveLossReason {
+    /// Stable kebab-case label for logs and metric label values.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::RtpStalled => "rtp-stalled",
+            Self::PipelineError => "pipeline-error",
+            Self::EndOfStream => "end-of-stream",
+            Self::PeerDisconnected => "peer-disconnected",
+            Self::AdapterDropped => "adapter-dropped",
+        }
+    }
+
+    /// The `signal` label recorded on the state-transition metric for a
+    /// [`StateTransition::LiveLost`] carrying this reason
+    /// (`live-lost-<reason>`), so the reason is queryable without a
+    /// second counter.
+    #[must_use]
+    pub const fn signal_label(self) -> &'static str {
+        match self {
+            Self::RtpStalled => "live-lost-rtp-stalled",
+            Self::PipelineError => "live-lost-pipeline-error",
+            Self::EndOfStream => "live-lost-end-of-stream",
+            Self::PeerDisconnected => "live-lost-peer-disconnected",
+            Self::AdapterDropped => "live-lost-adapter-dropped",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: [LiveLossReason; 5] = [
+        LiveLossReason::RtpStalled,
+        LiveLossReason::PipelineError,
+        LiveLossReason::EndOfStream,
+        LiveLossReason::PeerDisconnected,
+        LiveLossReason::AdapterDropped,
+    ];
+
+    #[test]
+    fn live_loss_reason_labels_are_stable_and_kebab_case() {
+        assert_eq!(LiveLossReason::RtpStalled.as_label(), "rtp-stalled");
+        assert_eq!(LiveLossReason::PipelineError.as_label(), "pipeline-error");
+        assert_eq!(LiveLossReason::EndOfStream.as_label(), "end-of-stream");
+        assert_eq!(
+            LiveLossReason::PeerDisconnected.as_label(),
+            "peer-disconnected"
+        );
+        assert_eq!(LiveLossReason::AdapterDropped.as_label(), "adapter-dropped");
+    }
+
+    #[test]
+    fn live_loss_reason_signal_labels_prefix_the_reason_and_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for r in ALL {
+            let label = r.signal_label();
+            assert_eq!(label, format!("live-lost-{}", r.as_label()));
+            assert!(seen.insert(label), "duplicate signal label {label}");
+        }
+    }
 }

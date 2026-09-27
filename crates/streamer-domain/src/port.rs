@@ -24,7 +24,7 @@ use crate::error::DomainError;
 use crate::event::{CameraEvent, ConnectionStatus};
 use crate::metrics::{BudgetDecision, MotionOutcome, SpliceOutcome};
 use crate::state::CameraState;
-use crate::stream::{IceServer, SignalingAnswer};
+use crate::stream::{IceServer, LiveSession, SignalingAnswer};
 
 /// Subscription to the inbound event bus from Arlo cloud / local hub.
 #[async_trait]
@@ -144,9 +144,18 @@ pub trait MediaMultiplexer: Send + Sync {
     /// frame and the output selector has switched to the live pad —
     /// the moment Frigate sees motion-quality frames.
     ///
+    /// The returned [`LiveSession`] is the feedback path for the rest
+    /// of the session (ADR 0004): it resolves via
+    /// [`LiveSession::lost`] when the adapter detects the source died
+    /// (no inbound RTP, pipeline error, end-of-stream, peer
+    /// disconnected). The caller keeps it exactly while the camera is
+    /// live and drops it on every live exit, which makes late reports
+    /// from that session unobservable.
+    ///
     /// The adapter does **not** own teardown: the orchestrator pairs
-    /// every attach/exit with [`WebrtcSignaler::teardown`] (battery
-    /// safety).
+    /// every attach/exit with [`Self::detach_live`] and
+    /// [`WebrtcSignaler::teardown`] (battery safety), including the
+    /// exit triggered by a resolved session handle.
     ///
     /// # Errors
     ///
@@ -157,7 +166,7 @@ pub trait MediaMultiplexer: Send + Sync {
         &self,
         camera: &CameraId,
         signaler: &dyn WebrtcSignaler,
-    ) -> Result<(), DomainError>;
+    ) -> Result<LiveSession, DomainError>;
 
     /// Detach the live source and revert to the idle frame.
     ///

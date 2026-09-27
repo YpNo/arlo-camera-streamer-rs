@@ -37,6 +37,7 @@
 //! | [`rtsp`]        |      | Wraps `gst-rtsp-server` (excluded from coverage).  |
 //! | [`gst_pipeline`]|      | Production [`PipelineRegistry`] (excluded from cov).|
 //! | [`live_rtp_sink`]|  ✓  | Per-camera RTP byte sink (`appsink` → consumer).   |
+//! | [`live_watch`]  |  ✓   | Live-loss detector logic: RTP activity clock + stall rule (ADR 0004). |
 //! | [`webrtc_pipeline`]| | Per-camera `webrtcbin` live leg (excluded from cov).|
 //!
 //! [`MediaMultiplexer`]: streamer_domain::port::MediaMultiplexer
@@ -49,6 +50,7 @@ pub mod error;
 pub mod gst_pipeline;
 pub mod idle_source;
 pub mod live_rtp_sink;
+pub mod live_watch;
 pub mod multiplexer;
 pub mod pipeline_desc;
 pub mod rtsp;
@@ -60,6 +62,7 @@ pub use error::MediaError;
 pub use gst_pipeline::GstPipelineRegistry;
 pub use idle_source::{IDLE_FPS, IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH, select_idle_source};
 pub use live_rtp_sink::{LiveRtpSink, LiveSinkReceivers, LiveSinks};
+pub use live_watch::{RtpActivity, stall_verdict};
 pub use multiplexer::{GstMediaMultiplexer, PipelineRegistry};
 pub use pipeline_desc::{
     DashBranchConfig, HlsBranchConfig, OutputBranches, build_output_branches, idle_audio_desc,

@@ -269,7 +269,12 @@ mod tests {
         }
     }
 
-    struct StubMedia;
+    /// Retains every notifier so a session never resolves as
+    /// `AdapterDropped` behind the wiring tests' back.
+    #[derive(Default)]
+    struct StubMedia {
+        notifiers: std::sync::Mutex<Vec<streamer_domain::stream::LiveLossNotifier>>,
+    }
     #[async_trait]
     impl MediaMultiplexer for StubMedia {
         async fn register(&self, _camera: &CameraId) -> Result<(), DomainError> {
@@ -279,8 +284,13 @@ mod tests {
             &self,
             _camera: &CameraId,
             _signaler: &dyn WebrtcSignaler,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<streamer_domain::stream::LiveSession, DomainError> {
+            let (session, notifier) = streamer_domain::stream::LiveSession::new();
+            self.notifiers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notifier);
+            Ok(session)
         }
         async fn detach_live(&self, _camera: &CameraId) -> Result<(), DomainError> {
             Ok(())
@@ -337,7 +347,7 @@ mod tests {
             Arc::new(StubEventSource),
             Arc::new(StubSignaler),
             Arc::new(StubThumbnails),
-            Arc::new(StubMedia),
+            Arc::new(StubMedia::default()),
         )
         .await
         .expect_err("must reject empty camera list");
@@ -352,7 +362,7 @@ mod tests {
             Arc::new(FailingEventSource),
             Arc::new(StubSignaler),
             Arc::new(StubThumbnails),
-            Arc::new(StubMedia),
+            Arc::new(StubMedia::default()),
         )
         .await
         .expect_err("must surface subscribe failure");
@@ -367,7 +377,7 @@ mod tests {
             Arc::new(StubEventSource),
             Arc::new(StubSignaler),
             Arc::new(StubThumbnails),
-            Arc::new(StubMedia),
+            Arc::new(StubMedia::default()),
         )
         .await
         .expect("spawn ok");

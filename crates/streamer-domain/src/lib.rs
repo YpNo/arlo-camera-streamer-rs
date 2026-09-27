@@ -15,7 +15,8 @@
 //! - [`admin`] models the operational-control vocabulary (snapshots,
 //!   error types) consumed by `/admin/*` HTTP routes.
 //! - [`config`] holds TOML-deserializable configuration types.
-//! - [`stream`] holds live-stream descriptors.
+//! - [`stream`] holds live-stream descriptors and the live-session
+//!   handle / notifier pair (ADR 0004).
 //! - [`camera`] holds identifier newtypes.
 //! - [`error`] declares the domain error hierarchy.
 
@@ -34,8 +35,9 @@ pub mod stream;
 pub use admin::{AdminError, CameraSnapshot, SystemSnapshot};
 pub use camera::{CameraId, StreamName};
 pub use config::{
-    ArloConfig, CameraConfig, CooldownConfig, DashOutput, EmailMfaConfig, HlsOutput, MfaConfig,
-    OutputConfig, RtspOutput, StreamerConfig, WebrtcConfig,
+    ArloConfig, CameraConfig, CooldownConfig, DEFAULT_LIVE_STALL_TIMEOUT_SECS, DashOutput,
+    EmailMfaConfig, HlsOutput, MIN_LIVE_STALL_TIMEOUT_SECS, MfaConfig, OutputConfig, RtspOutput,
+    StreamerConfig, WebrtcConfig,
 };
 pub use error::DomainError;
 pub use event::{CameraEvent, ConnectionStatus};
@@ -44,5 +46,7 @@ pub use port::{
     AdminControl, ArloEventSource, ArloThumbnailSource, MediaMultiplexer, MetricsRecorder,
     WebrtcSignaler,
 };
-pub use state::{CameraState, StateTransition};
-pub use stream::{Codec, IceAddressFamily, IceServer, SignalingAnswer};
+pub use state::{CameraState, LiveLossReason, StateTransition};
+pub use stream::{
+    Codec, IceAddressFamily, IceServer, LiveLossNotifier, LiveSession, SignalingAnswer,
+};

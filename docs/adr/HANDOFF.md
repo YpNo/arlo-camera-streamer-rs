@@ -66,6 +66,7 @@ of each event is unchanged, which is why `event_mapper.rs` still works.
 - `0001-factory-restart-splice` — superseded by 0003.
 - `0002-rtsp-only-output-v1` — accepted; HLS/DASH parsed but not wired.
 - `0003-seamless-input-selector-splice` — accepted; production splice.
+- `0004-live-lost-feedback` — accepted; `LiveSession` handle + `LiveLost` transition.
 
 ---
 
@@ -98,24 +99,22 @@ commits. Phase 9 is this session's work.
 
 ## 4. Agreed plan (2026-09-27) and where we are
 
-Order agreed with the user; items 1–2 are done, 3–5 remain.
+Order agreed with the user; items 1–3 are done, 4–5 remain.
 
 1. **Unblock CI** — done (toolchain, crates.io dep, image deps, no
    `-A dead_code`). **Open the PR `feat/init-v1` → `main`**: GitHub Actions
    has never run on this repository (it triggers on `main` and PRs only), so
    the coverage gate, the media-crate build and the doc job are unproven.
 2. **Docs/config hygiene** — done (see Phase 9).
-3. **`LiveLost` feedback path + ADR 0004.** Prerequisite for 4. Today
-   `MediaMultiplexer::attach_live` resolves once and the adapter has no
-   channel back: `webrtcbin` bus errors / EOS only log
-   (`webrtc_pipeline.rs::spawn_bus_watch`), `StateTransition` has no
-   lost-source variant, and the `input-selector` stays on a dead pad until
-   the debounce or `max_continuous_live` fires — a frozen RTSP output for up
-   to minutes. Proposed shape: `attach_live` returns a live-session handle
-   exposing a health watch (no-frame watchdog on the live appsink + bus
-   error → `LiveLost`); the orchestrator gains a `select!` arm and a
-   `LiveLost` transition (`Live → Idle`, optional single retry within
-   budget). Domain-only type additions; no port rename needed.
+3. **`LiveLost` feedback path + ADR 0004** — done (2026-09-27). `attach_live`
+   returns a `LiveSession`; the orchestrator holds it while `Live|Cooling`
+   and awaits it in `select!`; `StateTransition::LiveLost(reason)` maps to
+   `Idle`; detectors: stall watchdog (`webrtc.live_stall_timeout_secs`),
+   bus ERROR/EOS, connection-state failed/closed. Pure logic in
+   `streamer-infra-media/src/live_watch.rs`; the webrtcbin wiring is blind
+   until CI / the Frigate box runs it (see ADR §Consequences). Follow-up:
+   race the first-RTP wait against an early loss so an attach that dies
+   during ICE fails with the real reason instead of the 20 s timeout.
 4. **Two event contexts, two domain events.** The user confirmed the model:
    - `CameraEvent::Motion` — camera PIR/ML trigger (exists).
    - `CameraEvent::ManualStream { device_id }` — the **user started a live
@@ -126,8 +125,9 @@ Order agreed with the user; items 1–2 are done, 3–5 remain.
    - Policy differences to encode, not copy from `Motion`: the camera is
      awake because of the user, so **do not charge the daily budget** for
      piggy-backed time; keep `max_continuous_live` as the safety cap; the
-     session ends when the app closes — which is exactly why item 3 comes
-     first.
+     session ends when the app closes — which is why item 3 was done first:
+     the app-closed case now surfaces as `live-lost-rtp-stalled` /
+     `live-lost-peer-disconnected` within the stall timeout.
    - **First deliverable is a capture, not a variant.** The assumed wire
      signal is `cameras/<id>` with `properties.activityState =
      "userStreamActive"` (pyaarlo's v2 name; unverified on MQTT). Add an

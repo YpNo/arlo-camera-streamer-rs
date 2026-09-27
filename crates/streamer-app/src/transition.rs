@@ -9,14 +9,21 @@
 //!
 //! ## Transition matrix (Phase 1 v0.1)
 //!
-//! | From / Signal      | Motion | LiveAttached | LiveReady | CooldownExpired | MaxLiveExceeded | BudgetExhausted | BudgetReset | Failure | BackoffElapsed |
-//! |--------------------|--------|--------------|-----------|-----------------|-----------------|-----------------|-------------|---------|----------------|
-//! | Idle               | Activ. | (ignored)    | (ignored) | (ignored)       | (ignored)       | BatteryProtect  | Idle        | Failed  | (ignored)      |
-//! | Activating         | Activ. | Live         | Activ.    | (ignored)       | (ignored)       | BatteryProtect  | Activ.      | Failed  | (ignored)      |
-//! | Live               | Live   | Live         | Live      | Idle            | Idle            | BatteryProtect  | Live        | Failed  | (ignored)      |
-//! | Cooling (reserved) | Live   | (ignored)    | (ignored) | Idle            | Idle            | BatteryProtect  | Cooling     | Failed  | (ignored)      |
-//! | BatteryProtect     | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | Idle        | Failed  | (ignored)      |
-//! | Failed             | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | (ign.)      | Failed+ | Idle           |
+//! | From / Signal      | Motion | LiveAttached | LiveReady | CooldownExpired | MaxLiveExceeded | BudgetExhausted | BudgetReset | Failure | BackoffElapsed | LiveLost  |
+//! |--------------------|--------|--------------|-----------|-----------------|-----------------|-----------------|-------------|---------|----------------|-----------|
+//! | Idle               | Activ. | (ignored)    | (ignored) | (ignored)       | (ignored)       | BatteryProtect  | Idle        | Failed  | (ignored)      | (ignored) |
+//! | Activating         | Activ. | Live         | Activ.    | (ignored)       | (ignored)       | BatteryProtect  | Activ.      | Failed  | (ignored)      | (ignored) |
+//! | Live               | Live   | Live         | Live      | Idle            | Idle            | BatteryProtect  | Live        | Failed  | (ignored)      | Idle      |
+//! | Cooling (reserved) | Live   | (ignored)    | (ignored) | Idle            | Idle            | BatteryProtect  | Cooling     | Failed  | (ignored)      | Idle      |
+//! | BatteryProtect     | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | Idle        | Failed  | (ignored)      | (ignored) |
+//! | Failed             | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | (ign.)      | Failed+ | Idle           | (ignored) |
+//!
+//! `LiveLost` (ADR 0004) is the media adapter reporting a dead live
+//! source. It is a plain return to `Idle`, not a `Failure`: the source
+//! ending is not an adapter fault, the next motion re-activates through
+//! the normal budget check, and the reason travels in the metric label.
+//! In `Activating` the session handle does not exist yet, so the signal
+//! cannot even be produced; the row is kept explicit for completeness.
 //!
 //! The `Failed → Failed (Failure)` transition increments the retry counter
 //! so the orchestrator can apply exponential backoff before emitting
@@ -64,14 +71,14 @@ pub fn transition(state: &CameraState, signal: &StateTransition) -> CameraState 
         (S::Activating, _) => S::Activating,
 
         // ---------- From Live ----------
-        (S::Live { .. }, T::CooldownExpired | T::MaxLiveExceeded) => S::Idle,
+        (S::Live { .. }, T::CooldownExpired | T::MaxLiveExceeded | T::LiveLost(_)) => S::Idle,
         (S::Live { .. }, T::BudgetExhausted) => battery_protect(),
         (S::Live { .. }, T::Failure(reason)) => fresh_failed(reason),
         (S::Live { .. }, _) => state.clone(),
 
         // ---------- From Cooling (reserved) ----------
         (S::Cooling { .. }, T::MotionDetected) => S::Live { since_secs: 0 },
-        (S::Cooling { .. }, T::CooldownExpired | T::MaxLiveExceeded) => S::Idle,
+        (S::Cooling { .. }, T::CooldownExpired | T::MaxLiveExceeded | T::LiveLost(_)) => S::Idle,
         (S::Cooling { .. }, T::BudgetExhausted) => battery_protect(),
         (S::Cooling { .. }, T::Failure(reason)) => fresh_failed(reason),
         (S::Cooling { .. }, _) => state.clone(),
@@ -108,6 +115,7 @@ fn fresh_failed(reason: &str) -> CameraState {
 mod tests {
     use super::*;
     use rstest::rstest;
+    use streamer_domain::state::LiveLossReason;
 
     fn live(secs: u64) -> CameraState {
         CameraState::Live { since_secs: secs }
@@ -275,6 +283,47 @@ mod tests {
         let s = cooling(30);
         assert_eq!(transition(&s, &StateTransition::LiveAttached), s);
         assert_eq!(transition(&s, &StateTransition::BudgetReset), s);
+    }
+
+    // ---------- LiveLost (ADR 0004) ----------
+
+    #[rstest]
+    #[case(LiveLossReason::RtpStalled)]
+    #[case(LiveLossReason::PipelineError)]
+    #[case(LiveLossReason::EndOfStream)]
+    #[case(LiveLossReason::PeerDisconnected)]
+    #[case(LiveLossReason::AdapterDropped)]
+    fn live_live_lost_returns_idle_whatever_the_reason(#[case] reason: LiveLossReason) {
+        assert_eq!(
+            transition(&live(12), &StateTransition::LiveLost(reason)),
+            CameraState::Idle
+        );
+    }
+
+    #[test]
+    fn cooling_live_lost_returns_idle() {
+        assert_eq!(
+            transition(
+                &cooling(30),
+                &StateTransition::LiveLost(LiveLossReason::RtpStalled)
+            ),
+            CameraState::Idle
+        );
+    }
+
+    #[rstest]
+    #[case(CameraState::Idle)]
+    #[case(CameraState::Activating)]
+    #[case(battery())]
+    #[case(failed(2))]
+    fn live_lost_is_ignored_outside_live_and_cooling(#[case] state: CameraState) {
+        assert_eq!(
+            transition(
+                &state,
+                &StateTransition::LiveLost(LiveLossReason::PeerDisconnected)
+            ),
+            state
+        );
     }
 
     // ---------- BatteryProtect ----------

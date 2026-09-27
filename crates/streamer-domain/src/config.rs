@@ -5,6 +5,7 @@
 //! `streamer-bin` and `streamer-app` respectively.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,17 +29,55 @@ pub struct StreamerConfig {
     pub cameras: Vec<CameraConfig>,
 }
 
+/// Default for [`WebrtcConfig::live_stall_timeout_secs`]: about three
+/// keyframe-request cycles of silence — a source quiet that long is
+/// dead from the NVR's point of view.
+pub const DEFAULT_LIVE_STALL_TIMEOUT_SECS: u64 = 10;
+/// Floor applied to [`WebrtcConfig::live_stall_timeout_secs`] so a single
+/// lost keyframe-request cycle (3 s) can never be mistaken for a dead
+/// source.
+pub const MIN_LIVE_STALL_TIMEOUT_SECS: u64 = 4;
+
 /// WebRTC-ingestion knobs applied to every camera's `webrtcbin`.
 ///
 /// Kept separate from [`OutputConfig`] because these settings feed the
-/// **ingestion** side (offer generation, ICE gathering) rather than an
-/// output sink.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// **ingestion** side (offer generation, ICE gathering, source-loss
+/// detection) rather than an output sink.
+///
+/// `#[serde(default)]` on the struct makes a `[webrtc]` table with any
+/// subset of keys valid; an absent table is the same as an empty one.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct WebrtcConfig {
     /// Address-family policy for local ICE candidate gathering.
     /// Default is dual-stack (IPv4 + IPv6).
-    #[serde(default)]
     pub ice_address_family: IceAddressFamily,
+    /// Seconds without inbound video RTP (counted after the first
+    /// packet) before the live source is declared lost and the camera
+    /// returns to idle. Values below [`MIN_LIVE_STALL_TIMEOUT_SECS`]
+    /// are raised to it by [`Self::live_stall_timeout`].
+    pub live_stall_timeout_secs: u64,
+}
+
+impl Default for WebrtcConfig {
+    fn default() -> Self {
+        Self {
+            ice_address_family: IceAddressFamily::default(),
+            live_stall_timeout_secs: DEFAULT_LIVE_STALL_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl WebrtcConfig {
+    /// The stall timeout as a [`Duration`], never below
+    /// [`MIN_LIVE_STALL_TIMEOUT_SECS`].
+    #[must_use]
+    pub fn live_stall_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.live_stall_timeout_secs
+                .max(MIN_LIVE_STALL_TIMEOUT_SECS),
+        )
+    }
 }
 
 /// Arlo cloud authentication and session-cache configuration.
@@ -309,6 +348,10 @@ mod tests {
             other => panic!("example should ship email MFA, got {other:?}"),
         }
         assert_eq!(cfg.webrtc.ice_address_family, IceAddressFamily::default());
+        assert_eq!(
+            cfg.webrtc.live_stall_timeout_secs,
+            DEFAULT_LIVE_STALL_TIMEOUT_SECS
+        );
         assert_eq!(cfg.output.video_encoder, VideoEncoder::default());
         assert_eq!(cfg.output.rtsp.bind, default_rtsp_bind());
         assert_eq!(cfg.output.metrics_bind, default_metrics_bind());
@@ -491,6 +534,68 @@ mod tests {
         "#;
         let cfg: StreamerConfig = toml::from_str(toml_input).expect("valid config");
         assert_eq!(cfg.webrtc.ice_address_family, IceAddressFamily::Dual);
+        assert_eq!(
+            cfg.webrtc.live_stall_timeout_secs,
+            DEFAULT_LIVE_STALL_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn webrtc_table_without_stall_key_uses_default_timeout() {
+        // A `[webrtc]` table that predates the key (every config written
+        // before ADR 0004) must keep booting with the default.
+        let toml_input = r#"
+            [arlo]
+            email              = "u@example.com"
+            password_env       = "ARLO_PW"
+            session_cache_path = "/tmp/session.json"
+
+            [arlo.mfa]
+            kind = "sms"
+
+            [output.rtsp]
+
+            [webrtc]
+            ice_address_family = "ipv4"
+
+            [[cameras]]
+            arlo_device_id = "X"
+            stream_name    = "front_door"
+        "#;
+        let cfg: StreamerConfig = toml::from_str(toml_input).expect("valid config");
+        assert_eq!(cfg.webrtc.ice_address_family, IceAddressFamily::Ipv4);
+        assert_eq!(cfg.webrtc.live_stall_timeout(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn webrtc_parses_live_stall_timeout_override() {
+        #[derive(Deserialize)]
+        struct W {
+            webrtc: WebrtcConfig,
+        }
+        let w: W = toml::from_str("[webrtc]\nlive_stall_timeout_secs = 30").unwrap();
+        assert_eq!(w.webrtc.live_stall_timeout(), Duration::from_secs(30));
+        assert_eq!(w.webrtc.ice_address_family, IceAddressFamily::Dual);
+    }
+
+    #[test]
+    fn live_stall_timeout_below_floor_is_raised_to_floor() {
+        let cfg = WebrtcConfig {
+            live_stall_timeout_secs: 0,
+            ..WebrtcConfig::default()
+        };
+        assert_eq!(
+            cfg.live_stall_timeout(),
+            Duration::from_secs(MIN_LIVE_STALL_TIMEOUT_SECS)
+        );
+        let at_floor = WebrtcConfig {
+            live_stall_timeout_secs: MIN_LIVE_STALL_TIMEOUT_SECS,
+            ..WebrtcConfig::default()
+        };
+        assert_eq!(
+            at_floor.live_stall_timeout(),
+            Duration::from_secs(MIN_LIVE_STALL_TIMEOUT_SECS)
+        );
     }
 
     #[test]

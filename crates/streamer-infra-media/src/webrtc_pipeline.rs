@@ -25,6 +25,20 @@
 //! orchestrator's job (`WebrtcSignaler::teardown`, paired with detach);
 //! [`WebrtcLive::shutdown`] only tears down the local webrtcbin pipeline.
 //!
+//! ## Live-loss detection (ADR 0004)
+//!
+//! Four detectors share one [`LiveLossNotifier`]; the first to fire
+//! wins and the orchestrator returns the camera to idle:
+//!
+//! - a **stall watchdog** task: no inbound video RTP for
+//!   `webrtc.live_stall_timeout_secs` after the first packet
+//!   ([`crate::live_watch`] holds the pure logic);
+//! - the **bus watch**: `ERROR` → `PipelineError`, `EOS` → `EndOfStream`;
+//! - `webrtcbin` **`connection-state`** / **`ice-connection-state`**
+//!   reaching `failed` / `closed` → `PeerDisconnected` (`disconnected`
+//!   may recover per the WebRTC state machine and is only logged; a
+//!   persistent one is caught by the watchdog).
+//!
 //! This file requires a live GStreamer + camera and is excluded from
 //! unit coverage (integration / manual-gate territory), mirroring
 //! `gst_pipeline.rs` / `rtsp.rs`.
@@ -34,7 +48,7 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use gstreamer as gst;
@@ -48,10 +62,12 @@ use tracing::{debug, info, warn};
 use streamer_domain::camera::CameraId;
 use streamer_domain::config::WebrtcConfig;
 use streamer_domain::port::WebrtcSignaler;
-use streamer_domain::stream::{IceAddressFamily, IceServer};
+use streamer_domain::state::LiveLossReason;
+use streamer_domain::stream::{IceAddressFamily, IceServer, LiveLossNotifier};
 
 use crate::error::MediaError;
 use crate::live_rtp_sink::{LiveRtpSink, LiveSinks};
+use crate::live_watch::{RtpActivity, stall_verdict};
 
 /// H.264 payload type pinned in our offer (Arlo's gateway answers 103).
 const H264_PT: i32 = 103;
@@ -90,6 +106,10 @@ impl WebrtcLive {
     /// The caller owns whatever drains `sink` (loopback today, an
     /// `appsrc` after Phase 6).
     ///
+    /// `notifier` is the adapter half of the orchestrator's
+    /// `LiveSession`; the death detectors described in the module docs
+    /// fire it (first wins) once the session is up.
+    ///
     /// # Errors
     ///
     /// [`MediaError::Pipeline`] on GStreamer/element failure, or
@@ -100,6 +120,7 @@ impl WebrtcLive {
         signaler: &dyn WebrtcSignaler,
         sinks: LiveSinks,
         cfg: &WebrtcConfig,
+        notifier: LiveLossNotifier,
     ) -> Result<Self, MediaError> {
         let pipeline = gst::Pipeline::default();
         let webrtcbin = make("webrtcbin")?;
@@ -167,6 +188,9 @@ impl WebrtcLive {
         // Filled by `pad-added` once the video appsink is linked; the
         // keyframe pump targets this pad to send PLI/FIR upstream.
         let kf_pad: Arc<OnceLock<gst::glib::WeakRef<gst::Pad>>> = Arc::new(OnceLock::new());
+        // Touched on every inbound video packet; read by the stall
+        // watchdog spawned once the first packet has arrived.
+        let activity = Arc::new(RtpActivity::new(Instant::now()));
         install_recv_branch(
             &pipeline,
             &webrtcbin,
@@ -174,7 +198,9 @@ impl WebrtcLive {
             got_rtp.clone(),
             first_rtp.clone(),
             kf_pad.clone(),
+            activity.clone(),
         );
+        install_connection_watch(&webrtcbin, notifier.clone());
 
         // Negotiation: on-negotiation-needed → create-offer →
         // set-local-description; ship the full offer SDP once ICE
@@ -186,7 +212,7 @@ impl WebrtcLive {
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| MediaError::Pipeline(format!("pipeline → Playing: {e}")))?;
-        spawn_bus_watch(&pipeline);
+        spawn_bus_watch(&pipeline, notifier.clone());
 
         let offer_sdp = tokio::time::timeout(Duration::from_secs(20), offer_rx.recv())
             .await
@@ -213,7 +239,7 @@ impl WebrtcLive {
         // the appsink sink pad (webrtcbin/rtpbin turns it into RTCP
         // PLI/FIR so Arlo emits a fresh IDR). Cheap insurance for fast
         // (re)start — and required: Arlo withholds video until PLI.
-        let tasks = vec![spawn_keyframe_pump(kf_pad)];
+        let mut tasks = vec![spawn_keyframe_pump(kf_pad)];
 
         // Resolve once inbound RTP is flowing (matches the port's
         // "attach resolves when the live branch produces frames").
@@ -228,6 +254,13 @@ impl WebrtcLive {
             })?;
         }
         info!(%camera, "live webrtcbin ready; first RTP flowing");
+        // Only now does silence mean anything: the watchdog counts from
+        // the first packet, never from negotiation.
+        tasks.push(spawn_stall_watchdog(
+            activity,
+            cfg.live_stall_timeout(),
+            notifier,
+        ));
 
         Ok(Self { pipeline, tasks })
     }
@@ -321,6 +354,7 @@ fn pct(s: &str) -> String {
 /// `GST_FLOW_NOT_LINKED` → "Internal data stream error" on that leg's
 /// `nicesrc`. The persistent pipeline decodes each: H.264→I420 and
 /// Opus→AAC.
+#[allow(clippy::too_many_arguments)]
 fn install_recv_branch(
     pipeline: &gst::Pipeline,
     webrtcbin: &gst::Element,
@@ -328,6 +362,7 @@ fn install_recv_branch(
     got_rtp: Arc<AtomicBool>,
     first_rtp: Arc<Notify>,
     kf_pad: Arc<OnceLock<gst::glib::WeakRef<gst::Pad>>>,
+    activity: Arc<RtpActivity>,
 ) {
     let pipeline_w = pipeline.downgrade();
     webrtcbin.connect_pad_added(move |_wb, pad| {
@@ -349,6 +384,7 @@ fn install_recv_branch(
                 got_rtp.clone(),
                 first_rtp.clone(),
                 &kf_pad,
+                activity.clone(),
             ) {
                 warn!(error = %e, "failed to attach video appsink");
             }
@@ -408,6 +444,7 @@ fn structure_is_video(s: &gst::StructureRef) -> bool {
             .is_ok_and(|e| e.eq_ignore_ascii_case("H264"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn link_video_appsink(
     pipeline: &gst::Pipeline,
     pad: &gst::Pad,
@@ -415,6 +452,7 @@ fn link_video_appsink(
     got_rtp: Arc<AtomicBool>,
     first_rtp: Arc<Notify>,
     kf_pad: &OnceLock<gst::glib::WeakRef<gst::Pad>>,
+    activity: Arc<RtpActivity>,
 ) -> Result<(), MediaError> {
     let appsink = gst_app::AppSink::builder()
         .sync(false)
@@ -428,6 +466,7 @@ fn link_video_appsink(
                 let buf = sample.buffer().ok_or(gst::FlowError::Error)?;
                 let map = buf.map_readable().map_err(|_| gst::FlowError::Error)?;
                 let bytes = Bytes::copy_from_slice(map.as_slice());
+                activity.touch(Instant::now());
                 if !got_rtp.swap(true, Ordering::AcqRel) {
                     first_rtp.notify_one();
                 }
@@ -521,26 +560,94 @@ fn spawn_keyframe_pump(
     })
 }
 
-/// Drain the pipeline bus; surface ERROR/WARNING.
-fn spawn_bus_watch(pipeline: &gst::Pipeline) {
+/// Drain the pipeline bus; surface ERROR/EOS in the log and to the
+/// live-loss notifier. The thread ends when the bus flushes on
+/// `set_state(Null)` (`auto-flush-bus`) or at EOS.
+fn spawn_bus_watch(pipeline: &gst::Pipeline, notifier: LiveLossNotifier) {
     let Some(bus) = pipeline.bus() else { return };
     std::thread::spawn(move || {
         for msg in bus.iter_timed(gst::ClockTime::NONE) {
             use gst::MessageView as V;
             match msg.view() {
-                V::Error(e) => warn!(
-                    src = ?e.src().map(gst::prelude::GstObjectExt::path_string),
-                    error = %e.error(),
-                    "webrtcbin pipeline error"
-                ),
+                V::Error(e) => {
+                    warn!(
+                        src = ?e.src().map(gst::prelude::GstObjectExt::path_string),
+                        error = %e.error(),
+                        "webrtcbin pipeline error"
+                    );
+                    report_loss(&notifier, LiveLossReason::PipelineError);
+                }
                 V::Eos(_) => {
                     debug!("webrtcbin pipeline EOS");
+                    report_loss(&notifier, LiveLossReason::EndOfStream);
                     break;
                 }
                 _ => {}
             }
         }
+        debug!("webrtcbin bus watch exited");
     });
+}
+
+/// Watch `webrtcbin`'s peer-connection and ICE state; a terminal state
+/// on either is a lost source. `disconnected` is only logged: the
+/// WebRTC state machine allows recovery, and a persistent one is caught
+/// by the stall watchdog within the configured timeout.
+fn install_connection_watch(webrtcbin: &gst::Element, notifier: LiveLossNotifier) {
+    let n = notifier.clone();
+    webrtcbin.connect_notify(Some("connection-state"), move |wb, _| {
+        use gst_webrtc::WebRTCPeerConnectionState as S;
+        match wb.property::<S>("connection-state") {
+            S::Failed | S::Closed => report_loss(&n, LiveLossReason::PeerDisconnected),
+            S::Disconnected => debug!("peer connection disconnected (may recover)"),
+            _ => {}
+        }
+    });
+    webrtcbin.connect_notify(Some("ice-connection-state"), move |wb, _| {
+        use gst_webrtc::WebRTCICEConnectionState as S;
+        match wb.property::<S>("ice-connection-state") {
+            S::Failed | S::Closed => report_loss(&notifier, LiveLossReason::PeerDisconnected),
+            S::Disconnected => debug!("ICE disconnected (may recover)"),
+            _ => {}
+        }
+    });
+}
+
+/// Stall watchdog: declares the source lost once no video RTP has
+/// arrived for `timeout`. Sleeps exactly until the earliest instant the
+/// verdict could change, so a healthy 30 fps source costs one wake-up
+/// per `timeout`. Aborted by [`WebrtcLive::shutdown`].
+fn spawn_stall_watchdog(
+    activity: Arc<RtpActivity>,
+    timeout: Duration,
+    notifier: LiveLossNotifier,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let silent = activity.silent_for(Instant::now());
+            if let Some(reason) = stall_verdict(silent, timeout) {
+                warn!(
+                    silent_ms = silent.as_millis(),
+                    "no inbound video RTP; live source stalled"
+                );
+                report_loss(&notifier, reason);
+                break;
+            }
+            tokio::time::sleep(timeout.saturating_sub(silent)).await;
+        }
+    })
+}
+
+/// Deliver a loss report; a `false` return means another detector won
+/// or the orchestrator already left live — worth a debug line on the
+/// Frigate box to see which detectors agree, nothing more.
+fn report_loss(notifier: &LiveLossNotifier, reason: LiveLossReason) {
+    if !notifier.notify(reason) {
+        debug!(
+            reason = reason.as_label(),
+            "live-loss report not delivered (already reported or session over)"
+        );
+    }
 }
 
 #[cfg(test)]

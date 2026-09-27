@@ -29,7 +29,7 @@ use streamer_domain::camera::{CameraId, StreamName};
 use streamer_domain::config::{CameraConfig, OutputConfig, WebrtcConfig};
 use streamer_domain::error::DomainError;
 use streamer_domain::port::{MediaMultiplexer, WebrtcSignaler};
-use streamer_domain::stream::Codec;
+use streamer_domain::stream::{Codec, LiveSession};
 
 use crate::codec_cache::CodecCache;
 use crate::error::MediaError;
@@ -194,7 +194,7 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         &self,
         camera: &CameraId,
         signaler: &dyn WebrtcSignaler,
-    ) -> Result<(), DomainError> {
+    ) -> Result<LiveSession, DomainError> {
         self.ensure_registered(camera).await?;
         // 1. ICE servers (sipInfo) → 2. registry hands back the live
         // RTP byte sink for the camera's persistent pipeline (the
@@ -206,15 +206,17 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         // switch idle → live at the next live IDR.
         let ice = signaler.ice_servers(camera).await?;
         let sinks = self.registry.attach_live_sink(camera).await?;
-        let webrtc = WebrtcLive::start(camera, &ice, signaler, sinks, &self.webrtc).await?;
+        // The session handle goes back to the orchestrator; the
+        // notifier is shared by the webrtcbin leg's death detectors
+        // (stall watchdog, bus watch, connection-state) — ADR 0004.
+        let (session, notifier) = LiveSession::new();
+        let webrtc =
+            WebrtcLive::start(camera, &ice, signaler, sinks, &self.webrtc, notifier).await?;
         // On a failure above, the registry's pump task naturally exits
         // once the dropped sink closes the channel; the orchestrator
         // pairs the failure exit with `WebrtcSignaler::teardown`.
         self.live.lock().await.insert(camera.clone(), webrtc);
-        // `Codec` import is retained for `codec_cache` use elsewhere;
-        // the live launch no longer takes a codec hint at this layer.
-        let _ = Codec::H264;
-        Ok(())
+        Ok(session)
     }
 
     #[instrument(skip(self), fields(camera = %camera))]
