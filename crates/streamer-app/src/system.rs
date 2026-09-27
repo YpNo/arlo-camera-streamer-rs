@@ -4,7 +4,7 @@
 //! [`StreamerConfig`] and brings up:
 //!
 //! - One [`CameraOrchestrator`] tokio task per `[[cameras]]` block.
-//! - One [`EventRouter`] tokio task fanning the shared SSE bus into
+//! - One [`EventRouter`] tokio task fanning the shared event bus into
 //!   per-camera mailboxes.
 //!
 //! All tasks share a single [`CancellationToken`] so a graceful

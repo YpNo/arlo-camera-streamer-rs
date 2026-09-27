@@ -45,4 +45,4 @@ pub use port::{
     WebrtcSignaler,
 };
 pub use state::{CameraState, StateTransition};
-pub use stream::{Codec, IceAddressFamily, IceServer, SignalingAnswer, StreamSource};
+pub use stream::{Codec, IceAddressFamily, IceServer, SignalingAnswer};

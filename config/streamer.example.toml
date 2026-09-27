@@ -4,6 +4,9 @@
 # Copy to /etc/arlo-streamer/streamer.toml (or pass `--config <path>`)
 # and edit the marked sections before running. Secrets MUST come from
 # env vars — never write a password into this file.
+#
+# This file is parsed by a unit test in `streamer-domain`, so every key
+# below is guaranteed to be accepted by the current binary.
 # ---------------------------------------------------------------------------
 
 [arlo]
@@ -12,23 +15,47 @@ email              = "owner@example.com"
 # Name of the env var holding the Arlo cloud account password.
 # Never write the password into this file directly.
 password_env       = "ARLO_PASSWORD"
-# arlo-rs persists the session token here so MFA isn't required on
-# every restart. Path must be readable + writable by the streamer
-# process. Permissions are forced to 0600 on Unix.
+# arlo-rs persists the session token, cookie jar and paired device id
+# here so the second factor is only asked once. Path must be readable +
+# writable by the streamer process. Permissions are forced to 0600.
 session_cache_path = "/var/lib/arlo-streamer/session.json"
 
-# MFA strategy for cold-start (when session_cache_path is missing or
-# the cached token has expired). Two options:
-#   kind = "imap"   — headless: poll IMAP for the OTP message
-#   kind = "stdin"  — interactive: prompt on stdin (one-time setup only)
+# Second factor for the first login (and whenever the cached session is
+# rejected). Exactly one `[arlo.mfa]` block; pick a `kind`:
+#   kind = "email" — the OTP mail is fetched over IMAP when the mailbox
+#                    is locatable (`host` or `provider`) and `user` +
+#                    `password_env` are set; otherwise the OTP is
+#                    prompted on stdin (interactive setup only).
+#   kind = "push"  — approve the prompt in the Arlo mobile app; headless.
+#   kind = "sms"   — OTP prompted on stdin; not suitable headless.
 [arlo.mfa]
-kind         = "imap"
+kind         = "email"
+# Either an explicit IMAP host or a provider shortcut
+# (`gmail`, `outlook`, `hotmail`, `yahoo`). `host` wins when both are set.
 host         = "imap.example.com"
+# provider   = "gmail"
 user         = "arlo-otp@example.com"
 # Only the *name* of the env var goes here. The streamer reads
 # `std::env::var("ARLO_IMAP_PASSWORD")` at boot.
 password_env = "ARLO_IMAP_PASSWORD"
-# port       = 993                # default
+# port       = 993                # default (IMAPS)
+
+# Push alternative (replace the block above):
+# [arlo.mfa]
+# kind               = "push"
+# poll_interval_secs = 3          # default
+# timeout_secs       = 120        # default; time to reach your phone
+
+# ---------------------------------------------------------------------------
+# WebRTC ingest (applies to every camera's `webrtcbin`)
+# ---------------------------------------------------------------------------
+
+[webrtc]
+# Local ICE candidate gathering:
+#   "dual" — IPv4 + IPv6 (default).
+#   "ipv4" — IPv4 only; use it when IPv6 towards Arlo's gateway is broken
+#            or slow to fail over (live activation then stalls on ICE).
+ice_address_family = "dual"
 
 # ---------------------------------------------------------------------------
 # Output endpoints
@@ -46,12 +73,14 @@ video_encoder = "x264"
 # Prometheus /metrics endpoint (per-camera state, transitions, live seconds).
 metrics_bind = "127.0.0.1:9090"
 # Operational /admin HTTP endpoint (force-wake, force-idle, state snapshot).
+# Requires the STREAMER_ADMIN_TOKEN env var at boot.
 admin_bind   = "127.0.0.1:9091"
 
 [output.rtsp]
 bind = "0.0.0.0:8554"
 
-# Optional secondary outputs. Uncomment to enable.
+# Optional secondary outputs. Accepted by the parser but NOT wired in v1
+# (see docs/adr/0002-rtsp-only-output-v1.md); the daemon logs a warning.
 #
 # [output.hls]
 # dir             = "/var/cache/arlo-streamer/hls"
@@ -70,8 +99,9 @@ bind = "0.0.0.0:8554"
 
 [[cameras]]
 arlo_device_id = "REPLACE_WITH_DEVICE_ID"
+# URL path of the RTSP output: rtsp://<host>:8554/front_door
 stream_name    = "front_door"
-# codec_hint   = "h264"   # learned automatically on first stream
+# codec_hint   = "h264"   # or "h265"; learned automatically on first stream
 
 [cameras.cooldown]
 debounce_secs       = 60     # hold-live after last motion (debounce window)
@@ -81,5 +111,5 @@ budget_reset        = "00:00"
 
 # Operational note:
 #   Disable the official Arlo app's motion *recording* for every camera
-#   exposed here. Arlo's cloud-recording job competes with our
-#   `start_stream` request and will delay or block live activations.
+#   exposed here. Arlo's cloud-recording job competes with the live
+#   activation and will delay or block it.

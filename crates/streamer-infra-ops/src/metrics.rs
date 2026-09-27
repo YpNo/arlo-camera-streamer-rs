@@ -46,7 +46,7 @@ pub struct Metrics {
     registry: Arc<Registry>,
 
     // ---------- System-level (Phase 5) ----------
-    /// `1` when the Arlo SSE bus is connected, `0` otherwise.
+    /// `1` when the Arlo event bus is connected, `0` otherwise.
     arlo_connected: IntGauge,
     /// Number of cameras declared in `[[cameras]]` (constant).
     cameras_configured: IntGauge,
@@ -108,7 +108,7 @@ impl Metrics {
         // ---------- System-level ----------
         let arlo_connected = IntGauge::with_opts(opts!(
             "streamer_arlo_connected",
-            "1 if connected to the Arlo SSE bus, 0 otherwise"
+            "1 if connected to the Arlo event bus, 0 otherwise"
         ))?;
         let cameras_configured_g = IntGauge::with_opts(opts!(
             "streamer_cameras_configured",

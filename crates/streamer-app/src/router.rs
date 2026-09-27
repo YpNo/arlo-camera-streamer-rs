@@ -1,6 +1,6 @@
 //! Single-stream → many-cameras event fan-out.
 //!
-//! The Arlo SSE bus delivers one [`CameraEvent`] stream covering all
+//! The Arlo event bus delivers one [`CameraEvent`] stream covering all
 //! devices. Each [`CameraOrchestrator`](crate::orchestrator::CameraOrchestrator)
 //! task owns its own `mpsc::Receiver<CameraEvent>` filtered to its
 //! [`CameraId`]. The [`EventRouter`] sits between them: it consumes

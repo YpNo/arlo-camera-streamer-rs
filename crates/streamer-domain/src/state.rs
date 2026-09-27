@@ -15,7 +15,7 @@ use std::time::Duration;
 pub enum CameraState {
     /// No upstream stream; idle source serves the output endpoints.
     Idle,
-    /// Stream URL requested; awaiting SSE response and first IDR frame.
+    /// WebRTC offer sent; awaiting the gateway answer and the first IDR frame.
     Activating,
     /// Live source attached; selector is on the live pad.
     Live {

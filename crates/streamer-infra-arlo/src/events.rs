@@ -19,10 +19,10 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use futures::stream::{BoxStream, StreamExt};
 use arlo_rs::client::ArloClient;
 use arlo_rs::events::ConnectionState as ArloConnectionState;
+use async_trait::async_trait;
+use futures::stream::{BoxStream, StreamExt};
 use tokio_stream::wrappers::{BroadcastStream, WatchStream};
 use tracing::warn;
 
@@ -33,7 +33,7 @@ use streamer_domain::port::ArloEventSource;
 use crate::error::arlo_to_domain;
 use crate::event_mapper::map_event;
 
-/// Adapter that exposes the arlo-rs SSE event bus as the domain
+/// Adapter that exposes the arlo-rs MQTT event bus as the domain
 /// [`ArloEventSource`] port.
 pub struct ArloEventSourceAdapter {
     client: Arc<ArloClient>,

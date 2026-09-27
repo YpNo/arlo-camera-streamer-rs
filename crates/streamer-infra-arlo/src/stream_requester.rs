@@ -20,10 +20,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use arlo_rs::client::ArloClient;
 use arlo_rs::client::livestream::SignalingSocket;
 use arlo_rs::models::sip::SipInfo;
+use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::debug;
 

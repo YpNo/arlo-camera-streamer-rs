@@ -21,9 +21,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use async_trait::async_trait;
 use arlo_rs::client::ArloClient;
 use arlo_rs::models::api::Device;
+use async_trait::async_trait;
 
 use streamer_domain::camera::CameraId;
 use streamer_domain::error::DomainError;

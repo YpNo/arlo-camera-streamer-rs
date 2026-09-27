@@ -10,9 +10,9 @@
 
 use std::sync::Arc;
 
+use arlo_rs::client::ArloClient;
 use async_trait::async_trait;
 use bytes::Bytes;
-use arlo_rs::client::ArloClient;
 use tracing::debug;
 
 use streamer_domain::camera::CameraId;

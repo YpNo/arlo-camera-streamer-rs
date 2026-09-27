@@ -1,7 +1,7 @@
 //! Pure mapping from [`ArloEvent`] to the domain [`CameraEvent`]
 //! vocabulary.
 //!
-//! The Arlo SSE bus delivers a wide variety of resource / action /
+//! The Arlo event bus delivers a wide variety of resource / action /
 //! property combinations; the streamer only cares about a small subset:
 //!
 //! | Trigger                 | Resource pattern        | Property predicate                            |

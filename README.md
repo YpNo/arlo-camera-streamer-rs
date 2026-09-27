@@ -21,10 +21,10 @@ Frigate's pull from Arlo's push**:
 | Cooling | Live continues for `debounce_secs` | Awake |
 | Battery-protect | Idle frame returns | Sleeping (quota exhausted) |
 
-The transition is driven by Arlo's **SSE event bus**: when the camera
-fires a motion event, the daemon requests a live RTSPS stream, splices
-it into the GStreamer pipeline, and reverts to idle once the camera
-goes quiet.
+The transition is driven by Arlo's **MQTT event bus**: when the camera
+fires a motion event, the daemon negotiates a WebRTC session with Arlo's
+gateway, splices the live H.264 into the persistent GStreamer pipeline,
+and reverts to idle once the camera goes quiet.
 
 ## Architecture
 
@@ -58,10 +58,6 @@ to see the contracts. The ADRs document the load-bearing decisions:
   - **`gstreamer1.0-nice`** — libnice ICE for `webrtcbin`. **Required for live streaming.** Without it, live fails at motion with `pipeline error: webrtcbin has no sink request pad` (the idle stream still works, which makes it easy to miss).
   - the `gst-rtsp-server` library (Debian: `libgstrtspserver-1.0-0`).
   - *Optional* `gstreamer1.0-vaapi` — Intel/AMD hardware H.264 encode (QuickSync/VAAPI); big CPU win for multi-camera (see [Performance](#performance)).
-- **A Chromium/Chrome browser** — arlo-rs drives a headless browser for
-  Arlo authentication (it is *not* bundled). Found on `PATH` (`chromium`,
-  `google-chrome`, …) or via the `CHROME` env var. Missing it fails at
-  startup with a "could not find chrome" launch error.
 - An Arlo cloud account with at least one camera.
 - An IMAP mailbox you can poll for the Arlo MFA OTP, or be ready to
   type the OTP on stdin (cold-start only).
@@ -75,8 +71,7 @@ sudo apt-get update && sudo apt-get install -y \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
   gstreamer1.0-libav gstreamer1.0-nice \
-  libgstrtspserver-1.0-0 gstreamer1.0-tools \
-  chromium
+  libgstrtspserver-1.0-0 gstreamer1.0-tools
 # optional — Intel/AMD hardware H.264 encode:
 sudo apt-get install -y gstreamer1.0-vaapi
 ```
@@ -86,7 +81,6 @@ above (including `gst-rtsp-server` and libnice) in one package.
 
 ```bash
 brew install gstreamer
-brew install --cask google-chrome   # or: brew install chromium
 ```
 
 Sanity-check the WebRTC transport plugins are present (these are the
@@ -127,12 +121,16 @@ holding the values.
 | `arlo.email`                        | string         | (required)           | Arlo cloud account email.                                |
 | `arlo.password_env`                 | string         | (required)           | Env var name holding the password.                       |
 | `arlo.session_cache_path`           | path           | (required)           | Persisted session token — survives restarts.             |
-| `arlo.mfa.kind`                     | `imap`/`stdin` | (required)           | Production: `imap`. First run / debugging: `stdin`.      |
-| `arlo.mfa.host` / `.user` / `.password_env` / `.port` | strings | (port: 993) | IMAP creds when `kind = "imap"`.                |
+| `arlo.mfa.kind`                     | `email`/`push`/`sms` | (required)     | Second factor. `email` and `push` run headless; `sms` prompts on stdin. |
+| `arlo.mfa.host` / `.provider` / `.user` / `.password_env` / `.port` | strings | (port: 993) | IMAP mailbox for `kind = "email"`; without them the OTP is prompted on stdin. |
+| `arlo.mfa.poll_interval_secs` / `.timeout_secs` | u64  | `3` / `120`          | Approval polling for `kind = "push"`.                    |
+| `webrtc.ice_address_family`         | `dual`/`ipv4`  | `dual`               | ICE candidate gathering; `ipv4` when IPv6 to Arlo is broken. |
+| `output.video_encoder`              | `x264`/`vaapi` | `x264`               | Software or Intel/AMD GPU H.264 encode (see Performance). |
 | `output.rtsp.bind`                  | `host:port`    | `0.0.0.0:8554`       | Embedded RTSP server.                                    |
 | `output.metrics_bind`               | `host:port`    | `127.0.0.1:9090`     | Prometheus + healthchecks.                               |
 | `output.admin_bind`                 | `host:port`    | `127.0.0.1:9091`     | `/admin/*` write API.                                    |
 | `[[cameras]]`                       | array          | `[]`                 | One block per camera — see example.                      |
+| `cameras.codec_hint`                | `h264`/`h265`  | (auto)               | Skip first-stream codec detection.                       |
 | `cameras.cooldown.debounce_secs`    | u64            | `60`                 | Hold-live debounce after last motion.                    |
 | `cameras.cooldown.max_continuous_live` | u64         | `300`                | Hard cap on continuous live (battery protection).        |
 | `cameras.cooldown.daily_live_budget` | u64           | `0`                  | `0` = unlimited; otherwise total live secs/day.          |
@@ -289,7 +287,7 @@ GStreamer; CI runs them on Linux runners with the plugin set installed.
 
 GitHub Actions workflows live in [`.github/workflows/`](./.github/workflows/).
 The `ci.yml` pipeline runs lint → typecheck → test → coverage gate
-(>80 %) → security scan on every PR.
+(>85 %) → security scan on every PR.
 
 ## Security
 

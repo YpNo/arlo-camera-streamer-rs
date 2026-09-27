@@ -291,6 +291,43 @@ fn default_budget_reset() -> String {
 mod tests {
     use super::*;
 
+    /// The shipped example must always parse: it is the first thing a new
+    /// user runs, and a stale key there is a boot failure in production.
+    #[test]
+    fn example_config_file_parses_matching_documented_defaults() {
+        let raw = include_str!("../../../config/streamer.example.toml");
+        let cfg: StreamerConfig = toml::from_str(raw).expect("example config must parse");
+
+        assert_eq!(cfg.arlo.email, "owner@example.com");
+        assert_eq!(cfg.arlo.password_env, "ARLO_PASSWORD");
+        match &cfg.arlo.mfa {
+            MfaConfig::Email(email) => {
+                assert_eq!(email.host.as_deref(), Some("imap.example.com"));
+                assert_eq!(email.password_env.as_deref(), Some("ARLO_IMAP_PASSWORD"));
+                assert_eq!(email.port, default_imap_port());
+            }
+            other => panic!("example should ship email MFA, got {other:?}"),
+        }
+        assert_eq!(cfg.webrtc.ice_address_family, IceAddressFamily::default());
+        assert_eq!(cfg.output.video_encoder, VideoEncoder::default());
+        assert_eq!(cfg.output.rtsp.bind, default_rtsp_bind());
+        assert_eq!(cfg.output.metrics_bind, default_metrics_bind());
+        assert_eq!(cfg.output.admin_bind, default_admin_bind());
+        assert!(cfg.output.hls.is_none() && cfg.output.dash.is_none());
+
+        assert_eq!(cfg.cameras.len(), 1);
+        let cam = &cfg.cameras[0];
+        assert_eq!(cam.stream_name.as_str(), "front_door");
+        assert!(cam.codec_hint.is_none());
+        assert_eq!(cam.cooldown.debounce_secs, default_debounce());
+        assert_eq!(
+            cam.cooldown.max_continuous_live,
+            default_max_continuous_live()
+        );
+        assert_eq!(cam.cooldown.daily_live_budget, 0);
+        assert_eq!(cam.cooldown.budget_reset, default_budget_reset());
+    }
+
     #[test]
     fn video_encoder_parses_lowercase_and_defaults_to_x264() {
         #[derive(Deserialize)]

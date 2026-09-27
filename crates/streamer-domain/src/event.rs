@@ -45,12 +45,12 @@ impl CameraEvent {
     }
 }
 
-/// Connection status of the upstream Arlo SSE event bus.
+/// Connection status of the upstream Arlo MQTT event bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {
     /// Initial state or attempting to (re)establish.
     Connecting,
-    /// SSE stream open; events may flow.
+    /// MQTT session up; events may flow.
     Connected,
     /// Stream closed; orchestrator should pause activations.
     Disconnected,

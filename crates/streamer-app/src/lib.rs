@@ -11,7 +11,7 @@
 //! - [`budget`] (Phase 1) — wall-clock per-camera daily live-quota tracker
 //! - [`orchestrator`] (Phase 3) — per-camera tokio task driving the
 //!   state machine + ports
-//! - [`router`] (Phase 3) — fans the shared SSE event stream to per-camera
+//! - [`router`] (Phase 3) — fans the shared Arlo event stream to per-camera
 //!   mailboxes
 //! - [`system`] (Phase 3) — composition root: spawns N orchestrators
 //!   plus the router, exposes graceful shutdown

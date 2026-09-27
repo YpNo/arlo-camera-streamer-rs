@@ -6,9 +6,10 @@
 //! The media adapter (GStreamer `webrtcbin`) generates the offer, hands
 //! it to the signaler, and applies the returned answer SDP.
 //!
-//! [`StreamSource`] / [`Codec`] are the legacy URL-based descriptors
-//! still used by the GStreamer pipeline registry; they are retired when
-//! the `webrtcbin` media leg lands.
+//! [`Codec`] names the video codec a camera produces; the per-camera
+//! `codec_hint` in the configuration lets the pipeline skip the
+//! first-stream detection. [`IceAddressFamily`] is the ICE gathering
+//! policy applied to every `webrtcbin`.
 
 use serde::{Deserialize, Serialize};
 
@@ -61,14 +62,4 @@ pub enum IceAddressFamily {
     /// Gather only IPv4 candidates. Recommended when IPv6 to the Arlo
     /// gateway is broken or slow to fail over.
     Ipv4,
-}
-
-/// A live stream the media adapter must attach.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamSource {
-    /// Typically an `rtsps://…` URL produced by `ArloClient::start_stream`.
-    pub url: String,
-    /// Codec hint learned from a prior activation, if any. `None` triggers
-    /// auto-detection on first attach.
-    pub codec_hint: Option<Codec>,
 }
