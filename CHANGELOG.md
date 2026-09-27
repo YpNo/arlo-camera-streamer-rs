@@ -31,12 +31,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `webrtc.live_stall_timeout_secs` (default 10) instead of waiting for
   the debounce or the continuous-live cap. The reason is visible as the
   `live-lost-<reason>` signal on the state-transition metric.
+- Manual-stream piggy-back (ADR 0005): when the user opens a live view in
+  the Arlo app (`activityState == "userStreamActive"`), the daemon
+  attaches its own WebRTC leg and splices it into the RTSP output. The
+  session is not charged to the daily budget, has no debounce window
+  (only `max_continuous_live`), works even in battery-protect, and ends
+  on the camera's `idle` report, the live-loss watchdog or the cap. The
+  admin camera snapshot gains an optional `trigger` (`motion` / `manual`).
+- Capture aid for the Arlo bus: `RUST_LOG=streamer_infra_arlo::events=debug`
+  logs unmapped camera events with their property keys (never values);
+  `trace` logs every event the same way.
 
 ### Changed
 - Toolchain and MSRV raised to 1.98.1 to follow `arlo-rs` 0.2.0, which is
   now consumed from crates.io instead of a sibling checkout.
 
 ### Fixed
+- Admin wake and force-idle are acknowledged when dequeued instead of after
+  the WebRTC negotiation completed, which exceeded the 2 s reply timeout
+  and reported a healthy wake as "orchestrator unavailable".
+- The session cache directory is created at boot; a missing directory
+  silently cost a new OTP on every restart.
+- The WebRTC bus-watch thread now exits with its session instead of
+  leaking one blocked thread per live session.
+- A motion pulse during battery-protect or a failure backoff no longer
+  primes a stale hard-cap deadline that cut the next session short.
+- The battery-protect wake-up is rounded up to the reset boundary.
 - `config/streamer.example.toml` used an MFA kind (`imap`) the parser never
   accepted; the example now parses and a test keeps it that way.
 - Docker image: the build stage lacked the BoringSSL toolchain (cmake,

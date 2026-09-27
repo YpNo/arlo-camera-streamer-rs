@@ -294,6 +294,7 @@ mod tests {
                 cooling_remaining: None,
                 last_failure: None,
                 retries: 0,
+                trigger: None,
             })
         }
         async fn force_idle(&self, camera: &CameraId) -> Result<(), AdminError> {

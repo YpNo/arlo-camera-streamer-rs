@@ -42,3 +42,22 @@ Open:     Gap recorded in HANDOFF §5: a live session started with no RTSP
           rebuilt but pumps are not re-armed); gst-rtsp-server unprepares
           the media ~10 s after the last client leaves. Item 4
           (ManualStream capture switch) and item 5 (list-devices) remain.
+
+## 2026-09-27 (night) — ADR 0005 manual-stream piggy-back
+Changed:  CameraEvent::{ManualStream, ManualStreamEnded} (activityState
+          userStreamActive / idle), StateTransition::{ManualStreamDetected,
+          ManualStreamEnded}, LiveTrigger field on the orchestrator, debouncer
+          Held state, budget never charged for manual sessions, activation from
+          BatteryProtect with a manual-only re-check on exit, 5 s echo guard,
+          capture logging in events.rs, admin snapshot `trigger`, ManualWake
+          through the same guard as motion, orchestrator clock = tokio Instant.
+Why:      Owner wants Frigate to see the feed when they watch in the app; the
+          camera is awake anyway so it must be free; must end when the app
+          closes (battery). Wire signal is pyaarlo's vocabulary — unverified.
+Tests:    343 workspace tests green in the container; clippy/doc/fmt clean.
+          App suite dropped from ~4-10 s to 2 s (no more real-time spinning
+          on paused-clock deadlines).
+Open:     LIVE CAPTURE of the ADR 0005 checklist from the phone (debug target
+          streamer_infra_arlo::events). If key/value differ, edit the three
+          constants in event_mapper.rs. Item 5 list-devices remains. Deferred
+          wiring gap (no client at wake) still open.

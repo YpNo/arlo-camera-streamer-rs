@@ -65,6 +65,11 @@ pub struct CameraSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub last_failure: Option<String>,
+    /// Why the current session exists (`"motion"` / `"manual"`) while
+    /// activating, live or cooling; omitted otherwise (ADR 0005).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub trigger: Option<String>,
     /// Number of retries since the last successful attach.
     pub retries: u32,
 }
@@ -97,6 +102,7 @@ mod tests {
             cooling_remaining: Some(Duration::from_secs(15)),
             last_failure: None,
             retries: 0,
+            trigger: None,
         };
         let s = serde_json::to_string(&snap).unwrap();
         let back: CameraSnapshot = serde_json::from_str(&s).unwrap();
@@ -114,6 +120,7 @@ mod tests {
             cooling_remaining: None,
             last_failure: None,
             retries: 0,
+            trigger: None,
         };
         let s = serde_json::to_string(&snap).unwrap();
         assert!(!s.contains("cooling_remaining"));

@@ -75,6 +75,38 @@ pub enum StateTransition {
     /// [`LiveSession`](crate::stream::LiveSession)). Only meaningful in
     /// `Live` / `Cooling`; ignored everywhere else.
     LiveLost(LiveLossReason),
+    /// The user opened a live view in the Arlo app
+    /// (`CameraEvent::ManualStream`). Activates from `Idle` and from
+    /// `BatteryProtect` (piggy-backing costs the camera nothing); ignored
+    /// while a session exists (ADR 0005).
+    ManualStreamDetected,
+    /// The camera went idle while a piggy-backed session was live. The
+    /// orchestrator emits it only for manual sessions; the reducer maps
+    /// `Live | Cooling → Idle`.
+    ManualStreamEnded,
+}
+
+/// Why a live session exists. Decides which timers and which budget
+/// apply (ADR 0005). Held by the orchestrator next to the session handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LiveTrigger {
+    /// PIR/ML motion, audio, or the admin wake: the daemon woke the
+    /// camera, so debounce, hard cap and daily budget all apply.
+    Motion,
+    /// Piggy-back on a user live view: only the hard cap applies and
+    /// the daily budget is not charged.
+    Manual,
+}
+
+impl LiveTrigger {
+    /// Stable kebab-case label for the admin snapshot and logs.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Motion => "motion",
+            Self::Manual => "manual",
+        }
+    }
 }
 
 /// Why an attached live source stopped delivering usable media.
@@ -150,6 +182,12 @@ mod tests {
             "peer-disconnected"
         );
         assert_eq!(LiveLossReason::AdapterDropped.as_label(), "adapter-dropped");
+    }
+
+    #[test]
+    fn live_trigger_labels_are_stable_and_kebab_case() {
+        assert_eq!(LiveTrigger::Motion.as_label(), "motion");
+        assert_eq!(LiveTrigger::Manual.as_label(), "manual");
     }
 
     #[test]

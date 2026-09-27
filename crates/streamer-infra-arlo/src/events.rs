@@ -15,23 +15,37 @@
 //! re-fire on the next motion pulse, and connection-state changes are
 //! observed via the dedicated watch channel.
 //!
+//! # Capture aid (ADR 0005)
+//!
+//! Every raw bus event is logged at `trace` and every unmapped
+//! `cameras/*` event at `debug`, both **without property values** (they
+//! can carry presigned URLs and transaction ids): action, resource,
+//! source, the sorted property keys and the `activityState` string. To
+//! see what Arlo emits when a live view starts in the mobile app:
+//!
+//! ```text
+//! RUST_LOG=info,streamer_infra_arlo::events=debug   # unmapped camera events
+//! RUST_LOG=info,streamer_infra_arlo::events=trace   # every event
+//! ```
+//!
 //! [`ArloEvent`]: arlo_rs::models::events::ArloEvent
 
 use std::sync::Arc;
 
 use arlo_rs::client::ArloClient;
 use arlo_rs::events::ConnectionState as ArloConnectionState;
+use arlo_rs::models::events::ArloEvent;
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use tokio_stream::wrappers::{BroadcastStream, WatchStream};
-use tracing::warn;
+use tracing::{debug, trace, warn};
 
 use streamer_domain::error::DomainError;
 use streamer_domain::event::{CameraEvent, ConnectionStatus};
 use streamer_domain::port::ArloEventSource;
 
 use crate::error::arlo_to_domain;
-use crate::event_mapper::map_event;
+use crate::event_mapper::{activity_state, map_event, property_keys};
 
 /// Adapter that exposes the arlo-rs MQTT event bus as the domain
 /// [`ArloEventSource`] port.
@@ -56,7 +70,11 @@ impl ArloEventSource for ArloEventSourceAdapter {
         let rx = bus.subscribe();
         let stream = BroadcastStream::new(rx).filter_map(|item| async move {
             match item {
-                Ok(event) => map_event(&event),
+                Ok(event) => {
+                    let mapped = map_event(&event);
+                    observe_raw(&event, mapped.as_ref());
+                    mapped
+                }
                 Err(err) => {
                     warn!(error = %err, "arlo event bus lagged; skipping");
                     None
@@ -74,6 +92,30 @@ impl ArloEventSource for ArloEventSourceAdapter {
     }
 }
 
+/// Redacted diagnostics for the capture workflow (module docs): never
+/// the property values.
+fn observe_raw(event: &ArloEvent, mapped: Option<&CameraEvent>) {
+    let keys = property_keys(event.properties.as_ref());
+    let activity = activity_state(event.properties.as_ref());
+    trace!(
+        action = %event.action,
+        resource = %event.resource,
+        source = ?event.source,
+        ?keys,
+        ?activity,
+        ?mapped,
+        "arlo bus event"
+    );
+    if mapped.is_none() && event.resource.starts_with("cameras/") {
+        debug!(
+            resource = %event.resource,
+            ?keys,
+            ?activity,
+            "unmapped camera event"
+        );
+    }
+}
+
 const fn map_connection_state(state: &ArloConnectionState) -> ConnectionStatus {
     match state {
         ArloConnectionState::Connecting => ConnectionStatus::Connecting,
@@ -85,6 +127,24 @@ const fn map_connection_state(state: &ArloConnectionState) -> ConnectionStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observe_raw_handles_mapped_and_unmapped_events_without_panicking() {
+        let unmapped = ArloEvent {
+            action: "is".to_string(),
+            resource: "cameras/CAM".to_string(),
+            publish_response: None,
+            properties: Some(serde_json::json!({ "batteryLevel": 80, "activityState": "idle" })),
+            source: Some("BASE".to_string()),
+            trans_id: None,
+            active_mode: None,
+        };
+        observe_raw(&unmapped, None);
+        let mapped = CameraEvent::ManualStreamEnded {
+            device_id: streamer_domain::camera::CameraId::new("CAM"),
+        };
+        observe_raw(&unmapped, Some(&mapped));
+    }
 
     #[test]
     fn maps_all_connection_state_variants() {

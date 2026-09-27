@@ -8,8 +8,20 @@
 //! |-------------------------|-------------------------|-----------------------------------------------|
 //! | [`CameraEvent::Motion`] | `cameras/{device_id}`   | `motionDetected == true`                      |
 //! | [`CameraEvent::Audio`]  | `cameras/{device_id}`   | `audioDetected == true`                       |
+//! | [`CameraEvent::ManualStream`] | `cameras/{device_id}` | `activityState == "userStreamActive"`     |
+//! | [`CameraEvent::ManualStreamEnded`] | `cameras/{device_id}` | `activityState == "idle"`            |
 //! | [`CameraEvent::Online`] | `cameras/{device_id}`   | `connectionState == "available"`              |
 //! | [`CameraEvent::Offline`]| `cameras/{device_id}`   | `connectionState == "unavailable"`            |
+//!
+//! Precedence is the table order: a payload carrying both a motion
+//! flag and an activity state is the motion recording starting, and the
+//! actionable signal wins. Other `activityState` values
+//! (`alertStreamActive`, `startUserStream`, `fullFrameSnapshot`,
+//! `startRecord`, `stopRecord`) map to nothing — `alertStreamActive` is
+//! the consequence of a `motionDetected` that already arrived, and
+//! mapping it too would double-count motion. The `activityState`
+//! vocabulary is the pyaarlo one; confirmed against a live capture is
+//! part of ADR 0005's checklist.
 //!
 //! Anything that doesn't match returns [`None`]. The orchestrator
 //! never sees these — they're filtered out at the adapter boundary.
@@ -21,6 +33,9 @@ use streamer_domain::camera::CameraId;
 use streamer_domain::event::CameraEvent;
 
 const CAMERAS_PREFIX: &str = "cameras/";
+const ACTIVITY_STATE: &str = "activityState";
+const USER_STREAM_ACTIVE: &str = "userStreamActive";
+const ACTIVITY_IDLE: &str = "idle";
 
 /// Translate an [`ArloEvent`] to a domain [`CameraEvent`], returning
 /// [`None`] when the event is uninteresting or malformed.
@@ -39,6 +54,9 @@ pub fn map_event(event: &ArloEvent) -> Option<CameraEvent> {
             device_id: CameraId::new(device_id),
         });
     }
+    if let Some(mapped) = map_activity_state(device_id, props) {
+        return Some(mapped);
+    }
     if let Some(state) = props.get("connectionState").and_then(Value::as_str) {
         return match state {
             "available" => Some(CameraEvent::Online {
@@ -51,6 +69,37 @@ pub fn map_event(event: &ArloEvent) -> Option<CameraEvent> {
         };
     }
     None
+}
+
+fn map_activity_state(device_id: &str, props: &Value) -> Option<CameraEvent> {
+    match activity_state(Some(props))? {
+        USER_STREAM_ACTIVE => Some(CameraEvent::ManualStream {
+            device_id: CameraId::new(device_id),
+        }),
+        ACTIVITY_IDLE => Some(CameraEvent::ManualStreamEnded {
+            device_id: CameraId::new(device_id),
+        }),
+        _ => None,
+    }
+}
+
+/// The `activityState` string of an event's properties, if any. Safe
+/// to log: a small enum-like value, never a URL or a token.
+#[must_use]
+pub fn activity_state(props: Option<&Value>) -> Option<&str> {
+    props?.get(ACTIVITY_STATE).and_then(Value::as_str)
+}
+
+/// The property keys of an event, sorted, for redacted diagnostics.
+/// Keys only: property values can carry stream URLs and transaction ids.
+#[must_use]
+pub fn property_keys(props: Option<&Value>) -> Vec<&str> {
+    let mut keys: Vec<&str> = props
+        .and_then(Value::as_object)
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    keys.sort_unstable();
+    keys
 }
 
 fn extract_device_id(resource: &str) -> Option<&str> {
@@ -112,6 +161,93 @@ mod tests {
                 device_id: CameraId::new("CAM2")
             })
         );
+    }
+
+    // ---------- Activity state (ADR 0005) ----------
+
+    #[test]
+    fn maps_user_stream_active_to_manual_stream() {
+        let event = ev(
+            "cameras/CAM4",
+            Some(json!({ "activityState": "userStreamActive" })),
+        );
+        assert_eq!(
+            map_event(&event),
+            Some(CameraEvent::ManualStream {
+                device_id: CameraId::new("CAM4")
+            })
+        );
+    }
+
+    #[test]
+    fn maps_activity_idle_to_manual_stream_ended() {
+        let event = ev("cameras/CAM4", Some(json!({ "activityState": "idle" })));
+        assert_eq!(
+            map_event(&event),
+            Some(CameraEvent::ManualStreamEnded {
+                device_id: CameraId::new("CAM4")
+            })
+        );
+    }
+
+    #[rstest]
+    #[case("alertStreamActive")]
+    #[case("startUserStream")]
+    #[case("fullFrameSnapshot")]
+    #[case("startRecord")]
+    #[case("stopRecord")]
+    #[case("")]
+    fn ignores_other_activity_states(#[case] state: &str) {
+        let event = ev("cameras/CAM4", Some(json!({ "activityState": state })));
+        assert!(map_event(&event).is_none());
+    }
+
+    #[test]
+    fn ignores_non_string_activity_state() {
+        let event = ev("cameras/CAM4", Some(json!({ "activityState": 1 })));
+        assert!(map_event(&event).is_none());
+    }
+
+    #[test]
+    fn motion_takes_precedence_over_activity_state() {
+        let event = ev(
+            "cameras/CAM4",
+            Some(json!({ "motionDetected": true, "activityState": "alertStreamActive" })),
+        );
+        assert!(matches!(
+            map_event(&event),
+            Some(CameraEvent::Motion { .. })
+        ));
+    }
+
+    #[test]
+    fn activity_state_takes_precedence_over_connection_state() {
+        let event = ev(
+            "cameras/CAM4",
+            Some(json!({ "activityState": "userStreamActive", "connectionState": "available" })),
+        );
+        assert!(matches!(
+            map_event(&event),
+            Some(CameraEvent::ManualStream { .. })
+        ));
+    }
+
+    #[test]
+    fn property_keys_are_sorted_and_empty_without_properties() {
+        assert!(property_keys(None).is_empty());
+        let props = json!({ "zeta": 1, "alpha": "x", "mid": null });
+        assert_eq!(property_keys(Some(&props)), vec!["alpha", "mid", "zeta"]);
+        assert!(property_keys(Some(&json!("not an object"))).is_empty());
+    }
+
+    #[test]
+    fn activity_state_reads_only_string_values() {
+        assert_eq!(
+            activity_state(Some(&json!({ "activityState": "idle" }))),
+            Some("idle")
+        );
+        assert_eq!(activity_state(Some(&json!({ "activityState": 7 }))), None);
+        assert_eq!(activity_state(None), None);
     }
 
     // ---------- Connection state ----------

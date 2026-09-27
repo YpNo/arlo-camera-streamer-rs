@@ -20,6 +20,7 @@ Frigate's pull from Arlo's push**:
 | Live  | Real H.264/H.265 from the camera | Awake |
 | Cooling | Live continues for `debounce_secs` | Awake |
 | Battery-protect | Idle frame returns | Sleeping (quota exhausted) |
+| Live (manual) | Piggy-back on a live view you opened in the Arlo app; not charged to the budget, ends when you close the app | Awake (because of you) |
 
 The transition is driven by Arlo's **MQTT event bus**: when the camera
 fires a motion event, the daemon negotiates a WebRTC session with Arlo's

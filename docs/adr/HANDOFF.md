@@ -67,6 +67,7 @@ of each event is unchanged, which is why `event_mapper.rs` still works.
 - `0002-rtsp-only-output-v1` — accepted; HLS/DASH parsed but not wired.
 - `0003-seamless-input-selector-splice` — accepted; production splice.
 - `0004-live-lost-feedback` — accepted; `LiveSession` handle + `LiveLost` transition.
+- `0005-manual-stream-piggyback` — accepted; user live view → free piggy-backed session, wire signal to confirm by capture.
 
 ---
 
@@ -99,7 +100,7 @@ commits. Phase 9 is this session's work.
 
 ## 4. Agreed plan (2026-09-27) and where we are
 
-Order agreed with the user; items 1–3 are done, 4–5 remain.
+Order agreed with the user; items 1–4 are done (4 pending its live capture), 5 remains.
 
 1. **Unblock CI** — done (toolchain, crates.io dep, image deps, no
    `-A dead_code`). **Open the PR `feat/init-v1` → `main`**: GitHub Actions
@@ -115,25 +116,18 @@ Order agreed with the user; items 1–3 are done, 4–5 remain.
    until CI / the Frigate box runs it (see ADR §Consequences). Follow-up:
    race the first-RTP wait against an early loss so an attach that dies
    during ICE fails with the real reason instead of the 20 s timeout.
-4. **Two event contexts, two domain events.** The user confirmed the model:
-   - `CameraEvent::Motion` — camera PIR/ML trigger (exists).
-   - `CameraEvent::ManualStream { device_id }` — the **user started a live
-     view in the Arlo app** (to add). In v3 the camera uplinks one call and
-     each viewer gets its own gateway leg, so the daemon opens its *own*
-     WebRTC session while the app has one; there is no URL to pick up, and
-     "reuse an existing stream" collapses to nothing (dropped from scope).
-   - Policy differences to encode, not copy from `Motion`: the camera is
-     awake because of the user, so **do not charge the daily budget** for
-     piggy-backed time; keep `max_continuous_live` as the safety cap; the
-     session ends when the app closes — which is why item 3 was done first:
-     the app-closed case now surfaces as `live-lost-rtp-stalled` /
-     `live-lost-peer-disconnected` within the stall timeout.
-   - **First deliverable is a capture, not a variant.** The assumed wire
-     signal is `cameras/<id>` with `properties.activityState =
-     "userStreamActive"` (pyaarlo's v2 name; unverified on MQTT). Add an
-     event-dump switch (or a `trace` target that logs every raw
-     `ArloEvent`), start a live view from the phone, read the dump, then
-     write the mapper case + tests.
+4. **Two event contexts, two domain events** — built 2026-09-27 (ADR 0005),
+   **capture pending**. `CameraEvent::ManualStream` / `ManualStreamEnded`
+   from `activityState == "userStreamActive"` / `"idle"`; `LiveTrigger`
+   field on the orchestrator; manual sessions: no debounce (debouncer
+   `Held`), cap only, budget never charged, motion absorbed, activation
+   allowed from `BatteryProtect` with a return there afterwards; 5 s echo
+   guard after our own exits. **Run the ADR 0005 checklist from the phone**
+   with `RUST_LOG=info,streamer_infra_arlo::events=debug`: if the key or
+   value differs, the mapper constants in `event_mapper.rs` are the only
+   change. Follow-up if the capture shows our own leg echoes
+   `userStreamActive`: keep or tune the guard; if `idle` never arrives while
+   our leg is attached, consider a shorter cap for manual sessions.
 5. **`list-devices` CLI subcommand** — authenticate through the existing
    `boot()`, print `{device_id, device_name, device_type, model_id}` from
    `ArloClient::get_devices`. Biggest first-run UX win; the whole boot path

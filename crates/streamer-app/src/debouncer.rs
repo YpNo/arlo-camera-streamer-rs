@@ -21,6 +21,11 @@
 //! tripped so the orchestrator can log + emit the matching
 //! [`StateTransition`](streamer_domain::state::StateTransition).
 //!
+//! A **manual** (piggy-backed, ADR 0005) session started with
+//! [`MotionDebouncer::on_manual_session`] has no debounce window: the
+//! user may watch for minutes without any motion, so only the hard cap
+//! applies and motion pulses are ignored until the session ends.
+//!
 //! Because the debouncer is monotonic, it operates in [`Instant`]
 //! coordinates throughout — daily-reset wall-clock concerns belong to
 //! [`crate::budget`].
@@ -45,9 +50,15 @@ pub enum DebouncerVerdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DebouncerState {
     Off,
+    /// Motion-triggered: debounce window since `last_motion` plus the
+    /// hard cap since `live_since`.
     Active {
         live_since: Instant,
         last_motion: Instant,
+    },
+    /// Piggy-backed on a user live view: hard cap only.
+    Held {
+        live_since: Instant,
     },
 }
 
@@ -89,7 +100,18 @@ impl MotionDebouncer {
                 live_since,
                 last_motion: now,
             },
+            // A manual session has no debounce window to re-arm.
+            DebouncerState::Held { live_since } => DebouncerState::Held { live_since },
         };
+    }
+
+    /// Start a manual (piggy-backed) session at `now`: only the hard
+    /// cap applies from here on. Unconditional — it overrides any
+    /// priming left by a motion pulse that arrived while the manual
+    /// attach was in flight, or a stale session from before a
+    /// `BatteryProtect` period.
+    pub fn on_manual_session(&mut self, now: Instant) {
+        self.state = DebouncerState::Held { live_since: now };
     }
 
     /// Record that the live source has been attached at `now`.
@@ -129,6 +151,13 @@ impl MotionDebouncer {
                     DebouncerVerdict::KeepLive
                 }
             }
+            DebouncerState::Held { live_since } => {
+                if now.saturating_duration_since(live_since) >= self.max_continuous {
+                    DebouncerVerdict::MaxLiveExceeded
+                } else {
+                    DebouncerVerdict::KeepLive
+                }
+            }
         }
     }
 
@@ -150,6 +179,9 @@ impl MotionDebouncer {
                 let debounce_deadline = last_motion + self.debounce;
                 let next = max_deadline.min(debounce_deadline);
                 Some(next.max(now))
+            }
+            DebouncerState::Held { live_since } => {
+                Some((live_since + self.max_continuous).max(now))
             }
         }
     }
@@ -289,5 +321,82 @@ mod tests {
         let mut d = MotionDebouncer::new(&cfg(60, 300));
         d.on_idle();
         assert_eq!(d.poll(Instant::now()), DebouncerVerdict::Idle);
+    }
+
+    // ---------- Manual (piggy-backed) sessions — ADR 0005 ----------
+
+    #[test]
+    fn manual_session_ignores_debounce_window() {
+        let t0 = Instant::now();
+        let mut d = MotionDebouncer::new(&cfg(2, 300));
+        d.on_manual_session(t0);
+        assert_eq!(
+            d.poll(t0 + Duration::from_secs(100)),
+            DebouncerVerdict::KeepLive
+        );
+    }
+
+    #[test]
+    fn manual_session_hits_max_cap() {
+        let t0 = Instant::now();
+        let mut d = MotionDebouncer::new(&cfg(2, 10));
+        d.on_manual_session(t0);
+        assert_eq!(
+            d.poll(t0 + Duration::from_secs(10)),
+            DebouncerVerdict::MaxLiveExceeded
+        );
+    }
+
+    #[test]
+    fn manual_session_next_deadline_is_cap_only() {
+        let t0 = Instant::now();
+        let mut d = MotionDebouncer::new(&cfg(2, 10));
+        d.on_manual_session(t0);
+        assert_eq!(d.next_deadline(t0), Some(t0 + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn motion_during_manual_session_does_not_arm_debounce() {
+        let t0 = Instant::now();
+        let mut d = MotionDebouncer::new(&cfg(2, 10));
+        d.on_manual_session(t0);
+        d.on_motion(t0 + Duration::from_secs(1));
+        assert_eq!(
+            d.poll(t0 + Duration::from_secs(5)),
+            DebouncerVerdict::KeepLive
+        );
+        assert_eq!(d.next_deadline(t0), Some(t0 + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn on_manual_session_overrides_stale_motion_priming() {
+        let t0 = Instant::now();
+        let mut d = MotionDebouncer::new(&cfg(2, 10));
+        d.on_motion(t0);
+        d.on_manual_session(t0 + Duration::from_secs(9));
+        // The cap counts from the manual start, not the stale pulse.
+        assert_eq!(
+            d.poll(t0 + Duration::from_secs(12)),
+            DebouncerVerdict::KeepLive
+        );
+    }
+
+    #[test]
+    fn on_idle_from_manual_session_returns_off() {
+        let t0 = Instant::now();
+        let mut d = MotionDebouncer::new(&cfg(2, 10));
+        d.on_manual_session(t0);
+        d.on_idle();
+        assert_eq!(d.poll(t0), DebouncerVerdict::Idle);
+        assert_eq!(d.next_deadline(t0), None);
+    }
+
+    #[test]
+    fn on_live_attached_after_manual_session_is_noop() {
+        let t0 = Instant::now();
+        let mut d = MotionDebouncer::new(&cfg(2, 10));
+        d.on_manual_session(t0);
+        d.on_live_attached(t0 + Duration::from_secs(5));
+        assert_eq!(d.next_deadline(t0), Some(t0 + Duration::from_secs(10)));
     }
 }

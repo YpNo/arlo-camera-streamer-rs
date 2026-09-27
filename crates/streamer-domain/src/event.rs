@@ -21,6 +21,21 @@ pub enum CameraEvent {
         /// Camera that triggered the event.
         device_id: CameraId,
     },
+    /// The user opened a live view in the Arlo app
+    /// (`activityState == "userStreamActive"`). The camera is awake on
+    /// the user's account, so the daemon may piggy-back its own WebRTC
+    /// leg without charging the daily budget (ADR 0005).
+    ManualStream {
+        /// Camera the user is watching.
+        device_id: CameraId,
+    },
+    /// The camera reported `activityState == "idle"`. Also arrives after
+    /// motion recordings and after the daemon's own sessions; the
+    /// orchestrator acts on it only while a piggy-backed session is live.
+    ManualStreamEnded {
+        /// Camera that went idle.
+        device_id: CameraId,
+    },
     /// Device transitioned to online / reachable.
     Online {
         /// Camera whose connectivity changed.
@@ -39,6 +54,8 @@ impl CameraEvent {
         match self {
             Self::Motion { device_id }
             | Self::Audio { device_id }
+            | Self::ManualStream { device_id }
+            | Self::ManualStreamEnded { device_id }
             | Self::Online { device_id }
             | Self::Offline { device_id } => device_id,
         }
@@ -68,6 +85,12 @@ mod tests {
                 device_id: id.clone(),
             },
             CameraEvent::Audio {
+                device_id: id.clone(),
+            },
+            CameraEvent::ManualStream {
+                device_id: id.clone(),
+            },
+            CameraEvent::ManualStreamEnded {
                 device_id: id.clone(),
             },
             CameraEvent::Online {

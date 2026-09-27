@@ -50,6 +50,10 @@ alias cargo='mise exec -- cargo'
   files and the binary excluded (`ci.yml`). Raise deliberately.
 - Battery rule: every `Live` exit pairs `detach_live` with
   `WebrtcSignaler::teardown`.
+- Manual (piggy-backed) sessions (ADR 0005) end on the camera's `idle`
+  report first, `LiveLost` / the hard cap second; they are never billed.
+- The orchestrator's clock is `tokio::time::Instant` (virtual under
+  `start_paused` tests); never reintroduce `std::time::Instant::now()` there.
 
 ## Dependencies
 Checked against crates.io on 2026-09-27: all within one minor of latest

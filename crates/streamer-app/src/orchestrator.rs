@@ -40,6 +40,19 @@
 //! Dropping the handle on every live exit is what makes late reports
 //! from a finished session unobservable — no generation counters.
 //!
+//! # Two triggers (ADR 0005)
+//!
+//! A session is either **motion**-triggered (PIR/ML, audio, admin wake:
+//! debounce + hard cap + daily budget) or **manual** (the user opened a
+//! live view in the Arlo app and the daemon piggy-backs: hard cap only,
+//! budget not charged, ends on the camera's `idle` report with
+//! `LiveLost` and the cap as backstops). The trigger is an orchestrator
+//! field set at activation and cleared on every exit; `ManualStreamEnded`
+//! is only turned into a signal while the live session is manual, and a
+//! `ManualStream` arriving within `MANUAL_ECHO_GUARD` of our own live
+//! exit is dropped in case the camera reports our own leg as a user
+//! stream (capture item in ADR 0005).
+//!
 //! [`EventRouter`]: crate::router::EventRouter
 
 // `tokio::select!` arms with terminal `None` paths are clearer as
@@ -69,7 +82,7 @@ use streamer_domain::metrics::{BudgetDecision, MotionOutcome, SpliceOutcome};
 use streamer_domain::port::{
     ArloThumbnailSource, MediaMultiplexer, MetricsRecorder, WebrtcSignaler,
 };
-use streamer_domain::state::{CameraState, LiveLossReason, StateTransition};
+use streamer_domain::state::{CameraState, LiveLossReason, LiveTrigger, StateTransition};
 use streamer_domain::stream::LiveSession;
 
 use crate::budget::{BudgetVerdict, LiveBudgetTracker};
@@ -77,6 +90,11 @@ use crate::debouncer::{DebouncerVerdict, MotionDebouncer};
 #[cfg(test)]
 use crate::metrics_noop::NoopRecorder;
 use crate::transition::transition;
+
+/// Window after our own live exit during which a `ManualStream` event
+/// is treated as an echo of that exit rather than a new user view. Long
+/// enough for MQTT propagation, short enough to not hide a real view.
+const MANUAL_ECHO_GUARD: Duration = Duration::from_secs(5);
 
 /// Per-camera state-machine task.
 pub struct CameraOrchestrator {
@@ -93,6 +111,11 @@ pub struct CameraOrchestrator {
     /// state leaves live, so a report from a finished session can never
     /// be observed.
     live: Option<LiveSession>,
+    /// Why the current session exists (ADR 0005). `Some` from activation
+    /// until the exit to `Idle` / `BatteryProtect` / `Failed`.
+    trigger: Option<LiveTrigger>,
+    /// When the last live session ended; drives [`MANUAL_ECHO_GUARD`].
+    last_live_exit: Option<Instant>,
     signaler: Arc<dyn WebrtcSignaler>,
     thumbnails: Arc<dyn ArloThumbnailSource>,
     media: Arc<dyn MediaMultiplexer>,
@@ -144,6 +167,8 @@ impl CameraOrchestrator {
             budget,
             failed_deadline: None,
             live: None,
+            trigger: None,
+            last_live_exit: None,
             signaler,
             thumbnails,
             media,
@@ -288,8 +313,12 @@ impl CameraOrchestrator {
                 if reply.send(()).is_err() {
                     debug!("admin manual-wake reply dropped");
                 }
-                let signal = self.intercept_budget(StateTransition::MotionDetected);
-                self.debouncer.on_motion(Instant::now());
+                // Same guards as a real pulse: absorbed during a manual
+                // session, no stale debouncer priming in BatteryProtect /
+                // Failed, budget checked.
+                let Some(signal) = self.motion_signal() else {
+                    return;
+                };
                 if let Err(e) = self.process_signals(VecDeque::from([signal])).await {
                     warn!(error = %e, "manual-wake failed");
                 }
@@ -326,6 +355,7 @@ impl CameraOrchestrator {
             cooling_remaining,
             last_failure,
             retries,
+            trigger: self.trigger.map(|t| t.as_label().to_string()),
         }
     }
 
@@ -348,14 +378,17 @@ impl CameraOrchestrator {
         match &self.state {
             CameraState::Idle | CameraState::Activating => None,
             CameraState::Live { .. } | CameraState::Cooling { .. } => {
-                self.debouncer.next_deadline(Instant::now())
+                self.debouncer.next_deadline(now())
             }
             CameraState::Failed { .. } => self.failed_deadline,
             CameraState::BatteryProtect { .. } => {
-                let next_reset = self.budget.next_reset(Local::now().naive_local());
-                let now = Local::now().naive_local();
-                let delta = (next_reset - now).num_seconds().max(0);
-                Some(Instant::now() + Duration::from_secs(u64::try_from(delta).unwrap_or(0)))
+                let wall = Local::now().naive_local();
+                let next_reset = self.budget.next_reset(wall);
+                // Round *up*: firing before the wall-clock boundary would
+                // poll the tracker on the old day and bounce straight
+                // back into BatteryProtect.
+                let delta_ms = (next_reset - wall).num_milliseconds().max(0);
+                Some(now() + Duration::from_millis(u64::try_from(delta_ms).unwrap_or(0) + 1))
             }
         }
     }
@@ -363,11 +396,24 @@ impl CameraOrchestrator {
     async fn handle_event(&mut self, event: CameraEvent) -> Result<(), DomainError> {
         let signal = match event {
             CameraEvent::Motion { .. } | CameraEvent::Audio { .. } => {
-                self.debouncer.on_motion(Instant::now());
-                let signal = self.intercept_budget(StateTransition::MotionDetected);
-                self.metrics
-                    .record_motion(&self.camera_id, classify_motion(&self.state, &signal));
+                let Some(signal) = self.motion_signal() else {
+                    return Ok(());
+                };
                 signal
+            }
+            CameraEvent::ManualStream { .. } => {
+                let Some(signal) = self.manual_stream_signal() else {
+                    return Ok(());
+                };
+                signal
+            }
+            CameraEvent::ManualStreamEnded { .. } => {
+                if self.trigger != Some(LiveTrigger::Manual) {
+                    debug!(state = ?self.state, "camera idle report outside a manual session; ignored");
+                    return Ok(());
+                }
+                info!("user live view ended; releasing the piggy-backed session");
+                StateTransition::ManualStreamEnded
             }
             CameraEvent::Online { .. } => {
                 debug!("camera online");
@@ -378,6 +424,44 @@ impl CameraOrchestrator {
             }
         };
         self.process_signals(VecDeque::from([signal])).await
+    }
+
+    /// Turn a motion / audio pulse into a signal, or `None` when it must
+    /// not touch the machine: during a manual session the pulse is
+    /// absorbed without re-arming the debounce or polling the budget
+    /// (an exhausted budget must not cut a free piggy-back short).
+    fn motion_signal(&mut self) -> Option<StateTransition> {
+        if self.trigger == Some(LiveTrigger::Manual) {
+            self.metrics
+                .record_motion(&self.camera_id, MotionOutcome::Absorbed);
+            return None;
+        }
+        // Prime the debouncer only where a session can start or extend;
+        // a pulse in BatteryProtect / Failed would leave a stale
+        // `live_since` that trips the hard cap right after the next attach.
+        if matches!(
+            self.state,
+            CameraState::Idle | CameraState::Live { .. } | CameraState::Cooling { .. }
+        ) {
+            self.debouncer.on_motion(now());
+        }
+        let signal = self.intercept_budget(StateTransition::MotionDetected);
+        self.metrics
+            .record_motion(&self.camera_id, classify_motion(&self.state, &signal));
+        Some(signal)
+    }
+
+    /// A user live view started. `None` when it is most likely the echo
+    /// of our own session that just ended (see [`MANUAL_ECHO_GUARD`]).
+    fn manual_stream_signal(&self) -> Option<StateTransition> {
+        if let Some(exit) = self.last_live_exit
+            && now().saturating_duration_since(exit) < MANUAL_ECHO_GUARD
+        {
+            debug!("manual stream event within the echo guard of our own live exit; ignored");
+            return None;
+        }
+        info!(state = ?self.state, "user live view started; piggy-backing");
+        Some(StateTransition::ManualStreamDetected)
     }
 
     /// The media adapter reported the attached source dead. Route it
@@ -417,7 +501,7 @@ impl CameraOrchestrator {
     async fn handle_deadline(&mut self) -> Result<(), DomainError> {
         let signal = match &self.state {
             CameraState::Live { .. } | CameraState::Cooling { .. } => {
-                match self.debouncer.poll(Instant::now()) {
+                match self.debouncer.poll(now()) {
                     DebouncerVerdict::DebounceExpired => StateTransition::CooldownExpired,
                     DebouncerVerdict::MaxLiveExceeded => StateTransition::MaxLiveExceeded,
                     DebouncerVerdict::KeepLive | DebouncerVerdict::Idle => return Ok(()),
@@ -460,7 +544,7 @@ impl CameraOrchestrator {
                 self.metrics
                     .record_budget(&self.camera_id, BudgetDecision::Reset);
             }
-            let follow_ups = self.apply_state_change(&from, &to).await?;
+            let follow_ups = self.apply_state_change(&from, &to, &signal).await?;
             for f in follow_ups {
                 signals.push_back(f);
             }
@@ -472,22 +556,25 @@ impl CameraOrchestrator {
         &mut self,
         from: &CameraState,
         to: &CameraState,
+        signal: &StateTransition,
     ) -> Result<Vec<StateTransition>, DomainError> {
         let mut follow_ups = Vec::new();
         match (from, to) {
-            // Cold-start activation: kick off the async stream request.
-            (CameraState::Idle, CameraState::Activating) => {
+            // Activation: from Idle on motion or a user view, from
+            // BatteryProtect on a user view only (piggy-backing is free).
+            (CameraState::Idle | CameraState::BatteryProtect { .. }, CameraState::Activating) => {
+                let trigger = match signal {
+                    StateTransition::ManualStreamDetected => LiveTrigger::Manual,
+                    _ => LiveTrigger::Motion,
+                };
+                self.trigger = Some(trigger);
                 follow_ups.extend(self.start_activation().await);
             }
             // Activation succeeded.
-            (CameraState::Activating, CameraState::Live { .. }) => {
-                let now = Instant::now();
-                self.debouncer.on_live_attached(now);
-                self.budget.on_live_started(Local::now().naive_local());
-            }
-            // Cooldown / max-live / mid-Live failure → return to idle (or beyond).
+            (CameraState::Activating, CameraState::Live { .. }) => self.on_live_entered(),
+            // Cooldown / max-live / loss / user view ended → idle.
             (CameraState::Live { .. } | CameraState::Cooling { .. }, CameraState::Idle) => {
-                self.detach_and_refresh().await;
+                follow_ups.extend(self.on_idle_entered().await);
             }
             // Live → BatteryProtect (budget exhausted mid-session).
             (
@@ -495,8 +582,7 @@ impl CameraOrchestrator {
                 CameraState::BatteryProtect { .. },
             ) => {
                 self.detach_and_refresh().await;
-                self.budget.on_live_ended(Local::now().naive_local());
-                self.debouncer.on_idle();
+                self.on_session_over();
             }
             // Anywhere → Failed (transient error).
             (
@@ -507,7 +593,8 @@ impl CameraOrchestrator {
                 self.stop_arlo_live().await;
                 self.budget.on_live_ended(Local::now().naive_local());
                 self.debouncer.on_idle();
-                self.failed_deadline = Some(Instant::now() + backoff_duration(*retries));
+                self.on_session_over();
+                self.failed_deadline = Some(now() + backoff_duration(*retries));
             }
             // Failed → Idle (backoff elapsed; ready to retry).
             (CameraState::Failed { .. }, CameraState::Idle) => {
@@ -523,11 +610,49 @@ impl CameraOrchestrator {
         Ok(follow_ups)
     }
 
+    /// Arm the timers for the session that just attached. A motion
+    /// session gets debounce + cap and is billed; a manual session gets
+    /// the cap only and is free (the user woke the camera, not us).
+    fn on_live_entered(&mut self) {
+        let now = now();
+        match self.trigger {
+            Some(LiveTrigger::Manual) => self.debouncer.on_manual_session(now),
+            _ => {
+                self.debouncer.on_live_attached(now);
+                self.budget.on_live_started(Local::now().naive_local());
+            }
+        }
+    }
+
+    /// `Live | Cooling → Idle`: release everything, then — after a manual
+    /// session only — re-check the budget so a piggy-back that started
+    /// in `BatteryProtect` returns there instead of leaving the camera
+    /// armed for motion with an exhausted quota.
+    async fn on_idle_entered(&mut self) -> Vec<StateTransition> {
+        let was_manual = self.trigger == Some(LiveTrigger::Manual);
+        self.detach_and_refresh().await;
+        self.on_session_over();
+        if was_manual && self.budget.poll(Local::now().naive_local()) == BudgetVerdict::Exhausted {
+            debug!(
+                "budget still exhausted after the piggy-backed session; back to battery-protect"
+            );
+            return vec![StateTransition::BudgetExhausted];
+        }
+        Vec::new()
+    }
+
+    /// Bookkeeping shared by every session exit: the trigger is gone and
+    /// the exit instant feeds the manual-stream echo guard.
+    fn on_session_over(&mut self) {
+        self.trigger = None;
+        self.last_live_exit = Some(now());
+    }
+
     /// Bring up a fresh live session. The media adapter owns the
     /// WebRTC offer/answer round-trip (via `signaler`); the orchestrator
     /// only drives the splice and keeps teardown symmetric.
     async fn start_activation(&mut self) -> Vec<StateTransition> {
-        let started = Instant::now();
+        let started = now();
         match self
             .media
             .attach_live(&self.camera_id, self.signaler.as_ref())
@@ -614,6 +739,14 @@ impl CameraOrchestrator {
     }
 }
 
+/// The orchestrator's monotonic clock. Taken from tokio so that a paused
+/// test clock (`start_paused`) drives every deadline, guard and debounce
+/// computation consistently; in production it is the plain monotonic
+/// clock.
+fn now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
+
 /// Sleep until `deadline` or block forever when `None`. Used inside
 /// `tokio::select!` so the deadline arm can be short-circuited when
 /// the orchestrator has nothing to wait for. Converts the
@@ -666,6 +799,8 @@ fn signal_label(s: &StateTransition) -> &'static str {
         StateTransition::Failure(_) => "failure",
         StateTransition::BackoffElapsed => "backoff-elapsed",
         StateTransition::LiveLost(reason) => reason.signal_label(),
+        StateTransition::ManualStreamDetected => "manual-stream-detected",
+        StateTransition::ManualStreamEnded => "manual-stream-ended",
     }
 }
 
@@ -1130,6 +1265,320 @@ mod tests {
         assert_eq!(
             signal_label(&StateTransition::LiveLost(LiveLossReason::RtpStalled)),
             "live-lost-rtp-stalled"
+        );
+    }
+
+    // ---------- Manual stream piggy-back (ADR 0005) ----------
+
+    fn camera_cfg_budget(debounce: u64, max: u64, budget: u64) -> CameraConfig {
+        let mut cfg = camera_cfg(debounce, max);
+        cfg.cooldown.daily_live_budget = budget;
+        cfg
+    }
+
+    async fn send(tx: &mpsc::Sender<CameraEvent>, event: CameraEvent) {
+        tx.send(event).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    fn manual() -> CameraEvent {
+        CameraEvent::ManualStream {
+            device_id: CameraId::new("CAM"),
+        }
+    }
+
+    fn manual_ended() -> CameraEvent {
+        CameraEvent::ManualStreamEnded {
+            device_id: CameraId::new("CAM"),
+        }
+    }
+
+    fn motion() -> CameraEvent {
+        CameraEvent::Motion {
+            device_id: CameraId::new("CAM"),
+        }
+    }
+
+    /// Let the wall clock (which the budget tracker reads) move on.
+    fn let_wall_clock_pass(d: Duration) {
+        std::thread::sleep(d);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_stream_drives_idle_to_live_and_ends_on_manual_stream_ended() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        let calls = media.calls().await;
+        assert!(calls.iter().any(|c| matches!(c, MediaCall::AttachLive(_))));
+
+        send(&tx, manual_ended()).await;
+        assert!(media.calls().await.contains(&MediaCall::DetachLive));
+        assert_eq!(
+            sr.stop_count().await,
+            1,
+            "teardown pairs with the manual exit"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_session_outlives_debounce_window_until_max_cap() {
+        // debounce 2 s must NOT end a manual session; the 10 s cap must.
+        let cfg = camera_cfg(2, 10);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        media.calls().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !media.calls().await.contains(&MediaCall::DetachLive),
+            "a manual session has no debounce window"
+        );
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            media.calls().await.contains(&MediaCall::DetachLive),
+            "the hard cap still ends a manual session"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_session_is_not_charged_to_the_daily_budget() {
+        let cfg = camera_cfg_budget(60, 300, 1);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer()), Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        let_wall_clock_pass(Duration::from_millis(1100));
+        send(&tx, manual_ended()).await;
+        assert_eq!(sr.call_count().await, 1);
+
+        // A charged session of 1.1 s would have exhausted the 1 s budget
+        // and this motion would be denied.
+        send(&tx, motion()).await;
+        assert_eq!(
+            sr.call_count().await,
+            2,
+            "motion after a free manual session still activates"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_stream_in_battery_protect_piggybacks_then_returns_there() {
+        let cfg = camera_cfg_budget(2, 300, 1);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer()), Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        // Motion session that exhausts the 1 s budget.
+        send(&tx, motion()).await;
+        let_wall_clock_pass(Duration::from_millis(1100));
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(media.calls().await.contains(&MediaCall::DetachLive));
+        // Next motion is denied → BatteryProtect.
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 1);
+
+        // A user view piggy-backs even in BatteryProtect … (past the echo
+        // guard of the session that just ended)
+        tokio::time::advance(MANUAL_ECHO_GUARD + Duration::from_secs(1)).await;
+        send(&tx, manual()).await;
+        assert_eq!(sr.call_count().await, 2);
+        media.calls().await;
+        // … and the machine returns to BatteryProtect afterwards:
+        send(&tx, manual_ended()).await;
+        assert!(media.calls().await.contains(&MediaCall::DetachLive));
+        assert_eq!(sr.stop_count().await, 2);
+        send(&tx, motion()).await;
+        assert_eq!(
+            sr.call_count().await,
+            2,
+            "budget still exhausted after the free session"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_stream_ended_is_noop_during_a_motion_session_and_in_idle() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual_ended()).await;
+        assert_eq!(media.calls().await, vec![MediaCall::Register]);
+
+        send(&tx, motion()).await;
+        media.calls().await;
+        send(&tx, manual_ended()).await;
+        assert!(
+            media.calls().await.is_empty(),
+            "an idle report must not end a motion session"
+        );
+        assert_eq!(sr.stop_count().await, 0);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_stream_within_echo_guard_of_own_exit_is_ignored() {
+        let cfg = camera_cfg(2, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer()), Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        media.calls().await; // session 1 ended by cooldown
+
+        // Echo of our own exit: ignored.
+        send(&tx, manual()).await;
+        assert_eq!(sr.call_count().await, 1);
+
+        // Past the guard: a real user view is honoured.
+        tokio::time::advance(MANUAL_ECHO_GUARD + Duration::from_secs(1)).await;
+        send(&tx, manual()).await;
+        assert_eq!(sr.call_count().await, 2);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn motion_during_manual_session_is_absorbed_without_ending_it() {
+        let cfg = camera_cfg(2, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        media.calls().await;
+        send(&tx, motion()).await;
+        // If the pulse had re-armed a debounce, the session would end 2 s later.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(media.calls().await.is_empty());
+        assert_eq!(sr.call_count().await, 1);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn motion_pulse_in_failed_state_does_not_leave_a_stale_cap() {
+        // First attach fails (backoff 1 s); a pulse during Failed must not
+        // prime `live_since`, or the next session would trip the 2 s cap
+        // right after attaching.
+        let cfg = camera_cfg(60, 2);
+        let sr = StubSignaler::with_responses(vec![
+            Err(DomainError::AdapterTransport("boom".to_string())),
+            Ok(ok_answer()),
+        ]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await; // → Failed
+        send(&tx, motion()).await; // pulse while Failed
+        tokio::time::advance(Duration::from_secs(3)).await; // backoff elapsed → Idle
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        media.calls().await;
+
+        send(&tx, motion()).await; // attaches
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let calls = media.calls().await;
+        assert!(calls.iter().any(|c| matches!(c, MediaCall::AttachLive(_))));
+        assert!(
+            !calls.contains(&MediaCall::DetachLive),
+            "stale live_since would have tripped the cap immediately"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_reports_trigger_while_live_and_omits_it_when_idle() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (tx, rx) = mpsc::channel(32);
+        let (admin_tx, admin_rx) = mpsc::channel(4);
+        let token = CancellationToken::new();
+        let orch = CameraOrchestrator::new(
+            &cfg,
+            sr,
+            Arc::new(StubThumbnails),
+            media,
+            Arc::new(NoopRecorder),
+            rx,
+            admin_rx,
+            token.clone(),
+        )
+        .unwrap();
+        let handle = tokio::spawn(orch.run());
+
+        let snap = |admin_tx: mpsc::Sender<crate::admin::AdminCommand>| async move {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            admin_tx
+                .send(crate::admin::AdminCommand::Snapshot { reply })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(snap(admin_tx.clone()).await.trigger, None);
+
+        send(&tx, manual()).await;
+        let live = snap(admin_tx.clone()).await;
+        assert_eq!(live.state, "live");
+        assert_eq!(live.trigger.as_deref(), Some("manual"));
+
+        send(&tx, manual_ended()).await;
+        assert_eq!(snap(admin_tx).await.trigger, None);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn signal_label_covers_manual_signals() {
+        assert_eq!(
+            signal_label(&StateTransition::ManualStreamDetected),
+            "manual-stream-detected"
+        );
+        assert_eq!(
+            signal_label(&StateTransition::ManualStreamEnded),
+            "manual-stream-ended"
         );
     }
 
