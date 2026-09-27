@@ -42,7 +42,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake build-essential libssl-dev libclang-dev nasm golang-go \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -61,7 +62,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake build-essential libssl-dev libclang-dev nasm golang-go \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -88,7 +90,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake build-essential libssl-dev libclang-dev nasm golang-go \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.98.1
@@ -109,7 +112,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake build-essential libssl-dev libclang-dev nasm golang-go \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.98.1

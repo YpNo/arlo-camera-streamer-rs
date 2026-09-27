@@ -11,18 +11,21 @@ FROM rust:1.98-slim-bookworm AS builder
 
 # System packages required to build the gstreamer-rs crates against
 # system GStreamer, plus what arlo-rs's transport needs: `wreq` links
-# BoringSSL (`boring-sys2`), whose build.rs runs cmake and bindgen
-# (libclang) and assembles with nasm. Pinned via debian's own version
-# selection — apt is deterministic per snapshot.
+# BoringSSL (`btls-sys`), whose build.rs runs `git init` in its source
+# tree, then cmake and bindgen (libclang), and assembles with nasm.
+# Pinned via debian's own version selection — apt is deterministic per
+# snapshot.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
+        git \
         cmake \
         libclang-dev \
         nasm \
         libssl-dev \
         libgstreamer1.0-dev \
         libgstreamer-plugins-base1.0-dev \
+        libgstreamer-plugins-bad1.0-dev \
         libgstrtspserver-1.0-dev \
         libglib2.0-dev \
     && rm -rf /var/lib/apt/lists/*
