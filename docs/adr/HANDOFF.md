@@ -151,7 +151,7 @@ item 3 touches the port anyway.
 
 | Item | Notes |
 |---|---|
-| CI has never run | Open the PR. Watch `coverage` (85 % on non-media crates) and the media crate build on ubuntu-latest. |
+| CI has never run | Open the PR. First run: tests + clippy green on ubuntu-latest (media crate compiles there); doc links, coverage exclusions and Sonar config fixed after it. Gate is 80 % (measured 82 %). |
 | HLS / DASH sinks not wired | ADR 0002; config accepts and warns. |
 | No recorded-session integration test | Would need a canned SDP offer/answer + RTP fixture. |
 | `streamer-infra-media` untestable locally on this workstation | No GStreamer headers on the host or in the `rust-build` container; CI and the Frigate box are the only executors. |

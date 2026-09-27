@@ -21,19 +21,20 @@
 //!
 //! Lifecycle (per camera):
 //!
-//! 1. [`Self::register`] installs the factory at `/<stream_name>` with
+//! 1. [`register`](PipelineRegistry::register) installs the factory at `/<stream_name>` with
 //!    a `media-configure` hook. `suspend-mode=None` is set so the
 //!    pipeline stays running across client disconnects.
 //! 2. On first client connect, gst-rtsp-server constructs the media
 //!    and our hook captures handles to `appsrc name=live_rtp_src`,
 //!    `input-selector name=sel` (sink pads), and the downstream
 //!    encoder `x264enc name=video_enc`.
-//! 3. [`Self::attach_live_sink`] hands back a [`LiveRtpSink`] — its
+//! 3. [`attach_live_sink`](PipelineRegistry::attach_live_sink) hands back a
+//!    [`LiveSinks`] pair — each
 //!    receiver is drained by a tokio pump that calls
 //!    `appsrc.push_buffer(...)`. A pad probe on `sel.sink_1` waits
 //!    for the first decoded raw buffer, flips `active-pad = sink_1`,
 //!    and force-key-units the encoder. The probe self-removes.
-//! 4. [`Self::detach_live_sink`] flips `active-pad = sink_0`
+//! 4. [`detach_live_sink`](PipelineRegistry::detach_live_sink) flips `active-pad = sink_0`
 //!    synchronously, force-key-units the encoder, and aborts the
 //!    live pump.
 //!
@@ -46,7 +47,7 @@
 //!
 //! ## Thumbnail handling (Phase 5)
 //!
-//! [`Self::refresh_thumbnail`] persists the JPEG to a stable per-camera
+//! [`refresh_thumbnail`](PipelineRegistry::refresh_thumbnail) persists the JPEG to a stable per-camera
 //! file and points the synthetic idle branch's `gdkpixbufoverlay`
 //! (`idle_overlay`) at it, so the STANDBY screen shows the camera's
 //! last snapshot instead of a black frame. The overlay is an inline

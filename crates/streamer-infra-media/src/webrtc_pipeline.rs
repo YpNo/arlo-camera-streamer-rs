@@ -23,7 +23,7 @@
 //! pipeline (video → decode → I420 splice; audio → decode → mix onto
 //! silence). Teardown of the Arlo signaling session is the
 //! orchestrator's job (`WebrtcSignaler::teardown`, paired with detach);
-//! [`WebrtcLive::shutdown`] only tears down the local webrtcbin pipeline.
+//! `WebrtcLive::shutdown` only tears down the local webrtcbin pipeline.
 //!
 //! ## Live-loss detection (ADR 0004)
 //!
@@ -616,7 +616,7 @@ fn install_connection_watch(webrtcbin: &gst::Element, notifier: LiveLossNotifier
 /// Stall watchdog: declares the source lost once no video RTP has
 /// arrived for `timeout`. Sleeps exactly until the earliest instant the
 /// verdict could change, so a healthy 30 fps source costs one wake-up
-/// per `timeout`. Aborted by [`WebrtcLive::shutdown`].
+/// per `timeout`. Aborted by `WebrtcLive::shutdown`.
 fn spawn_stall_watchdog(
     activity: Arc<RtpActivity>,
     timeout: Duration,

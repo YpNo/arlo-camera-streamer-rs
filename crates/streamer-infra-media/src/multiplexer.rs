@@ -45,7 +45,7 @@ use crate::webrtc_pipeline::WebrtcLive;
 /// - Building the per-camera persistent pipeline + RTSP mount in
 ///   `register` (the Phase-6 [`crate::pipeline_desc::combined_launch_string`]:
 ///   idle + appsrc-live + input-selector + single payloader).
-/// - Returning a [`LiveRtpSink`] from `attach_live_sink` and wiring the
+/// - Returning a [`LiveSinks`] pair from `attach_live_sink` and wiring the
 ///   IDR-aligned `input-selector` swap to live (see
 ///   [`crate::splice::KeyframeWatcher`]).
 /// - Returning the camera to idle on `detach_live_sink` — also

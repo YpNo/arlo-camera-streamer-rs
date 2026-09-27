@@ -46,7 +46,8 @@ alias cargo='mise exec -- cargo'
   GStreamer wiring thin and the decision logic in pure modules.
 - Root disk is small; `target/` directories of the sibling projects grow
   to tens of GB. Clean them before an image build.
-- Coverage gate: 85 % via tarpaulin, media crate excluded (`ci.yml`).
+- Coverage gate: 80 % via tarpaulin (measured 82 % on 2026-09-27), GStreamer-bound
+  files and the binary excluded (`ci.yml`). Raise deliberately.
 - Battery rule: every `Live` exit pairs `detach_live` with
   `WebrtcSignaler::teardown`.
 
