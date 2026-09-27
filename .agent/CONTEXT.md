@@ -46,7 +46,7 @@ alias cargo='mise exec -- cargo'
   container). The host still has none. Pipeline behaviour needs a camera.
 - Root disk is small; `target/` directories of the sibling projects grow
   to tens of GB. Clean them before an image build.
-- Coverage gate: 80 % via tarpaulin (measured 82 % on 2026-09-27), GStreamer-bound
+- Coverage gate: 84 % via tarpaulin (measured 84.13 % on 2026-09-27), GStreamer-bound
   files and the binary excluded (`ci.yml`). Raise deliberately.
 - Battery rule: every `Live` exit pairs `detach_live` with
   `WebrtcSignaler::teardown`.

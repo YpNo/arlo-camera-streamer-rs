@@ -138,9 +138,9 @@ jobs:
         #   the `build_arlo_rs_config` and `utf8_path` helpers) IS unit-tested
         #   inline; the wrappers belong to integration tests against a real
         #   Arlo account.
-        # Threshold: 80 — measured 82 % on the non-GStreamer crates on
-        # 2026-09-27 (first CI run). Raise deliberately once the media
-        # crate's pure modules are counted; never set above what is held.
+        # Threshold: 84 — measured 84.13 % on 2026-09-27 (second CI run, media
+        # crate's pure modules counted). Raise deliberately; never set above
+        # what is held.
         run: |
           cargo tarpaulin --workspace --all-features --timeout 180 --out xml \
             --exclude arlo-camera-streamer \
@@ -152,7 +152,7 @@ jobs:
             --exclude-files 'crates/streamer-infra-arlo/src/events.rs' \
             --exclude-files 'crates/streamer-infra-arlo/src/stream_requester.rs' \
             --exclude-files 'crates/streamer-infra-arlo/src/thumbnails.rs' \
-            --fail-under 80
+            --fail-under 84
       - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           fail_ci_if_error: false

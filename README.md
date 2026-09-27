@@ -290,7 +290,7 @@ GStreamer; CI runs them on Linux runners with the plugin set installed.
 
 GitHub Actions workflows live in [`.github/workflows/`](./.github/workflows/).
 The `ci.yml` pipeline runs lint → typecheck → test → coverage gate
-(>80 %, measured 82 % on 2026-09-27; raised deliberately, never above what is held) → security scan on every PR.
+(>84 %, the measured number on 2026-09-27; raised deliberately, never above what is held) → security scan on every PR.
 
 ## Security
 
