@@ -18,9 +18,14 @@ On this workstation every cargo command runs inside the `rust-build`
 distrobox (BoringSSL under `wreq` needs libclang there):
 
 ```bash
+# one-shot form (mise exec selects the pinned toolchain inside the container)
+distrobox enter rust-build -- bash -lc 'cd ~/workspace/arlo-camera-streamer/arlo-camera-streamer-rs && LIBCLANG_PATH=/usr/lib/llvm-19/lib mise exec -- cargo test -p streamer-domain -p streamer-app -p streamer-infra-arlo -p streamer-infra-ops --all-features'
+
+# interactive form
 distrobox enter rust-build
 export LIBCLANG_PATH=/usr/lib/llvm-19/lib
 P="-p streamer-domain -p streamer-app -p streamer-infra-arlo -p streamer-infra-ops"
+alias cargo='mise exec -- cargo'
 ```
 
 | Purpose | Command |
@@ -32,6 +37,7 @@ P="-p streamer-domain -p streamer-app -p streamer-infra-arlo -p streamer-infra-o
 | docs | `RUSTDOCFLAGS="-D warnings" cargo doc $P --no-deps --all-features` |
 | security | `cargo audit && cargo deny check` (host is fine) |
 | image | `podman build -t arlo-camera-streamer:local .` (needs ~10 GB free) |
+| release binary (Linux box with GStreamer dev headers) | `cargo build --release --locked --package arlo-camera-streamer` → `target/release/arlo-camera-streamer` |
 
 ## Runtime constraints
 - `streamer-infra-media` and `streamer-bin` **do not build here**: neither
