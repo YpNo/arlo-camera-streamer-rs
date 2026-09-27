@@ -48,7 +48,7 @@ to see the contracts. The ADRs document the load-bearing decisions:
 
 ## Prerequisites
 
-- **Rust** ≥ 1.95 (`rustup toolchain install 1.95.0`).
+- **Rust** ≥ 1.98.1 (`rustup toolchain install 1.98.1`; the MSRV follows arlo-rs).
 - **GStreamer 1.22+** with the plugin set below.
   - `gstreamer1.0-plugins-base`
   - `gstreamer1.0-plugins-good` (also provides `gdkpixbufoverlay` for the idle thumbnail)

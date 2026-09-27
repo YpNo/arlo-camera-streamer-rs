@@ -7,7 +7,7 @@
 - **Domain**: Media Streaming & Home Automation
 - **Primary adapters (inbound)**: RTSP Server, Metrics/Health API
 - **Driven adapters (outbound)**: `arlo-rs` client, GStreamer Pipelines
-- **MSRV**: 1.95.0
+- **MSRV**: 1.98.1 (follows arlo-rs 0.2.0)
 - **Async runtime**: tokio
 
 ---
@@ -52,14 +52,12 @@
 
 ```bash
 
-# Run all tests (stable 1.95.0)
+# Run all tests (stable 1.98.1)
 cargo test --workspace --all-features
 
 # Run coverage (requires cargo-tarpaulin)
 cargo tarpaulin --all-features --workspace --timeout 120 --out xml
 
-# Update UI test expectations (after toolchain changes)
-TRYBUILD=overwrite cargo test -p imap-client --test type_state_tests
 
 # Run Lint checks
 cargo clippy --workspace -- -D warnings

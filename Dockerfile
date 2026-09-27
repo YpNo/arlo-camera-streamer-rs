@@ -7,14 +7,19 @@
 # stage exactly (debian:bookworm-slim ships GStreamer 1.22). The build
 # stage carries the dev headers; runtime carries only the .so files.
 # ----------------------------------------------------------------------
-FROM rust:1.95-slim-bookworm AS builder
+FROM rust:1.98-slim-bookworm AS builder
 
 # System packages required to build the gstreamer-rs crates against
-# system GStreamer. Pinned via debian's own version selection — apt is
-# deterministic per snapshot.
+# system GStreamer, plus what arlo-rs's transport needs: `wreq` links
+# BoringSSL (`boring-sys2`), whose build.rs runs cmake and bindgen
+# (libclang) and assembles with nasm. Pinned via debian's own version
+# selection — apt is deterministic per snapshot.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
+        cmake \
+        libclang-dev \
+        nasm \
         libssl-dev \
         libgstreamer1.0-dev \
         libgstreamer-plugins-base1.0-dev \
@@ -66,6 +71,7 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         tini \
+        wget \
         gstreamer1.0-plugins-base \
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad \
@@ -99,7 +105,8 @@ USER streamer
 # - 9091/tcp  /admin (bearer-token-auth required)
 EXPOSE 8554/tcp 9090/tcp 9091/tcp
 
-# Healthcheck talks to the public liveness endpoint with a 5s budget.
+# Healthcheck talks to the public liveness endpoint with a 5s budget
+# (`wget` is installed above: bookworm-slim ships neither wget nor curl).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["sh", "-c", "wget -qO- http://127.0.0.1:9090/healthz | grep -q ok || exit 1"]
 

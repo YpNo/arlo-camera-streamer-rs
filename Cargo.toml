@@ -12,7 +12,7 @@ members  = [
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.95.0"
+rust-version = "1.98.1"
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/YpNo/arlo-camera-streamer-rs"
 
@@ -34,8 +34,11 @@ streamer-infra-arlo  = { path = "crates/streamer-infra-arlo" }
 streamer-infra-media = { path = "crates/streamer-infra-media" }
 streamer-infra-ops   = { path = "crates/streamer-infra-ops" }
 
-# ---- Sibling project (arlo-rs client) ----
-arlo-rs = { path = "../arlo-rs" }
+# ---- Arlo client (published sibling project) ----
+# Pinned to the crates.io release so CI, Docker and a fresh clone resolve it
+# without a sibling checkout. To build against a local ../arlo-rs, uncomment
+# the `[patch.crates-io]` block at the end of this file (never commit it on).
+arlo-rs = "0.2.0"
 
 # ---- Async runtime ----
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs"] }
@@ -81,3 +84,8 @@ gstreamer-sdp         = "0.25"
 mockall    = "0.14"
 rstest     = "0.26"
 tokio-test = "0.4"
+
+# Local development against an unreleased ../arlo-rs. Keep commented in git:
+# a path override here would break every build that lacks the sibling tree.
+# [patch.crates-io]
+# arlo-rs = { path = "../arlo-rs" }
