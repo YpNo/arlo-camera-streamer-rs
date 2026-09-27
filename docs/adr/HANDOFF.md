@@ -154,7 +154,8 @@ item 3 touches the port anyway.
 | CI has never run | Open the PR. First run: tests + clippy green on ubuntu-latest (media crate compiles there); doc links, coverage exclusions and Sonar config fixed after it. Gate is 80 % (measured 82 %). |
 | HLS / DASH sinks not wired | ADR 0002; config accepts and warns. |
 | No recorded-session integration test | Would need a canned SDP offer/answer + RTP fixture. |
-| `streamer-infra-media` untestable locally on this workstation | No GStreamer headers on the host or in the `rust-build` container; CI and the Frigate box are the only executors. |
+| Live session started with no RTSP client connected | `attach_live_sink` finds no media wiring, spawns discard pumps and warns "deferred wiring not implemented"; when a client connects later the media is rebuilt but the running session keeps discarding, so the camera streams for nothing until the session ends. Harmless with Frigate (always connected), visible with ad-hoc VLC. Fix: re-arm the pumps from the `media-configure` hook when a session is active. |
+| Media unprepared when the last client leaves | gst-rtsp-server tears the media down ~10 s after the last client disconnects (seen live 2026-09-27); the next attach then hits the gap above. Same fix. |
 | Dependency currency | All within one minor of latest on 2026-09-27; `mockall` 0.15 / `rstest` 0.27 are the only minor bumps pending (dev-deps). |
 
 ---
@@ -169,7 +170,9 @@ Verified in production; do not rediscover:
 - **Never `bus.add_watch_local()` inside `media-configure`** ("no default
   main context"). Use `bus.set_sync_handler` for diagnostics.
 - **You cannot fully validate `gst-rtsp-server` prepare on macOS.** Pipeline
-  changes are blind until Linux CI or the Frigate box runs them.
+  changes need Linux: since 2026-09-27 the `rust-build` distrobox has GStreamer
+  1.26 dev packages, so the media crate builds and unit-tests locally; the
+  pipeline itself still needs a camera.
 - **`gupnp … 1900: Address already in use` at live start is harmless.**
 - **VAAPI needs `/dev/dri`** in Docker (`--device /dev/dri`).
 - **Arlo's TCP TURN is unusable**; the signaler adapter drops it and keeps
@@ -212,7 +215,9 @@ export RUST_LOG=info,arlo_camera_streamer=debug
 ```
 
 Runtime deps: GStreamer 1.22+ with base/good/bad/ugly/libav/rtsp/nice
-(optional vaapi). No browser.
+(optional vaapi). No browser. Live-validated 2026-09-27 on GStreamer 1.26
+(Debian trixie): motion → live → cooldown, and the ADR 0004 stall path
+(`live-lost-rtp-stalled` 4 s after the last packet).
 
 ---
 

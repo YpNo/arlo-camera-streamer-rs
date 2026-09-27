@@ -5,7 +5,10 @@
 //!
 //! 1. **Build** the client via [`ArloClient::builder`], pointing at
 //!    the configured `session_cache_path`. arlo-rs auto-loads any
-//!    existing token snapshot on disk.
+//!    existing token snapshot on disk. The cache's parent directory is
+//!    created first (owner-only): arlo-rs writes the file with a
+//!    temp-file + rename inside that directory and never creates it,
+//!    so a missing directory silently costs an OTP on every restart.
 //! 2. **Resolve secrets** from the env vars named in
 //!    `ArloConfig::password_env` and `EmailMfaConfig::password_env`.
 //!    Missing env vars are surfaced as [`DomainError::InvalidConfig`].
@@ -58,6 +61,7 @@ struct ResolvedSecrets {
 ///   IMAP unreachable).
 pub async fn boot(config: &ArloConfig) -> Result<Arc<ArloClient>, DomainError> {
     let session_cache_path = utf8_path(&config.session_cache_path)?;
+    ensure_cache_dir(&config.session_cache_path).await?;
 
     let mut client = ArloClient::builder()
         .headless(true)
@@ -103,6 +107,49 @@ pub async fn boot(config: &ArloConfig) -> Result<Arc<ArloClient>, DomainError> {
 
     info!("arlo-rs authentication complete");
     Ok(Arc::new(client))
+}
+
+/// Create the session cache's parent directory when it is missing, with
+/// owner-only permissions (the file inside carries the Arlo token and
+/// cookie jar). An existing directory is left untouched, whatever its
+/// mode — it may be a shared system path the deployer manages.
+///
+/// # Errors
+///
+/// [`DomainError::InvalidConfig`] when the directory cannot be created
+/// (permissions, a file in the way): the daemon would otherwise run but
+/// re-ask the second factor on every restart, which is a configuration
+/// problem worth failing on at boot.
+async fn ensure_cache_dir(cache_path: &Path) -> Result<(), DomainError> {
+    let Some(parent) = cache_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    if let Ok(meta) = tokio::fs::metadata(parent).await {
+        if meta.is_dir() {
+            return Ok(());
+        }
+        return Err(DomainError::InvalidConfig(format!(
+            "session_cache_path directory {} exists but is not a directory",
+            parent.display()
+        )));
+    }
+    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+        DomainError::InvalidConfig(format!(
+            "session_cache_path directory {} cannot be created: {e}",
+            parent.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) =
+            tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await
+        {
+            warn!(path = %parent.display(), error = %e, "could not restrict session cache directory to owner-only");
+        }
+    }
+    info!(path = %parent.display(), "created session cache directory");
+    Ok(())
 }
 
 fn utf8_path(p: &Path) -> Result<String, DomainError> {
@@ -389,5 +436,67 @@ mod tests {
             client.session_cache_path.as_deref(),
             Some("/etc/arlo-streamer/session.json")
         );
+    }
+
+    // ---------- session cache directory ----------
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("streamer-boot-{tag}-{}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn ensure_cache_dir_creates_missing_nested_parent_owner_only() {
+        let root = scratch_dir("nested");
+        let cache = root.join("deeper").join("session.json");
+        ensure_cache_dir(&cache).await.expect("directory created");
+        let meta = std::fs::metadata(cache.parent().unwrap()).expect("exists");
+        assert!(meta.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn ensure_cache_dir_leaves_existing_directory_and_mode_alone() {
+        let root = scratch_dir("existing");
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        ensure_cache_dir(&root.join("session.json"))
+            .await
+            .expect("existing directory is fine");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "an existing directory must keep its mode");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn ensure_cache_dir_fails_when_a_file_blocks_the_directory() {
+        let root = scratch_dir("blocked");
+        std::fs::create_dir_all(&root).unwrap();
+        let blocker = root.join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let err = ensure_cache_dir(&blocker.join("session.json"))
+            .await
+            .expect_err("a file in the way must fail");
+        assert!(matches!(err, DomainError::InvalidConfig(_)));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn ensure_cache_dir_accepts_bare_filename() {
+        ensure_cache_dir(Path::new("session.json"))
+            .await
+            .expect("no parent means nothing to create");
     }
 }

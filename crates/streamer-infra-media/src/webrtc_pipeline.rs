@@ -77,6 +77,10 @@ const OPUS_PT: i32 = 111;
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(3);
 /// Max wait from `set-remote-description` to the first inbound RTP.
 const FIRST_RTP_TIMEOUT_SECS: u64 = 20;
+/// Name of the application message [`WebrtcLive::shutdown`] posts so the
+/// bus-watch thread returns instead of blocking on a bus that will never
+/// carry another message.
+const BUS_WATCH_STOP: &str = "streamer-bus-watch-stop";
 
 /// A running per-camera `webrtcbin` live session. Drop or
 /// [`shutdown`](Self::shutdown) tears down the local pipeline (the
@@ -95,6 +99,15 @@ impl WebrtcLive {
     pub(crate) fn shutdown(&mut self) {
         for t in self.tasks.drain(..) {
             t.abort();
+        }
+        // Release the bus-watch thread *before* the bus goes flushing on
+        // READY → NULL (a flushing bus drops posts, and a thread blocked
+        // in `timed_pop` would otherwise outlive the session).
+        if let Some(bus) = self.pipeline.bus() {
+            let stop = gst::message::Application::new(gst::Structure::new_empty(BUS_WATCH_STOP));
+            if let Err(e) = bus.post(stop) {
+                debug!(error = %e, "bus-watch stop message not posted");
+            }
         }
         if let Err(e) = self.pipeline.set_state(gst::State::Null) {
             debug!(error = %e, "webrtcbin pipeline → Null failed (ignored)");
@@ -561,8 +574,8 @@ fn spawn_keyframe_pump(
 }
 
 /// Drain the pipeline bus; surface ERROR/EOS in the log and to the
-/// live-loss notifier. The thread ends when the bus flushes on
-/// `set_state(Null)` (`auto-flush-bus`) or at EOS.
+/// live-loss notifier. The thread ends at EOS or on the
+/// [`BUS_WATCH_STOP`] application message that `shutdown` posts.
 fn spawn_bus_watch(pipeline: &gst::Pipeline, notifier: LiveLossNotifier) {
     let Some(bus) = pipeline.bus() else { return };
     std::thread::spawn(move || {
@@ -580,6 +593,11 @@ fn spawn_bus_watch(pipeline: &gst::Pipeline, notifier: LiveLossNotifier) {
                 V::Eos(_) => {
                     debug!("webrtcbin pipeline EOS");
                     report_loss(&notifier, LiveLossReason::EndOfStream);
+                    break;
+                }
+                V::Application(app)
+                    if app.structure().is_some_and(|s| s.name() == BUS_WATCH_STOP) =>
+                {
                     break;
                 }
                 _ => {}

@@ -263,7 +263,15 @@ impl CameraOrchestrator {
                     debug!("admin snapshot reply dropped");
                 }
             }
+            // Mutating commands are acknowledged *before* they are
+            // applied: the HTTP layer answers 202 Accepted, and a wake
+            // spends several seconds in WebRTC negotiation — longer
+            // than the admin reply timeout, which would report a
+            // perfectly healthy wake as "orchestrator unavailable".
             AdminCommand::ForceIdle { reply } => {
+                if reply.send(()).is_err() {
+                    debug!("admin force-idle reply dropped");
+                }
                 if matches!(
                     self.state,
                     CameraState::Live { .. }
@@ -275,18 +283,15 @@ impl CameraOrchestrator {
                         warn!(error = %e, "force-idle failed");
                     }
                 }
-                if reply.send(()).is_err() {
-                    debug!("admin force-idle reply dropped");
-                }
             }
             AdminCommand::ManualWake { reply } => {
+                if reply.send(()).is_err() {
+                    debug!("admin manual-wake reply dropped");
+                }
                 let signal = self.intercept_budget(StateTransition::MotionDetected);
                 self.debouncer.on_motion(Instant::now());
                 if let Err(e) = self.process_signals(VecDeque::from([signal])).await {
                     warn!(error = %e, "manual-wake failed");
-                }
-                if reply.send(()).is_err() {
-                    debug!("admin manual-wake reply dropped");
                 }
             }
         }

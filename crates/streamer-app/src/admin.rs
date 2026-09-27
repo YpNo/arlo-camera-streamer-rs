@@ -10,10 +10,14 @@
 //!
 //! ## Reply protocol
 //!
-//! Each command carries a [`tokio::sync::oneshot::Sender`] that the
-//! orchestrator fulfils after applying the change. The actor wraps
-//! the wait in a per-call timeout so a stuck orchestrator surfaces as
-//! [`AdminError::Unavailable`] rather than blocking the HTTP handler.
+//! Each command carries a [`tokio::sync::oneshot::Sender`]. `Snapshot`
+//! is fulfilled with the data; the mutating commands (`ForceIdle`,
+//! `ManualWake`) are acknowledged as soon as the orchestrator dequeues
+//! them and are applied right after — a wake spends seconds in WebRTC
+//! negotiation, and the HTTP contract is 202 Accepted, not "done". The
+//! actor wraps the wait in a per-call timeout so a stuck orchestrator
+//! surfaces as [`AdminError::Unavailable`] rather than blocking the
+//! HTTP handler.
 //!
 //! ## Why an mpsc actor instead of `Arc<RwLock<…>>`?
 //!

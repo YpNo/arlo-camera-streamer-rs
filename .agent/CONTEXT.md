@@ -24,7 +24,7 @@ distrobox enter rust-build -- bash -lc 'cd ~/workspace/arlo-camera-streamer/arlo
 # interactive form
 distrobox enter rust-build
 export LIBCLANG_PATH=/usr/lib/llvm-19/lib
-P="-p streamer-domain -p streamer-app -p streamer-infra-arlo -p streamer-infra-ops"
+P="--workspace"   # the four-crate subset is no longer needed
 alias cargo='mise exec -- cargo'
 ```
 
@@ -40,10 +40,10 @@ alias cargo='mise exec -- cargo'
 | release binary (Linux box with GStreamer dev headers) | `cargo build --release --locked --package arlo-camera-streamer` → `target/release/arlo-camera-streamer` |
 
 ## Runtime constraints
-- `streamer-infra-media` and `streamer-bin` **do not build here**: neither
-  the host nor the container has GStreamer dev headers. CI
-  (`ubuntu-latest`) and the Frigate box are the only executors. Keep
-  GStreamer wiring thin and the decision logic in pure modules.
+- Since 2026-09-27 the `rust-build` container has the GStreamer 1.26 dev
+  and runtime packages (Debian trixie), so the **whole workspace builds and
+  tests there** (`cargo test --workspace --all-features` inside the
+  container). The host still has none. Pipeline behaviour needs a camera.
 - Root disk is small; `target/` directories of the sibling projects grow
   to tens of GB. Clean them before an image build.
 - Coverage gate: 80 % via tarpaulin (measured 82 % on 2026-09-27), GStreamer-bound
