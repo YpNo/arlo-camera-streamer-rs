@@ -177,3 +177,15 @@ Tests:    Owner run, 69f679c: 12 pulses 20:59:59 → 21:02:12, each `camera trig
           300 s cap. Each pulse cycle also brings SnapshotAvailable and an
           `activityState: idle` report (logged "camera idle report without a
           known user view"): harmless while no user view is tracked.
+
+## 2026-09-28 — backlog: legacy builders, dev-deps, one negotiate call, HLS
+Changed:  Phase-4 builders deleted; PT constants shared. mockall 0.15 / rstest 0.27.
+          WebrtcSignaler::negotiate(camera, &mut dyn OfferBuilder) replaces
+          ice_servers + negotiate (no SipInfo cache; crate::ice tested);
+          MediaError::Signaling keeps CameraBusy. Found + fixed: a failed attach
+          never released the registry's live sinks → every later attach refused
+          ("already in live mode"). HLS via loopback RTSP segmenter (hls.rs,
+          ADR 0006); DASH unsupported (stock dashsink: TS only, no pruning).
+Tests:    Integration suite 6/6 (refused attach then attach; HLS live segment
+          luma > 180, retention, cleanup), stable ×3 (~28 s).
+Open:     HLS not yet run on the Frigate box.

@@ -43,6 +43,9 @@ pub struct RtspServer {
     /// Held so the main-loop thread isn't dropped while the server is alive.
     loop_thread: Mutex<Option<JoinHandle<()>>>,
     main_loop: glib::MainLoop,
+    /// Host the server was bound to (brackets stripped), for
+    /// [`loopback_url`](Self::loopback_url).
+    host: String,
 }
 
 impl RtspServer {
@@ -88,6 +91,7 @@ impl RtspServer {
             mounts,
             loop_thread: Mutex::new(Some(join)),
             main_loop,
+            host,
         }))
     }
 
@@ -164,6 +168,18 @@ impl RtspServer {
         u16::try_from(self.server.bound_port()).ok()
     }
 
+    /// URL this process reaches `mount_path` at: the bound port on the
+    /// loopback address when the server listens on every interface.
+    /// `None` before the socket is bound.
+    #[must_use]
+    pub fn loopback_url(&self, mount_path: &str) -> Option<String> {
+        let port = self.bound_port()?;
+        Some(format!(
+            "rtsp://{}:{port}{mount_path}",
+            loopback_host(&self.host)
+        ))
+    }
+
     /// Stop the main loop. Called during graceful shutdown.
     pub fn stop(&self) {
         if self.main_loop.is_running() {
@@ -190,6 +206,17 @@ impl Drop for RtspServer {
 }
 
 /// Split `host:port` into typed parts. Accepts IPv4 and bracketed-IPv6.
+/// The host to dial for a server bound to `host`: wildcards map to the
+/// loopback address of their family, IPv6 literals get brackets.
+fn loopback_host(host: &str) -> String {
+    match host {
+        "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" => "[::1]".to_string(),
+        h if h.contains(':') => format!("[{h}]"),
+        h => h.to_string(),
+    }
+}
+
 fn parse_bind(bind: &str) -> Result<(String, String), MediaError> {
     // Walk from the right so IPv6 colons don't confuse us.
     let (host, port) = bind
@@ -218,6 +245,15 @@ fn parse_bind(bind: &str) -> Result<(String, String), MediaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_host_maps_wildcards_and_brackets_ipv6() {
+        assert_eq!(loopback_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(loopback_host("::"), "[::1]");
+        assert_eq!(loopback_host("fd00::5"), "[fd00::5]");
+        assert_eq!(loopback_host("192.168.1.10"), "192.168.1.10");
+        assert_eq!(loopback_host("localhost"), "localhost");
+    }
 
     #[test]
     fn parse_bind_ipv4() {

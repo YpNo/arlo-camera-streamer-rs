@@ -50,6 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   battery-protect, failed) each new snapshot refreshes it at once; at the
   end of a session the refresh uses the cached snapshot and saves a cloud
   round-trip.
+- HLS output (ADR 0006): with `[output.hls]` set, each camera's RTSP
+  output is repackaged without re-encoding into
+  `<dir>/<stream_name>/index.m3u8` and segments by a loopback segmenter.
+  Retention is bounded (`playlist_length` + 2 segments on disk), the
+  directory is cleared of stale files at start and stop, and the
+  segmenter restarts with backoff. `[output.dash]` is still parsed but
+  ignored with a warning that explains why.
 - GStreamer integration tests (`streamer-infra-media/tests/live_session.rs`):
   real live sessions through the production media stack against a local
   `webrtcbin` gateway and an RTSP client, covering the idle → live → idle

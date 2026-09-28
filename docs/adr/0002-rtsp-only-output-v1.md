@@ -1,10 +1,11 @@
 # ADR 0002 — RTSP-only output for v1
 
-- **Status:** Accepted
+- **Status:** Superseded by 0006 (HLS)
 - **Date:** 2026-05-09
 - **Deciders:** Senior architect, project owner
 - **Supersedes:** —
-- **Superseded by:** —
+- **Superseded by:** 0006 for HLS (DASH remains out, for the reasons
+  recorded there)
 
 ## Context
 

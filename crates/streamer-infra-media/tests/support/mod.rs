@@ -9,7 +9,7 @@ use gstreamer as gst;
 
 use streamer_domain::camera::{CameraId, StreamName};
 use streamer_domain::config::{
-    CameraConfig, CooldownConfig, OutputConfig, RtspOutput, VideoEncoder, WebrtcConfig,
+    CameraConfig, CooldownConfig, HlsOutput, OutputConfig, RtspOutput, VideoEncoder, WebrtcConfig,
 };
 use streamer_infra_media::{GstMediaMultiplexer, GstPipelineRegistry, RtspServer};
 
@@ -70,6 +70,15 @@ pub struct Stack {
 
 impl Stack {
     pub fn new(webrtc: WebrtcConfig) -> Self {
+        Self::with_outputs(webrtc, None)
+    }
+
+    /// The stack with HLS written under `hls.dir`.
+    pub fn with_hls(webrtc: WebrtcConfig, hls: HlsOutput) -> Self {
+        Self::with_outputs(webrtc, Some(hls))
+    }
+
+    fn with_outputs(webrtc: WebrtcConfig, hls: Option<HlsOutput>) -> Self {
         let server = RtspServer::start("127.0.0.1:0").expect("rtsp server");
         let registry = Arc::new(GstPipelineRegistry::new(server.clone(), VideoEncoder::X264));
         let camera = CameraId::new(CAMERA);
@@ -83,7 +92,7 @@ impl Stack {
             rtsp: RtspOutput {
                 bind: "127.0.0.1:0".to_string(),
             },
-            hls: None,
+            hls,
             dash: None,
             video_encoder: VideoEncoder::X264,
             metrics_bind: "127.0.0.1:0".to_string(),
@@ -102,6 +111,38 @@ impl Stack {
         let port = self.server.bound_port().expect("rtsp server bound");
         format!("rtsp://127.0.0.1:{port}/{STREAM}")
     }
+}
+
+/// Mean brightness (0–255) of the last video frame of an MPEG-TS
+/// segment, or `None` when it holds no decodable frame.
+pub fn segment_mean_luma(path: &std::path::Path) -> Option<u64> {
+    use gstreamer::prelude::*;
+    let launch = format!(
+        "filesrc location=\"{}\" ! tsdemux ! h264parse ! avdec_h264 ! videoconvert \
+         ! video/x-raw,format=GRAY8 ! appsink name=frames sync=false",
+        path.display()
+    );
+    let pipeline = gst::parse::launch(&launch)
+        .ok()?
+        .downcast::<gst::Pipeline>()
+        .ok()?;
+    let sink = pipeline
+        .by_name("frames")?
+        .downcast::<gstreamer_app::AppSink>()
+        .ok()?;
+    pipeline.set_state(gst::State::Playing).ok()?;
+    let mut last = None;
+    while let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_seconds(5)) {
+        let buffer = sample.buffer()?;
+        let map = buffer.map_readable().ok()?;
+        let frame = map.as_slice();
+        if !frame.is_empty() {
+            let sum: u64 = frame.iter().map(|&b| u64::from(b)).sum();
+            last = Some(sum / frame.len() as u64);
+        }
+    }
+    let _ = pipeline.set_state(gst::State::Null);
+    last
 }
 
 /// The WebRTC settings with the stall timeout at its floor, so the stall

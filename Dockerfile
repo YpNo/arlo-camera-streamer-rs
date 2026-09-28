@@ -96,8 +96,8 @@ RUN chmod +x /usr/local/bin/arlo-camera-streamer
 # Default mount points (overridable at runtime):
 # - /etc/arlo-streamer/streamer.toml — config (read-only)
 # - /var/lib/arlo-streamer            — session cache + thumbnails
-# - /var/lib/arlo-streamer/hls,/dash  — segment output (when enabled)
-RUN mkdir -p /etc/arlo-streamer /var/lib/arlo-streamer/hls /var/lib/arlo-streamer/dash \
+# - /var/lib/arlo-streamer/hls         — HLS output (when [output.hls] is set)
+RUN mkdir -p /etc/arlo-streamer /var/lib/arlo-streamer/hls \
  && chown -R streamer:streamer /var/lib/arlo-streamer
 
 USER streamer

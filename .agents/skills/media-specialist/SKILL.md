@@ -72,6 +72,18 @@ Arlo-specific behaviour with the `live-validation` skill.
 - Pin each branch's final caps in one capsfilter; keep launch strings as pure builders
   in `pipeline_desc.rs` with their constants beside them.
 
+## HLS output (ADR 0006)
+
+- `hls.rs`: a per-camera segmenter that is an **RTSP client of the camera's own mount**
+  (`RtspServer::loopback_url`) → `rtph264depay ! h264parse` / `rtpmp4adepay ! aacparse`
+  → `hlssink2`. Never tap the RTSP media for HLS: it exists only while a client is
+  connected. Never re-encode.
+- Retention is `max-files = playlist_length + HLS_SEGMENTS_BEYOND_PLAYLIST`; the directory
+  is prepared (created, stale files cleared) before the mount is installed, and cleared
+  again when the segmenter thread stops. Drop never joins the thread.
+- DASH: stock `dashsink` writes only MPEG-TS and never prunes; fMP4 needs gst-plugins-rs.
+  Do not "just wire it".
+
 ## Media lifecycle vs live session
 
 gst-rtsp-server builds the media on the first client and unprepares it after the last,

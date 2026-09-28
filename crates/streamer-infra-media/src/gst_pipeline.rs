@@ -86,11 +86,13 @@ use streamer_domain::camera::CameraId;
 use streamer_domain::config::VideoEncoder;
 
 use crate::error::MediaError;
+use crate::hls::{HlsSegmenter, prepare_dir};
 use crate::idle_source::{IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH};
 use crate::live_rtp_sink::{LiveSinkReceivers, LiveSinks};
 use crate::multiplexer::PipelineRegistry;
 use crate::pipeline_desc::{
-    IDLE_OVERLAY_NAME, OutputBranches, UNIFIED_ENCODER_NAME, combined_launch_string,
+    HlsBranchConfig, IDLE_OVERLAY_NAME, OutputBranches, UNIFIED_ENCODER_NAME,
+    combined_launch_string,
 };
 use crate::rtsp::RtspServer;
 
@@ -154,6 +156,9 @@ struct CameraEntry {
     live_active: Arc<AtomicBool>,
     /// Active live ingestion if any.
     session: Option<LiveSession>,
+    /// HLS segmenter when `[output.hls]` is set (ADR 0006). Held for its
+    /// lifetime: dropping it stops the segmenter.
+    _hls: Option<HlsSegmenter>,
 }
 
 /// The wiring of the media currently serving this camera's clients, or
@@ -186,6 +191,26 @@ impl GstPipelineRegistry {
             video_encoder,
             state: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Check that HLS can run for a camera about to be registered: the
+    /// RTSP port is known and the per-stream directory is usable (created,
+    /// stale files cleared). Runs before the mount is installed, so a
+    /// failure leaves nothing behind. Returns the segmenter's source URL.
+    async fn prepare_hls(
+        &self,
+        mount_path: &str,
+        hls: &HlsBranchConfig,
+    ) -> Result<String, MediaError> {
+        let url = self
+            .server
+            .loopback_url(mount_path)
+            .ok_or_else(|| MediaError::Rtsp("RTSP server not bound; HLS needs its port".into()))?;
+        let prepared = hls.clone();
+        tokio::task::spawn_blocking(move || prepare_dir(&prepared))
+            .await
+            .map_err(|e| MediaError::Pipeline(format!("HLS dir preparation task: {e}")))??;
+        Ok(url)
     }
 
     fn refresh_overlay_timestamp(idle: &IdleKind) -> IdleKind {
@@ -237,6 +262,11 @@ impl PipelineRegistry for GstPipelineRegistry {
         let launch = combined_launch_string(&idle, self.video_encoder);
         debug!(camera = %camera, launch_string = %launch, "combined launch string");
 
+        let hls_url = match &outputs.hls {
+            Some(hls) => Some(self.prepare_hls(&outputs.rtsp_mount_path, hls).await?),
+            None => None,
+        };
+
         let wiring: WiringSlot = Arc::new(StdMutex::new(None));
         let live_active = Arc::new(AtomicBool::new(false));
         let wiring_for_cb = wiring.clone();
@@ -281,11 +311,17 @@ impl PipelineRegistry for GstPipelineRegistry {
         )?;
         info!(mount = %outputs.rtsp_mount_path, idle = idle.kind_label(), "camera registered");
 
-        if outputs.hls.is_some() || outputs.dash.is_some() {
-            // Phase 5 hookup — HLS/DASH sinks need a separate top-level
-            // pipeline (not the RTSP factory) because gst-rtsp-server
-            // owns its own pipeline graph.
-            warn!("HLS/DASH outputs configured but not yet wired (Phase 5)");
+        let hls = match (outputs.hls, hls_url) {
+            (Some(hls), Some(url)) => Some(HlsSegmenter::start(camera.clone(), url, hls)?),
+            _ => None,
+        };
+        if outputs.dash.is_some() {
+            warn!(
+                camera = %camera,
+                "DASH output is not supported and is ignored: without gst-plugins-rs, \
+                 GStreamer's dashsink writes only MPEG-TS fragments that browser players \
+                 reject, and never deletes them (ADR 0006); use [output.hls]"
+            );
         }
 
         self.state.write().await.insert(
@@ -297,6 +333,7 @@ impl PipelineRegistry for GstPipelineRegistry {
                 wiring,
                 live_active,
                 session: None,
+                _hls: hls,
             },
         );
         Ok(())

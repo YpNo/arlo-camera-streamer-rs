@@ -114,6 +114,8 @@ pub struct OutputBranches {
 /// Resolved HLS sink parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HlsBranchConfig {
+    /// Per-stream directory holding the playlist and its segments.
+    pub dir: String,
     /// Path to `index.m3u8`.
     pub playlist_location: String,
     /// `printf`-style segment filename pattern.
@@ -122,7 +124,20 @@ pub struct HlsBranchConfig {
     pub target_duration: u32,
     /// Number of segments in the playlist window.
     pub playlist_length: u32,
+    /// Segments kept on disk: the playlist window plus
+    /// [`HLS_SEGMENTS_BEYOND_PLAYLIST`], so a player still downloading
+    /// the oldest listed segment never gets a 404.
+    pub max_files: u32,
 }
+
+/// Segments `hlssink2` keeps beyond the playlist window.
+pub const HLS_SEGMENTS_BEYOND_PLAYLIST: u32 = 2;
+/// Playlist file name inside [`HlsBranchConfig::dir`].
+pub const HLS_PLAYLIST_FILE: &str = "index.m3u8";
+/// Segment file name prefix and suffix inside [`HlsBranchConfig::dir`].
+pub const HLS_SEGMENT_PREFIX: &str = "segment-";
+/// See [`HLS_SEGMENT_PREFIX`].
+pub const HLS_SEGMENT_SUFFIX: &str = ".ts";
 
 /// Resolved DASH sink parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,12 +167,38 @@ pub fn build_output_branches(name: &StreamName, output: &OutputConfig) -> Output
 
 fn build_hls_branch(name: &StreamName, hls: &HlsOutput) -> HlsBranchConfig {
     let dir = format_dir(&hls.dir, name);
+    let playlist_length = hls.effective_playlist_length();
     HlsBranchConfig {
-        playlist_location: format!("{dir}/index.m3u8"),
-        segment_location: format!("{dir}/segment-%05d.ts"),
-        target_duration: hls.segment_secs,
-        playlist_length: hls.playlist_length,
+        playlist_location: format!("{dir}/{HLS_PLAYLIST_FILE}"),
+        segment_location: format!("{dir}/{HLS_SEGMENT_PREFIX}%05d{HLS_SEGMENT_SUFFIX}"),
+        target_duration: hls.effective_segment_secs(),
+        playlist_length,
+        max_files: playlist_length + HLS_SEGMENTS_BEYOND_PLAYLIST,
+        dir,
     }
+}
+
+/// Launch string of the HLS segmenter: an RTSP client of the camera's
+/// own mount (`url`, on loopback) that repackages its H.264 + AAC into
+/// `hlssink2` segments without re-encoding. Reading the RTSP output
+/// keeps one splice for every output (ADR 0006); `hlssink2` cuts at the
+/// encoder's keyframes (every `UNIFIED_GOP` frames) and deletes
+/// segments beyond [`HlsBranchConfig::max_files`].
+#[must_use]
+pub fn hls_segmenter_launch(url: &str, hls: &HlsBranchConfig) -> String {
+    format!(
+        "rtspsrc name=src location=\"{url}\" protocols=tcp latency=0 \
+         src. ! rtph264depay ! h264parse ! queue ! hls.video \
+         src. ! rtpmp4adepay ! aacparse ! queue ! hls.audio \
+         hlssink2 name=hls location=\"{segments}\" playlist-location=\"{playlist}\" \
+                  target-duration={target} playlist-length={length} max-files={max}",
+        url = escape_gst_text(url),
+        segments = escape_gst_text(&hls.segment_location),
+        playlist = escape_gst_text(&hls.playlist_location),
+        target = hls.target_duration,
+        length = hls.playlist_length,
+        max = hls.max_files,
+    )
 }
 
 fn build_dash_branch(name: &StreamName, dash: &DashOutput) -> DashBranchConfig {
@@ -385,10 +426,50 @@ mod tests {
     fn build_output_branches_with_hls_uses_per_stream_dir() {
         let b = build_output_branches(&name(), &output(true, false));
         let hls = b.hls.expect("hls present");
+        assert_eq!(hls.dir, "/var/hls/front_door");
         assert_eq!(hls.playlist_location, "/var/hls/front_door/index.m3u8");
         assert_eq!(hls.segment_location, "/var/hls/front_door/segment-%05d.ts");
         assert_eq!(hls.target_duration, 4);
         assert_eq!(hls.playlist_length, 6);
+        assert_eq!(hls.max_files, 6 + HLS_SEGMENTS_BEYOND_PLAYLIST);
+    }
+
+    #[test]
+    fn build_output_branches_with_hls_raises_values_below_the_floor() {
+        let mut out = output(true, false);
+        if let Some(h) = out.hls.as_mut() {
+            h.segment_secs = 0;
+            h.playlist_length = 1;
+        }
+        let hls = build_output_branches(&name(), &out)
+            .hls
+            .expect("hls present");
+        assert_eq!((hls.target_duration, hls.playlist_length), (1, 3));
+    }
+
+    #[test]
+    fn hls_segmenter_launch_repackages_the_rtsp_mount_without_reencoding() {
+        let hls = build_output_branches(&name(), &output(true, false))
+            .hls
+            .expect("hls present");
+        let desc = hls_segmenter_launch("rtsp://127.0.0.1:8554/front_door", &hls);
+        assert!(desc.contains(r#"rtspsrc name=src location="rtsp://127.0.0.1:8554/front_door""#));
+        assert!(desc.contains("rtph264depay ! h264parse"));
+        assert!(desc.contains("rtpmp4adepay ! aacparse"));
+        assert!(desc.contains(r#"playlist-location="/var/hls/front_door/index.m3u8""#));
+        assert!(desc.contains("target-duration=4 playlist-length=6 max-files=8"));
+        for codec in [
+            "x264enc",
+            "vaapih264enc",
+            "avenc_aac",
+            "avdec_h264",
+            "opusdec",
+        ] {
+            assert!(
+                !desc.contains(codec),
+                "the segmenter must not transcode ({codec}): {desc}"
+            );
+        }
     }
 
     #[test]

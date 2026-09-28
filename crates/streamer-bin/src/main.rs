@@ -79,7 +79,7 @@ mod list_devices;
 #[command(
     name = "arlo-camera-streamer",
     version,
-    about = "Bridges Arlo battery cameras to Frigate NVR via RTSP / HLS / DASH."
+    about = "Bridges Arlo battery cameras to Frigate NVR via RTSP (and optional HLS)."
 )]
 struct Cli {
     /// Path to the TOML configuration file.

@@ -84,17 +84,18 @@ admin_bind   = "127.0.0.1:9091"
 [output.rtsp]
 bind = "0.0.0.0:8554"
 
-# Optional secondary outputs. Accepted by the parser but NOT wired in v1
-# (see docs/adr/0002-rtsp-only-output-v1.md); the daemon logs a warning.
+# Optional HLS output (docs/adr/0006-hls-output-via-loopback-segmenter.md):
+# <dir>/<stream_name>/index.m3u8 plus segments, repackaged from the RTSP
+# output without re-encoding. Serve the directory with any web server.
+# Enabling it keeps each camera's encoder running.
 #
 # [output.hls]
-# dir             = "/var/cache/arlo-streamer/hls"
-# segment_secs    = 2
-# playlist_length = 10
+# dir             = "/var/lib/arlo-streamer/hls"
+# segment_secs    = 2      # floor 1; segments cut at keyframes (every 2 s)
+# playlist_length = 10     # floor 3; two more segments are kept on disk
 #
-# [output.dash]
-# dir          = "/var/cache/arlo-streamer/dash"
-# segment_secs = 2
+# [output.dash] is parsed but not supported (see ADR 0006); the daemon
+# warns and ignores it.
 
 # ---------------------------------------------------------------------------
 # Cameras — one [[cameras]] block per Arlo device you want to expose.

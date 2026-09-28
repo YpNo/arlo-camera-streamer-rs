@@ -22,11 +22,12 @@ mod support;
 
 use std::time::Duration;
 
-use streamer_domain::config::WebrtcConfig;
+use streamer_domain::config::{HlsOutput, WebrtcConfig};
 use streamer_domain::error::DomainError;
 use streamer_domain::port::{MediaMultiplexer, WebrtcSignaler};
 use streamer_domain::state::LiveLossReason;
 
+use streamer_infra_media::pipeline_desc::HLS_SEGMENTS_BEYOND_PLAYLIST;
 use support::gateway::FakeGateway;
 use support::probe::{RtspProbe, eventually};
 use support::{Stack, fast_stall, gstreamer_ready};
@@ -212,4 +213,84 @@ async fn live_session_refused_attach_keeps_camera_busy_and_frees_the_next_attach
         .detach_live(&stack.camera)
         .await
         .expect("detach_live");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hls_output_segments_the_splice_bounds_disk_and_cleans_up() {
+    let _serial = SERIAL.lock().await;
+    if !gstreamer_ready() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("streamer-it-hls-{}", std::process::id()));
+    let dir = root.join(support::STREAM);
+    let hls = HlsOutput {
+        dir: root.clone(),
+        segment_secs: 1,
+        playlist_length: 3,
+    };
+    let max_files = 3 + HLS_SEGMENTS_BEYOND_PLAYLIST;
+    let stack = Stack::with_hls(WebrtcConfig::default(), hls);
+    stack.media.register(&stack.camera).await.expect("register");
+
+    let playlist = dir.join("index.m3u8");
+    assert!(
+        eventually(PICTURE_TIMEOUT, || playlist.exists()
+            && segments(&dir).len() >= 2)
+        .await,
+        "no HLS playlist and segments in {}",
+        dir.display()
+    );
+
+    let gateway = FakeGateway::default();
+    let _session = stack
+        .media
+        .attach_live(&stack.camera, &gateway)
+        .await
+        .expect("attach_live");
+    let live_segment = || {
+        segments(&dir)
+            .into_iter()
+            .rev()
+            .nth(1) // the newest one may still be written
+            .and_then(|s| support::segment_mean_luma(&s))
+            .is_some_and(|luma| luma > LIVE_MIN_LUMA)
+    };
+    assert!(
+        eventually(PICTURE_TIMEOUT, live_segment).await,
+        "the live picture never reached an HLS segment"
+    );
+    assert!(
+        segments(&dir).len() <= max_files as usize + 1,
+        "hlssink2 kept {} segments, expected at most {max_files}",
+        segments(&dir).len()
+    );
+
+    stack
+        .media
+        .detach_live(&stack.camera)
+        .await
+        .expect("detach_live");
+    drop(stack);
+    assert!(
+        eventually(PICTURE_TIMEOUT, || !playlist.exists()
+            && segments(&dir).is_empty())
+        .await,
+        "the playlist and segments must be removed when the segmenter stops"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Segment files in `dir`, oldest first (names are zero-padded).
+fn segments(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<_> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "ts"))
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    found
 }

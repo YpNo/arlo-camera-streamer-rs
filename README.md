@@ -44,9 +44,10 @@ Read [`crates/streamer-domain/src/port.rs`](./crates/streamer-domain/src/port.rs
 to see the contracts. The ADRs document the load-bearing decisions:
 
 - [docs/adr/0001-factory-restart-splice.md](./docs/adr/0001-factory-restart-splice.md) — *superseded by 0003*
-- [docs/adr/0002-rtsp-only-output-v1.md](./docs/adr/0002-rtsp-only-output-v1.md)
+- [docs/adr/0002-rtsp-only-output-v1.md](./docs/adr/0002-rtsp-only-output-v1.md) — *superseded by 0006 for HLS*
 - [docs/adr/0003-seamless-input-selector-splice.md](./docs/adr/0003-seamless-input-selector-splice.md)
 - [ADR 0004 — Live-loss feedback](./docs/adr/0004-live-lost-feedback.md): a dead live source returns the camera to idle within the stall timeout instead of the debounce or the continuous-live cap.
+- [ADR 0006 — HLS output](./docs/adr/0006-hls-output-via-loopback-segmenter.md): HLS is written by a loopback RTSP client of each camera, without re-encoding; DASH is not supported.
 
 ## Prerequisites
 
@@ -132,6 +133,10 @@ holding the values.
 | `output.rtsp.bind`                  | `host:port`    | `0.0.0.0:8554`       | Embedded RTSP server.                                    |
 | `output.metrics_bind`               | `host:port`    | `127.0.0.1:9090`     | Prometheus + healthchecks.                               |
 | `output.admin_bind`                 | `host:port`    | `127.0.0.1:9091`     | `/admin/*` write API.                                    |
+| `output.hls.dir`                    | path           | (off)                | Enables HLS: `<dir>/<stream_name>/index.m3u8` + segments (ADR 0006). Serve it with any web server. Keeps each camera's encoder running. |
+| `output.hls.segment_secs`           | u32            | `2` (floor 1)        | Target segment length; segments cut at keyframes (every 2 s). |
+| `output.hls.playlist_length`        | u32            | `10` (floor 3)       | Segments in the playlist; two more are kept on disk.      |
+| `output.dash`                       | table          | (ignored)            | Parsed for compatibility, not supported: see ADR 0006.    |
 | `[[cameras]]`                       | array          | `[]`                 | One block per camera — see example.                      |
 | `cameras.codec_hint`                | `h264`/`h265`  | (auto)               | Skip first-stream codec detection.                       |
 | `cameras.cooldown.debounce_secs`    | u64            | `60`                 | Hold-live debounce after last motion.                    |

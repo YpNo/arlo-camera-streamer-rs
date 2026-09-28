@@ -46,6 +46,7 @@
 pub mod codec_cache;
 pub mod error;
 pub mod gst_pipeline;
+mod hls;
 pub mod idle_source;
 pub mod live_rtp_sink;
 pub mod live_watch;

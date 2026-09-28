@@ -238,6 +238,26 @@ pub struct HlsOutput {
     pub playlist_length: u32,
 }
 
+/// Shortest HLS segment accepted; `0` would disable splitting.
+pub const MIN_HLS_SEGMENT_SECS: u32 = 1;
+/// Shortest HLS playlist accepted: RFC 8216 §6.3.3 wants a client to
+/// find at least three segments.
+pub const MIN_HLS_PLAYLIST_LENGTH: u32 = 3;
+
+impl HlsOutput {
+    /// Target segment duration, raised to [`MIN_HLS_SEGMENT_SECS`].
+    #[must_use]
+    pub fn effective_segment_secs(&self) -> u32 {
+        self.segment_secs.max(MIN_HLS_SEGMENT_SECS)
+    }
+
+    /// Playlist window, raised to [`MIN_HLS_PLAYLIST_LENGTH`].
+    #[must_use]
+    pub fn effective_playlist_length(&self) -> u32 {
+        self.playlist_length.max(MIN_HLS_PLAYLIST_LENGTH)
+    }
+}
+
 /// DASH sink configuration. Files are written to `dir/<stream_name>/…`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DashOutput {
@@ -576,6 +596,26 @@ mod tests {
         let w: W = toml::from_str("[webrtc]\nlive_stall_timeout_secs = 30").unwrap();
         assert_eq!(w.webrtc.live_stall_timeout(), Duration::from_secs(30));
         assert_eq!(w.webrtc.ice_address_family, IceAddressFamily::Dual);
+    }
+
+    #[test]
+    fn hls_output_values_below_floor_are_raised_and_others_kept() {
+        let low = HlsOutput {
+            dir: PathBuf::from("/tmp/hls"),
+            segment_secs: 0,
+            playlist_length: 1,
+        };
+        assert_eq!(low.effective_segment_secs(), MIN_HLS_SEGMENT_SECS);
+        assert_eq!(low.effective_playlist_length(), MIN_HLS_PLAYLIST_LENGTH);
+        let ok = HlsOutput {
+            dir: PathBuf::from("/tmp/hls"),
+            segment_secs: 4,
+            playlist_length: 6,
+        };
+        assert_eq!(
+            (ok.effective_segment_secs(), ok.effective_playlist_length()),
+            (4, 6)
+        );
     }
 
     #[test]
