@@ -161,3 +161,29 @@ What stays valid from this ADR: the two events, the trigger field, the
 free budget, the cap-only timers, the `idle`-first end signal and the
 echo guard. What changes: how the manual session's media is obtained.
 
+## Second capture, 2026-09-28 (`peek_stream_url` probe)
+
+1. **The `get` query on `/startStream` is not a passive read.** Polled on
+   idle cameras it handed out fresh web sessions (a new session id per
+   cycle) and every call was followed by the camera publishing its full
+   state, i.e. the request reaches the camera. It must never run on a
+   timer; arlo-rs's docs and probe were corrected accordingly.
+2. **During a user view it returns a watch-along URL.** After
+   `userStreamActive`, the query returned the user's own session id with
+   `watchalong=true` on every call (only the per-call `egressToken`
+   changes). This is Arlo's own mechanism for a second viewer.
+3. **The URL is MPEG-DASH, not RTSP**:
+   `https://weblivestream-<zone>.arlo.com:80/stream/<ip>/<camera>_<ts>.mpd?egressToken=…&watchalong=true`
+   — the query identifies as the web client. Note the `https` scheme on
+   port 80.
+4. A query made within milliseconds of the user's session being created
+   returned a fresh session instead of the watch-along; the next one
+   returned the watch-along.
+
+Direction for ADR 0006: on `ManualStream`, query once, accept only a
+`watchalong=true` URL (one retry after 2 s), and feed it to a second
+live-source kind in the media adapter (GStreamer DASH demux → H.264
+decode → the same raw-I420 splice). Open questions before the design:
+does GStreamer play the URL (TLS on port 80, token auth, segment
+latency), and what codec does the manifest declare.
+

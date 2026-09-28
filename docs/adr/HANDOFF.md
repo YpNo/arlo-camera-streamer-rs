@@ -120,11 +120,12 @@ Order agreed with the user; items 1–4 are done (4 pending its live capture), 5
    **captured 2026-09-27: event side confirmed, media side refuted** —
    Arlo refuses our WebRTC leg (error 14001 "RTSP Streaming in progress,
    SIP Streaming is not allowed") while the app streams over RTSP. Next:
-   ADR 0006, RTSP pick-up of the app's stream via `get_stream_url` +
-   an `rtspsrc` live-source kind in the media adapter. Run
-   `cargo run --example peek_stream_url` in `../arlo-rs` (branch
-   `feat/stream-peek-probe`) while streaming from the app to learn the
-   URL shape first. `CameraEvent::ManualStream` / `ManualStreamEnded`
+   ADR 0006. Second capture (2026-09-28): during a user view,
+   `get_stream_url` returns a **`watchalong=true` MPEG-DASH** URL
+   (`https://weblivestream-…:80/…/*.mpd`) joining the user's session;
+   on idle cameras the same call wakes them (never poll it). Next: a
+   playback test of the watch-along URL with `gst-discoverer-1.0`, then
+   ADR 0006 — a DASH live-source kind in the media adapter. `CameraEvent::ManualStream` / `ManualStreamEnded`
    from `activityState == "userStreamActive"` / `"idle"`; `LiveTrigger`
    field on the orchestrator; manual sessions: no debounce (debouncer
    `Held`), cap only, budget never charged, motion absorbed, activation
