@@ -43,6 +43,11 @@ pub enum MediaError {
     #[error("live source lost during setup: {}", .0.as_label())]
     LostDuringSetup(LiveLossReason),
 
+    /// The signaler failed the negotiation. Carried unchanged so the
+    /// orchestrator still sees, for instance, `CameraBusy` (Arlo 14001).
+    #[error("{0}")]
+    Signaling(DomainError),
+
     /// RTSP server (mount-point installation, port binding, etc.) failure.
     #[error("RTSP server error: {0}")]
     Rtsp(String),
@@ -56,6 +61,7 @@ impl From<MediaError> for DomainError {
     fn from(err: MediaError) -> Self {
         match err {
             MediaError::UnknownCamera(c) => Self::UnknownCamera(c),
+            MediaError::Signaling(e) => e,
             other => Self::AdapterTransport(other.to_string()),
         }
     }
@@ -104,6 +110,13 @@ mod tests {
             DomainError::AdapterTransport(msg) => assert!(msg.contains("peer-disconnected")),
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn signaling_error_maps_back_unchanged() {
+        let err = MediaError::Signaling(DomainError::CameraBusy("14001".to_string()));
+        let domain: DomainError = err.into();
+        assert!(matches!(domain, DomainError::CameraBusy(r) if r == "14001"));
     }
 
     #[test]

@@ -240,16 +240,10 @@ mod tests {
     struct StubSignaler;
     #[async_trait]
     impl WebrtcSignaler for StubSignaler {
-        async fn ice_servers(
-            &self,
-            _camera: &CameraId,
-        ) -> Result<Vec<streamer_domain::stream::IceServer>, DomainError> {
-            Ok(vec![])
-        }
         async fn negotiate(
             &self,
             _camera: &CameraId,
-            _offer_sdp: String,
+            _offer: &mut dyn streamer_domain::port::OfferBuilder,
         ) -> Result<SignalingAnswer, DomainError> {
             Ok(SignalingAnswer {
                 answer_sdp: "v=0\r\n".to_string(),

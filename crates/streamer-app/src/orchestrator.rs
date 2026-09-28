@@ -878,18 +878,13 @@ mod tests {
 
     #[async_trait]
     impl WebrtcSignaler for StubSignaler {
-        async fn ice_servers(
-            &self,
-            _camera: &CameraId,
-        ) -> Result<Vec<streamer_domain::stream::IceServer>, DomainError> {
-            Ok(vec![])
-        }
         async fn negotiate(
             &self,
             _camera: &CameraId,
-            _offer_sdp: String,
+            offer: &mut dyn streamer_domain::port::OfferBuilder,
         ) -> Result<SignalingAnswer, DomainError> {
             *self.calls.lock().await += 1;
+            offer.build_offer(&[]).await?;
             self.responses
                 .lock()
                 .await
@@ -899,6 +894,19 @@ mod tests {
         async fn teardown(&self, _camera: &CameraId) -> Result<(), DomainError> {
             *self.stops.lock().await += 1;
             Ok(())
+        }
+    }
+
+    /// The media half of a negotiation, for doubles that need no SDP.
+    struct StaticOffer;
+
+    #[async_trait]
+    impl streamer_domain::port::OfferBuilder for StaticOffer {
+        async fn build_offer(
+            &mut self,
+            _ice_servers: &[streamer_domain::stream::IceServer],
+        ) -> Result<String, DomainError> {
+            Ok("offer".to_string())
         }
     }
 
@@ -970,7 +978,7 @@ mod tests {
             // Mirror the real adapter: the media leg owns the WebRTC
             // offer/answer round-trip. Surfacing the negotiate error as
             // an attach failure is exactly the production contract.
-            let answer = signaler.negotiate(camera, "offer".to_string()).await?;
+            let answer = signaler.negotiate(camera, &mut StaticOffer).await?;
             self.events
                 .lock()
                 .await

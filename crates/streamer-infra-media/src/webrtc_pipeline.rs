@@ -50,6 +50,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -61,9 +62,10 @@ use tracing::{debug, info, warn};
 
 use streamer_domain::camera::CameraId;
 use streamer_domain::config::WebrtcConfig;
-use streamer_domain::port::WebrtcSignaler;
+use streamer_domain::error::DomainError;
+use streamer_domain::port::{OfferBuilder, WebrtcSignaler};
 use streamer_domain::state::LiveLossReason;
-use streamer_domain::stream::{IceAddressFamily, IceServer, LiveLossNotifier};
+use streamer_domain::stream::{IceAddressFamily, IceServer, LiveLossNotifier, SignalingAnswer};
 
 use crate::error::MediaError;
 use crate::live_rtp_sink::{LiveRtpSink, LiveSinks};
@@ -150,11 +152,12 @@ impl WebrtcLive {
     ///
     /// # Errors
     ///
-    /// [`MediaError::Pipeline`] on GStreamer/element failure, or
-    /// [`MediaError::SpliceTimeout`] if no RTP arrives in time.
+    /// [`MediaError::Pipeline`] on GStreamer/element failure,
+    /// [`MediaError::Signaling`] carrying the signaler's error unchanged
+    /// (`CameraBusy` included), or [`MediaError::SpliceTimeout`] if no
+    /// RTP arrives in time.
     pub(crate) async fn start(
         camera: &CameraId,
-        ice: &[IceServer],
         signaler: &dyn WebrtcSignaler,
         sinks: LiveSinks,
         cfg: &WebrtcConfig,
@@ -166,7 +169,6 @@ impl WebrtcLive {
         webrtcbin.set_property_from_str("bundle-policy", "none");
         webrtcbin.set_property("latency", 0u32);
         apply_ice_address_family(&webrtcbin, cfg.ice_address_family);
-        apply_ice(&webrtcbin, ice);
 
         let audio_caps = rtp_caps("audio", "OPUS", OPUS_PT, OPUS_CLOCK_RATE);
         let video_caps = rtp_caps("video", "H264", H264_PT, H264_CLOCK_RATE);
@@ -248,12 +250,22 @@ impl WebrtcLive {
         let (offer_tx, mut offer_rx) = mpsc::unbounded_channel::<String>();
         install_negotiation(&webrtcbin, offer_tx);
 
-        pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|e| MediaError::Pipeline(format!("pipeline → Playing: {e}")))?;
-        spawn_bus_watch(&pipeline, notifier.clone());
-
-        exchange_sdp(camera, signaler, &webrtcbin, &mut offer_rx).await?;
+        // The signaler fetches the call's ICE servers, then calls back
+        // into `OfferGathering`, which configures them and starts the
+        // pipeline so webrtcbin gathers the offer.
+        let mut gathering = OfferGathering {
+            camera,
+            pipeline: &pipeline,
+            webrtcbin: &webrtcbin,
+            offer_rx: &mut offer_rx,
+            notifier: &notifier,
+        };
+        let answer = signaler
+            .negotiate(camera, &mut gathering)
+            .await
+            .map_err(MediaError::Signaling)?;
+        apply_answer(&webrtcbin, &answer)?;
+        info!(%camera, session = %answer.session_id, "answer applied; awaiting first RTP");
 
         // Keyframe pump: periodic force-key-unit sent *upstream* into
         // the appsink sink pad (webrtcbin/rtpbin turns it into RTCP
@@ -292,25 +304,36 @@ impl Drop for WebrtcLive {
     }
 }
 
-/// Wait for the gathered local offer, carry it to Arlo through
-/// `signaler`, and apply the answer to `webrtcbin`.
-async fn exchange_sdp(
-    camera: &CameraId,
-    signaler: &dyn WebrtcSignaler,
-    webrtcbin: &gst::Element,
-    offer_rx: &mut mpsc::UnboundedReceiver<String>,
-) -> Result<(), MediaError> {
-    let offer_sdp = tokio::time::timeout(OFFER_TIMEOUT, offer_rx.recv())
-        .await
-        .map_err(|_| MediaError::Pipeline("timed out gathering local offer".into()))?
-        .ok_or_else(|| MediaError::Pipeline("offer channel closed".into()))?;
-    info!(%camera, bytes = offer_sdp.len(), "webrtcbin offer ready; negotiating with Arlo");
+/// The media side of [`WebrtcSignaler::negotiate`]: configures the
+/// call's ICE servers, starts the pipeline and returns webrtcbin's
+/// gathered (non-trickle) offer.
+struct OfferGathering<'a> {
+    camera: &'a CameraId,
+    pipeline: &'a gst::Pipeline,
+    webrtcbin: &'a gst::Element,
+    offer_rx: &'a mut mpsc::UnboundedReceiver<String>,
+    notifier: &'a LiveLossNotifier,
+}
 
-    let answer = signaler
-        .negotiate(camera, offer_sdp)
-        .await
-        .map_err(|e| MediaError::Pipeline(format!("signaling negotiate: {e}")))?;
+#[async_trait]
+impl OfferBuilder for OfferGathering<'_> {
+    async fn build_offer(&mut self, ice_servers: &[IceServer]) -> Result<String, DomainError> {
+        apply_ice(self.webrtcbin, ice_servers);
+        self.pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| MediaError::Pipeline(format!("pipeline → Playing: {e}")))?;
+        spawn_bus_watch(self.pipeline, self.notifier.clone());
+        let offer_sdp = tokio::time::timeout(OFFER_TIMEOUT, self.offer_rx.recv())
+            .await
+            .map_err(|_| MediaError::Pipeline("timed out gathering local offer".into()))?
+            .ok_or_else(|| MediaError::Pipeline("offer channel closed".into()))?;
+        info!(camera = %self.camera, bytes = offer_sdp.len(), "webrtcbin offer ready; negotiating with Arlo");
+        Ok(offer_sdp)
+    }
+}
 
+/// Apply the gateway's answer verbatim to `webrtcbin`.
+fn apply_answer(webrtcbin: &gst::Element, answer: &SignalingAnswer) -> Result<(), MediaError> {
     let msg = gst_sdp::SDPMessage::parse_buffer(answer.answer_sdp.as_bytes())
         .map_err(|e| MediaError::Pipeline(format!("parse answer SDP: {e}")))?;
     let answer_desc =
@@ -319,7 +342,6 @@ async fn exchange_sdp(
         "set-remote-description",
         &[&answer_desc, &gst::Promise::new()],
     );
-    info!(%camera, session = %answer.session_id, "answer applied; awaiting first RTP");
     Ok(())
 }
 

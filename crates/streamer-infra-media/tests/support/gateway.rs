@@ -9,7 +9,8 @@
 //! The video leg passes through a `valve`; [`FakeGateway::stall_video`]
 //! closes it to simulate a camera that stops sending while the call
 //! stays up. [`FakeGateway::hanging_up`] builds one that answers and
-//! then drops the call, so our ICE checks fail during setup.
+//! then drops the call, so our ICE checks fail during setup;
+//! [`FakeGateway::busy`] refuses the call with `CameraBusy`.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -23,8 +24,8 @@ use tokio::sync::oneshot;
 
 use streamer_domain::camera::CameraId;
 use streamer_domain::error::DomainError;
-use streamer_domain::port::WebrtcSignaler;
-use streamer_domain::stream::{IceServer, SignalingAnswer};
+use streamer_domain::port::{OfferBuilder, WebrtcSignaler};
+use streamer_domain::stream::SignalingAnswer;
 
 /// Upper bound for each signaling step (promise reply, ICE gathering).
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -62,6 +63,7 @@ pub struct FakeGateway {
     call: Mutex<Option<Call>>,
     negotiations: Mutex<u32>,
     hang_up_after_answer: bool,
+    busy: bool,
 }
 
 impl FakeGateway {
@@ -69,6 +71,15 @@ impl FakeGateway {
     pub fn hanging_up() -> Self {
         Self {
             hang_up_after_answer: true,
+            ..Self::default()
+        }
+    }
+
+    /// A gateway that refuses the call as Arlo does while the user
+    /// streams the camera in the app (error 14001).
+    pub fn busy() -> Self {
+        Self {
+            busy: true,
             ..Self::default()
         }
     }
@@ -88,15 +99,18 @@ impl FakeGateway {
 
 #[async_trait]
 impl WebrtcSignaler for FakeGateway {
-    async fn ice_servers(&self, _camera: &CameraId) -> Result<Vec<IceServer>, DomainError> {
-        Ok(Vec::new())
-    }
-
     async fn negotiate(
         &self,
         _camera: &CameraId,
-        offer_sdp: String,
+        offer: &mut dyn OfferBuilder,
     ) -> Result<SignalingAnswer, DomainError> {
+        if self.busy {
+            return Err(DomainError::CameraBusy(
+                "RTSP Streaming in progress".to_string(),
+            ));
+        }
+        // Host candidates only: no STUN or TURN to hand over.
+        let offer_sdp = offer.build_offer(&[]).await?;
         let (call, answer_sdp) = answer(&offer_sdp)
             .await
             .map_err(DomainError::AdapterTransport)?;

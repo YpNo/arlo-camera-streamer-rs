@@ -68,9 +68,14 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
 
 ## Attach flow and its failures
 
-`media.attach_live(camera, signaler)` owns the whole attach: the multiplexer calls
-`signaler.ice_servers`, gets live sinks from the registry, and races `WebrtcLive::start`
-against the session's loss signal. The orchestrator only maps the outcome:
+`media.attach_live(camera, signaler)` owns the whole attach: the multiplexer gets live
+sinks from the registry and races `WebrtcLive::start` against the session's loss signal.
+`start` makes **one** `signaler.negotiate(camera, &mut OfferBuilder)` call: the signaler
+fetches `sipInfo` (14001 → `CameraBusy`), calls back `build_offer(&ice_servers)` so
+webrtcbin gathers the offer with them, then carries it to Arlo. No coordinates are cached
+between calls. Any failure releases the live sinks (`detach_live_sink`), or the next
+attach would be refused with "already in live mode". The orchestrator only maps the
+outcome:
 
 - `Ok(session)` → `LiveAttached`, store the handle.
 - `Err(CameraBusy)` → `CameraBusy`, mark the camera as viewed.

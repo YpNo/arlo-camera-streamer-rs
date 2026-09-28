@@ -3,17 +3,18 @@
 //!
 //! v3 Arlo live is a WebRTC call brokered by a `FreeSWITCH` gateway. The
 //! media adapter (GStreamer `webrtcbin`, in `streamer-infra-media`)
-//! owns the peer connection and **generates the SDP offer**. This
-//! adapter carries that offer to Arlo:
+//! owns the peer connection and **generates the SDP offer**. One
+//! [`negotiate`](WebrtcSignaler::negotiate) call:
 //!
-//! 1. [`ice_servers`](WebrtcSignaler::ice_servers) — `sip_info` (REST)
-//!    for the per-call SIP/ICE coordinates. The [`SipInfo`] is cached
-//!    per camera so the immediately-following `negotiate` reuses it.
-//! 2. [`negotiate`](WebrtcSignaler::negotiate) — `webrtc_negotiate`
-//!    (`POST /hmswebsocketproxy/initiateOffer` over the signaling WS)
-//!    → the gateway's SDP answer.
+//! 1. `sip_info` (REST) for the call's SIP/ICE coordinates — Arlo error
+//!    14001 here means the user is streaming the camera in the app;
+//! 2. the media adapter's [`OfferBuilder`] builds the offer with the
+//!    usable ICE servers ([`crate::ice`]);
+//! 3. `webrtc_negotiate` (`POST /hmswebsocketproxy/initiateOffer` over
+//!    the signaling WS) with the same coordinates → the gateway's answer.
 //!
-//! The open [`SignalingSocket`] is **owned here** per camera until
+//! The coordinates live only for that call. The open [`SignalingSocket`]
+//! is **owned here** per camera until
 //! [`teardown`](WebrtcSignaler::teardown), which sends
 //! `sessionDisconnected` so a camera is never left streaming (battery).
 
@@ -22,27 +23,24 @@ use std::sync::Arc;
 
 use arlo_rs::client::ArloClient;
 use arlo_rs::client::livestream::SignalingSocket;
-use arlo_rs::models::sip::SipInfo;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::debug;
 
 use streamer_domain::camera::CameraId;
 use streamer_domain::error::DomainError;
-use streamer_domain::port::WebrtcSignaler;
-use streamer_domain::stream::{IceServer, SignalingAnswer};
+use streamer_domain::port::{OfferBuilder, WebrtcSignaler};
+use streamer_domain::stream::SignalingAnswer;
 
 use crate::device_registry::DeviceRegistry;
 use crate::error::arlo_to_domain;
+use crate::ice::usable_ice_servers;
 
 /// Adapter exposing arlo-rs's WebRTC signaling as the domain
 /// [`WebrtcSignaler`] port, owning the per-camera signaling socket.
 pub struct ArloWebrtcSignalerAdapter {
     client: Arc<ArloClient>,
     devices: Arc<DeviceRegistry>,
-    /// `SipInfo` from the most recent `ice_servers` call, reused by the
-    /// matching `negotiate` (avoids a second `sipInfo` round-trip).
-    sip_cache: Mutex<HashMap<String, SipInfo>>,
     /// Open signaling WS per camera id. `disconnect()` sends
     /// `sessionDisconnected` and closes the socket.
     sessions: Mutex<HashMap<String, SignalingSocket>>,
@@ -56,7 +54,6 @@ impl ArloWebrtcSignalerAdapter {
         Self {
             client,
             devices,
-            sip_cache: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -70,65 +67,26 @@ impl ArloWebrtcSignalerAdapter {
             s.disconnect().await;
         }
     }
+}
 
-    /// Fetch `sipInfo` for `camera` and cache it for the matching
-    /// `negotiate`.
-    async fn fetch_and_cache_sip(&self, camera: &CameraId) -> Result<SipInfo, DomainError> {
+#[async_trait]
+impl WebrtcSignaler for ArloWebrtcSignalerAdapter {
+    async fn negotiate(
+        &self,
+        camera: &CameraId,
+        offer: &mut dyn OfferBuilder,
+    ) -> Result<SignalingAnswer, DomainError> {
+        // Idempotent: drop any stale session for this camera first.
+        self.take_and_disconnect(camera.as_str()).await;
         let device = self.devices.resolve(camera).await?;
         let sip = self
             .client
             .sip_info(&device)
             .await
             .map_err(arlo_to_domain)?;
-        self.sip_cache
-            .lock()
-            .await
-            .insert(camera.as_str().to_string(), sip.clone());
-        Ok(sip)
-    }
-}
-
-#[async_trait]
-impl WebrtcSignaler for ArloWebrtcSignalerAdapter {
-    async fn ice_servers(&self, camera: &CameraId) -> Result<Vec<IceServer>, DomainError> {
-        let sip = self.fetch_and_cache_sip(camera).await?;
-        // webrtc-ice/libnice + Arlo only ever use the UDP TURN; the
-        // `transport=tcp` TURN is unusable (proven live) — drop it.
-        let servers = sip
-            .ice_servers
-            .data
-            .iter()
-            .filter(|s| {
-                !(s.kind.eq_ignore_ascii_case("turn") && s.transport.as_deref() == Some("tcp"))
-            })
-            .map(|s| {
-                let is_turn = s.kind.eq_ignore_ascii_case("turn");
-                IceServer {
-                    url: s.url(),
-                    username: if is_turn { s.username.clone() } else { None },
-                    credential: if is_turn { s.credential.clone() } else { None },
-                }
-            })
-            .collect();
-        Ok(servers)
-    }
-
-    async fn negotiate(
-        &self,
-        camera: &CameraId,
-        offer_sdp: String,
-    ) -> Result<SignalingAnswer, DomainError> {
-        // Idempotent: drop any stale session for this camera first.
-        self.take_and_disconnect(camera.as_str()).await;
-
-        // Reuse the `SipInfo` cached by the preceding `ice_servers`
-        // call; re-fetch if the caller skipped it (order-independent).
-        let cached = self.sip_cache.lock().await.remove(camera.as_str());
-        let sip = match cached {
-            Some(s) => s,
-            None => self.fetch_and_cache_sip(camera).await?,
-        };
-
+        let offer_sdp = offer
+            .build_offer(&usable_ice_servers(&sip.ice_servers))
+            .await?;
         let (answer, socket) = self
             .client
             .webrtc_negotiate(&sip, &offer_sdp)
@@ -147,7 +105,6 @@ impl WebrtcSignaler for ArloWebrtcSignalerAdapter {
 
     async fn teardown(&self, camera: &CameraId) -> Result<(), DomainError> {
         self.take_and_disconnect(camera.as_str()).await;
-        self.sip_cache.lock().await.remove(camera.as_str());
         debug!(%camera, "WebRTC signaling session torn down");
         Ok(())
     }

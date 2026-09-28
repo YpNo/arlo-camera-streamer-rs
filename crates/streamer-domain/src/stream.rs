@@ -25,7 +25,9 @@ use crate::state::LiveLossReason;
 
 /// One ICE (STUN/TURN) server the media adapter must configure on its
 /// WebRTC peer **before** generating the offer. Sourced from Arlo's
-/// `sipInfo` via [`WebrtcSignaler::ice_servers`](crate::port::WebrtcSignaler::ice_servers).
+/// `sipInfo` and handed to the media adapter's
+/// [`OfferBuilder`](crate::port::OfferBuilder) during
+/// [`WebrtcSignaler::negotiate`](crate::port::WebrtcSignaler::negotiate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IceServer {
     /// e.g. `stun:host:port` or `turn:host:port?transport=udp`.

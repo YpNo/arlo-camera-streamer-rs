@@ -23,6 +23,7 @@ mod support;
 use std::time::Duration;
 
 use streamer_domain::config::WebrtcConfig;
+use streamer_domain::error::DomainError;
 use streamer_domain::port::{MediaMultiplexer, WebrtcSignaler};
 use streamer_domain::state::LiveLossReason;
 
@@ -179,4 +180,36 @@ async fn live_session_call_dropped_during_setup_fails_attach_with_reason() {
         "the loss took the whole first-RTP timeout ({:?})",
         started.elapsed()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_session_refused_attach_keeps_camera_busy_and_frees_the_next_attach() {
+    let _serial = SERIAL.lock().await;
+    if !gstreamer_ready() {
+        return;
+    }
+    let stack = Stack::new(WebrtcConfig::default());
+    stack.media.register(&stack.camera).await.expect("register");
+
+    let refused = stack
+        .media
+        .attach_live(&stack.camera, &FakeGateway::busy())
+        .await
+        .expect_err("a busy camera must refuse the attach");
+    assert!(
+        matches!(refused, DomainError::CameraBusy(_)),
+        "CameraBusy must reach the orchestrator unchanged, got {refused:?}"
+    );
+
+    let gateway = FakeGateway::default();
+    let _session = stack
+        .media
+        .attach_live(&stack.camera, &gateway)
+        .await
+        .expect("a failed attach must not block the next one");
+    stack
+        .media
+        .detach_live(&stack.camera)
+        .await
+        .expect("detach_live");
 }

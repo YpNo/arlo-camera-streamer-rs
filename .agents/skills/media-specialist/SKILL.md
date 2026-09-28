@@ -15,7 +15,8 @@ Arlo-specific behaviour with the `live-validation` skill.
 
 - `FakeGateway` implements `WebrtcSignaler` with a second `webrtcbin`: non-bundled,
   audio sendrecv, white `videotestsrc` → H.264 pt 103 through a `valve`
-  (`stall_video()` closes it); `hanging_up()` answers then drops the call.
+  (`stall_video()` closes it); `hanging_up()` answers then drops the call; `busy()`
+  refuses with `CameraBusy` like Arlo's 14001.
 - `RtspProbe` plays the mount over TCP, decodes to GRAY8 and keeps the mean luma: idle is
   black (< 80), live is white (> 180); `interrupted()` records any EOS or error.
 - Tests share the default GLib main context through `RtspServer`, so they hold a static

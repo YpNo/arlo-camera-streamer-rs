@@ -24,6 +24,7 @@ pub mod discovery;
 pub mod error;
 pub mod event_mapper;
 pub mod events;
+pub mod ice;
 pub mod snapshot_cache;
 pub mod stream_requester;
 pub mod thumbnails;

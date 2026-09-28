@@ -68,6 +68,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `live_audio_desc`), unused since the persistent splice pipeline.
 
 ### Changed
+- `WebrtcSignaler` is one call per attempt: `negotiate(camera, &mut dyn
+  OfferBuilder)` fetches the call's coordinates, hands the ICE servers
+  to the media adapter to build the offer, and carries it to Arlo. The
+  separate `ice_servers` step and the per-camera `SipInfo` cache it
+  needed are gone.
 - Every motion / audio pulse is logged at `debug`, on the bus
   (`camera trigger pulse kind=motion`) and in the orchestrator (`trigger pulse` with
   its outcome and when the session will end), so a capture shows how a
@@ -89,6 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoded instead of logged as dropped.
 
 ### Fixed
+- A failed attach (no RTP within 20 s, a loss during setup, a refused
+  call) left the camera's live sinks armed, so every later attach
+  failed with "already in live mode" until a restart. A failed attach
+  now releases them.
 - A live session started while no RTSP client was connected sent its
   video to a discard sink for its whole duration, even after a client
   connected; a client reconnecting mid-session lost the live video the

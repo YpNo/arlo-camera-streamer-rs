@@ -197,15 +197,14 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         signaler: &dyn WebrtcSignaler,
     ) -> Result<LiveSession, DomainError> {
         self.ensure_registered(camera).await?;
-        // 1. ICE servers (sipInfo) → 2. registry hands back the live
-        // RTP byte sink for the camera's persistent pipeline (the
-        // appsrc on the live branch of the combined launch); the
-        // registry arms its IDR-aligned `input-selector` flip in the
-        // background → 3. webrtcbin builds the offer pushing inbound
-        // RTP into the sink → 4. signaler carries it to Arlo →
-        // 5. answer applied. Connected RTSP clients see a seamless
-        // switch idle → live at the next live IDR.
-        let ice = signaler.ice_servers(camera).await?;
+        // 1. The registry hands back the live RTP byte sinks for the
+        // camera's persistent pipeline and arms its `input-selector`
+        // flip → 2. `WebrtcLive::start` runs one `negotiate`: the
+        // signaler fetches the call's ICE servers (sipInfo), webrtcbin
+        // builds the offer with them, the signaler carries it to Arlo →
+        // 3. answer applied, inbound RTP flows into the sinks. Connected
+        // RTSP clients see a seamless switch idle → live at the next
+        // live keyframe.
         let sinks = self.registry.attach_live_sink(camera).await?;
         // The session handle goes back to the orchestrator; the
         // notifier is shared by the webrtcbin leg's death detectors
@@ -213,11 +212,20 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         // A detector that fires during setup fails the attach with its
         // reason instead of the first-RTP timeout.
         let (mut session, notifier) = LiveSession::new();
-        let setup = WebrtcLive::start(camera, &ice, signaler, sinks, &self.webrtc, notifier);
-        let webrtc = setup_or_loss(setup, &mut session).await?;
-        // On a failure above, the registry's pump task naturally exits
-        // once the dropped sink closes the channel; the orchestrator
-        // pairs the failure exit with `WebrtcSignaler::teardown`.
+        let setup = WebrtcLive::start(camera, signaler, sinks, &self.webrtc, notifier);
+        let webrtc = match setup_or_loss(setup, &mut session).await {
+            Ok(webrtc) => webrtc,
+            Err(e) => {
+                // Release the registry's live side exactly as a detach
+                // would: left armed, it refuses every later attach with
+                // "already in live mode". The orchestrator pairs the
+                // failure exit with `WebrtcSignaler::teardown`.
+                if let Err(release) = self.registry.detach_live_sink(camera).await {
+                    warn!(error = %release, "releasing the live sinks after a failed attach failed");
+                }
+                return Err(e.into());
+            }
+        };
         self.live.lock().await.insert(camera.clone(), webrtc);
         Ok(session)
     }
@@ -266,16 +274,10 @@ mod tests {
     struct NoopSignaler;
     #[async_trait]
     impl WebrtcSignaler for NoopSignaler {
-        async fn ice_servers(
-            &self,
-            _camera: &CameraId,
-        ) -> Result<Vec<streamer_domain::stream::IceServer>, DomainError> {
-            Ok(vec![])
-        }
         async fn negotiate(
             &self,
             _camera: &CameraId,
-            _offer_sdp: String,
+            _offer: &mut dyn streamer_domain::port::OfferBuilder,
         ) -> Result<SignalingAnswer, DomainError> {
             Ok(SignalingAnswer {
                 answer_sdp: "v=0\r\n".to_string(),
