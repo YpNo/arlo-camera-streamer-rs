@@ -11,12 +11,24 @@ Follow-up signals go on a FIFO queue drained by `process_signals`, never by recu
 
 ## States and signals
 
-States: `Idle`, `Activating`, `Live { since_secs }`, `BatteryProtect { reset_in }`,
+States: `Idle`, `Activating`, `Live`, `BatteryProtect { reset_in }`,
 `Failed { reason, retries }`. The session ends `debounce_secs` after the last motion
-(or at `max_continuous_live`). A `Cooling` state was removed on 2026-09-28 because nothing
-produced it; reintroduce one only with a real input behind it (`motionDetected: false`,
-ignored today), after a capture shows how Arlo repeats `motionDetected` during sustained
-motion.
+pulse, or at `max_continuous_live` (300 s, kept on purpose for the battery), both timed
+by the debouncer.
+
+**How Arlo reports motion (captured 2026-09-28):** a pulse, not a state. While motion
+lasts, the camera repeats `activityState: fullFrameSnapshot` → `motionDetected: true` →
+`motionDetected: false` about 5 s later, every ~10 s (longest gap seen: 13 s). So:
+
+- one long motion = a train of `true` pulses; each restarts the cooldown and keeps the
+  same WebRTC session — that *is* the long capture followed by a cooldown;
+- `false` ends a pulse, not the motion: never start a cooldown on it (the mapper ignores
+  it on purpose), and a lost `false` changes nothing;
+- `debounce_secs` must stay above the pulse gap (> 15 s);
+- motion longer than the hard cap ends the session; the next pulse starts a new one.
+
+`Cooling` and `Live::since_secs` were removed on 2026-09-28: nothing produced or read
+them.
 
 | Signal | Effect |
 |---|---|

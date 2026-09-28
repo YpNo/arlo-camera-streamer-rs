@@ -62,6 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `trace` logs every event the same way.
 
 ### Changed
+- Every motion / audio pulse is logged at `debug`, on the bus
+  (`camera trigger pulse`) and in the orchestrator (`trigger pulse` with
+  its outcome and when the session will end), so a capture shows how a
+  long motion keeps a session alive.
+- `CameraState::Live` no longer carries `since_secs`, which was never
+  updated (logs showed `since_secs: 0` after minutes of live); the
+  debouncer has always timed the session.
 - The `Cooling` camera state is gone: it was declared but never entered.
   The admin snapshot loses `cooling_remaining` (never serialized, it was
   always empty) and `streamer_camera_state` loses its always-zero

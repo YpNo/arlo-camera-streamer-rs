@@ -17,14 +17,10 @@ pub enum CameraState {
     Idle,
     /// WebRTC offer sent; awaiting the gateway answer and the first IDR frame.
     Activating,
-    /// Live source attached; selector is on the live pad.
-    Live {
-        /// Wall-clock seconds spent in `Live` for the current session.
-        ///
-        /// Compared against `CooldownConfig::max_continuous_live` to enforce
-        /// the battery-protection cap.
-        since_secs: u64,
-    },
+    /// Live source attached; selector is on the live pad. The session's
+    /// cooldown and `max_continuous_live` hard cap are timed by the
+    /// orchestrator's debouncer, not stored here.
+    Live,
     /// Daily live budget exhausted; motion is ignored until reset.
     BatteryProtect {
         /// Time until the daily budget resets and the camera returns to idle.

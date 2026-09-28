@@ -17,14 +17,15 @@
 //!
 //! # Capture aid (ADR 0005)
 //!
-//! Every raw bus event is logged at `trace` and every unmapped
-//! `cameras/*` event at `debug`, both **without property values** (they
+//! Every raw bus event is logged at `trace`; every unmapped `cameras/*`
+//! event and every motion / audio pulse at `debug`; all **without
+//! property values** (they
 //! can carry presigned URLs and transaction ids): action, resource,
 //! source, the sorted property keys and the `activityState` string. To
 //! see what Arlo emits when a live view starts in the mobile app:
 //!
 //! ```text
-//! RUST_LOG=info,streamer_infra_arlo::events=debug   # unmapped camera events
+//! RUST_LOG=info,streamer_infra_arlo::events=debug   # pulses + unmapped camera events
 //! RUST_LOG=info,streamer_infra_arlo::events=trace   # every event
 //! ```
 //!
@@ -121,13 +122,17 @@ fn observe_raw(event: &ArloEvent, mapped: Option<&CameraEvent>) {
         ?mapped,
         "arlo bus event"
     );
-    if mapped.is_none() && event.resource.starts_with("cameras/") {
-        debug!(
+    match mapped {
+        None if event.resource.starts_with("cameras/") => debug!(
             resource = %event.resource,
             ?keys,
             ?activity,
             "unmapped camera event"
-        );
+        ),
+        Some(trigger @ (CameraEvent::Motion { .. } | CameraEvent::Audio { .. })) => {
+            debug!(resource = %event.resource, ?trigger, "camera trigger pulse");
+        }
+        _ => {}
     }
 }
 

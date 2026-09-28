@@ -159,3 +159,12 @@ Why:      The GStreamer-bound files had no automated test; a recording cannot be
 Tests:    Integration suite 4/4, stable over 5 runs (~21 s).
 Open:     Cooldown on motionDetected:false needs a capture of how Arlo repeats
           motionDetected during sustained motion.
+
+## 2026-09-28 — motion cadence captured; since_secs removed; pulses logged
+Tests:    Owner capture, 2 min of motion: Arlo repeats fullFrameSnapshot →
+          motionDetected true → false (~5 s) every ~10 s (max gap 13 s); one
+          session 20:46:04 → 20:50:01, ended debounce (owner's config 120 s)
+          after the last pulse. No behaviour change needed: `false` ends a pulse.
+Changed:  Live is a unit variant (since_secs never updated); motion/audio
+          pulses logged at debug in the events adapter and the orchestrator
+          (outcome + session_ends_in_ms). Hard cap kept at 300 s (owner).

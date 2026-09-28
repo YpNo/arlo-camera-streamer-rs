@@ -64,17 +64,17 @@ pub fn transition(state: &CameraState, signal: &StateTransition) -> CameraState 
         (S::Idle, _) => S::Idle,
 
         // ---------- From Activating ----------
-        (S::Activating, T::LiveAttached) => S::Live { since_secs: 0 },
+        (S::Activating, T::LiveAttached) => S::Live,
         (S::Activating, T::CameraBusy) => S::Idle,
         (S::Activating, T::Failure(reason)) => fresh_failed(reason),
         (S::Activating, T::BudgetExhausted) => battery_protect(),
         (S::Activating, _) => S::Activating,
 
         // ---------- From Live ----------
-        (S::Live { .. }, T::CooldownExpired | T::MaxLiveExceeded | T::LiveLost(_)) => S::Idle,
-        (S::Live { .. }, T::BudgetExhausted) => battery_protect(),
-        (S::Live { .. }, T::Failure(reason)) => fresh_failed(reason),
-        (S::Live { .. }, _) => state.clone(),
+        (S::Live, T::CooldownExpired | T::MaxLiveExceeded | T::LiveLost(_)) => S::Idle,
+        (S::Live, T::BudgetExhausted) => battery_protect(),
+        (S::Live, T::Failure(reason)) => fresh_failed(reason),
+        (S::Live, _) => state.clone(),
 
         // ---------- From BatteryProtect ----------
         (S::BatteryProtect { .. }, T::BudgetReset) => S::Idle,
@@ -110,8 +110,8 @@ mod tests {
     use rstest::rstest;
     use streamer_domain::state::LiveLossReason;
 
-    fn live(secs: u64) -> CameraState {
-        CameraState::Live { since_secs: secs }
+    fn live() -> CameraState {
+        CameraState::Live
     }
 
     fn battery() -> CameraState {
@@ -171,7 +171,7 @@ mod tests {
     fn activating_live_attached_enters_live() {
         assert_eq!(
             transition(&CameraState::Activating, &StateTransition::LiveAttached),
-            live(0)
+            live()
         );
     }
 
@@ -204,19 +204,19 @@ mod tests {
     #[case(StateTransition::CooldownExpired)]
     #[case(StateTransition::MaxLiveExceeded)]
     fn live_returns_to_idle_on_cooldown_or_max(#[case] signal: StateTransition) {
-        assert_eq!(transition(&live(42), &signal), CameraState::Idle);
+        assert_eq!(transition(&live(), &signal), CameraState::Idle);
     }
 
     #[test]
     fn live_holds_on_motion() {
-        let s = live(10);
+        let s = live();
         assert_eq!(transition(&s, &StateTransition::MotionDetected), s);
     }
 
     #[test]
     fn live_failure_enters_failed() {
         let result = transition(
-            &live(5),
+            &live(),
             &StateTransition::Failure("pipeline crash".to_string()),
         );
         assert!(matches!(result, CameraState::Failed { retries: 0, .. }));
@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn live_budget_exhausted_enters_battery_protect() {
         assert!(matches!(
-            transition(&live(5), &StateTransition::BudgetExhausted),
+            transition(&live(), &StateTransition::BudgetExhausted),
             CameraState::BatteryProtect { .. }
         ));
     }
@@ -240,7 +240,7 @@ mod tests {
     #[case(LiveLossReason::AdapterDropped)]
     fn live_live_lost_returns_idle_whatever_the_reason(#[case] reason: LiveLossReason) {
         assert_eq!(
-            transition(&live(12), &StateTransition::LiveLost(reason)),
+            transition(&live(), &StateTransition::LiveLost(reason)),
             CameraState::Idle
         );
     }
@@ -272,7 +272,7 @@ mod tests {
 
     #[rstest]
     #[case(CameraState::Idle)]
-    #[case(live(3))]
+    #[case(live())]
     #[case(battery())]
     #[case(failed(1))]
     fn camera_busy_is_ignored_outside_activating(#[case] state: CameraState) {

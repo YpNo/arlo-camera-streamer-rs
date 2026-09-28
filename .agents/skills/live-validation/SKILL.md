@@ -37,6 +37,7 @@ A stale binary has already cost a validation round.
 
 | Path | Expected lines, in order |
 |---|---|
+| Motion pulses (`streamer_infra_arlo::events=debug`, `streamer_app=debug`) | `camera trigger pulse` per `true` (about every 10 s while motion lasts); `trigger pulse … outcome=absorbed session_ends_in_ms=…` shows the cooldown restarting |
 | Motion session | `state transition … to=Activating` → `webrtcbin offer ready` → `answer applied; awaiting first RTP` → `live webrtcbin ready; first RTP flowing` → `to=Live` → (cooldown) `to=Idle` → `webrtcbin bus watch exited` |
 | Stall (kill the source, e.g. cut the camera's network) | `no inbound video RTP; live source stalled` about `live_stall_timeout_secs` after the last packet → `signal=LiveLost(RtpStalled)` → `to=Idle` |
 | Loss during setup (block outbound UDP to Arlo TURN) | `attach_live failed … live source lost during setup: peer-disconnected` quickly, not after 20 s |

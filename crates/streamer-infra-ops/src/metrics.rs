@@ -265,7 +265,7 @@ fn state_label(state: &CameraState) -> &'static str {
     match state {
         CameraState::Idle => "idle",
         CameraState::Activating => "activating",
-        CameraState::Live { .. } => "live",
+        CameraState::Live => "live",
         CameraState::BatteryProtect { .. } => "battery-protect",
         CameraState::Failed { .. } => "failed",
     }
@@ -509,7 +509,7 @@ mod tests {
         let cases = [
             CameraState::Idle,
             CameraState::Activating,
-            CameraState::Live { since_secs: 0 },
+            CameraState::Live,
             CameraState::BatteryProtect {
                 reset_in: Duration::from_secs(1),
             },

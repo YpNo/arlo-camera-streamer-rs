@@ -136,9 +136,12 @@ Order agreed with the user; items 1–5 are done.
    out. Logs now go to stderr.
 
 Optional cleanups noted during the review: `Cooling` was declared but
-never produced; removed 2026-09-28 (a real cooldown state would follow
-`motionDetected: false`, which needs a capture of how Arlo repeats
-`motionDetected` during sustained motion first). The two-step `ice_servers` + `negotiate` protocol hides a
+never produced; removed 2026-09-28, along with `Live::since_secs`
+(never updated). A capture the same day settled the cooldown question:
+Arlo repeats a motion pulse (`true`, then `false` ~5 s later) about
+every 10 s while motion lasts, so the existing "`debounce_secs` after the
+last pulse" rule already gives one long capture plus a cooldown; `false`
+ends a pulse, not the motion. The hard cap stays at 300 s (owner's call). The two-step `ice_servers` + `negotiate` protocol hides a
 per-camera cache in the adapter — fold the coordinates into one call if
 item 3 touches the port anyway.
 

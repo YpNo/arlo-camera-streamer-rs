@@ -295,10 +295,7 @@ impl CameraOrchestrator {
                 if reply.send(()).is_err() {
                     debug!("admin force-idle reply dropped");
                 }
-                if matches!(
-                    self.state,
-                    CameraState::Live { .. } | CameraState::Activating
-                ) {
+                if matches!(self.state, CameraState::Live | CameraState::Activating) {
                     let signals = VecDeque::from([StateTransition::CooldownExpired]);
                     if let Err(e) = self.process_signals(signals).await {
                         warn!(error = %e, "force-idle failed");
@@ -312,7 +309,7 @@ impl CameraOrchestrator {
                 // Same guards as a real pulse: absorbed during a manual
                 // session, no stale debouncer priming in BatteryProtect /
                 // Failed, budget checked.
-                let Some(signal) = self.motion_signal() else {
+                let Some(signal) = self.motion_signal("admin-wake") else {
                     return;
                 };
                 if let Err(e) = self.process_signals(VecDeque::from([signal])).await {
@@ -329,7 +326,7 @@ impl CameraOrchestrator {
         let state_label = match &self.state {
             CameraState::Idle => "idle",
             CameraState::Activating => "activating",
-            CameraState::Live { .. } => "live",
+            CameraState::Live => "live",
             CameraState::BatteryProtect { .. } => "battery-protect",
             CameraState::Failed { .. } => "failed",
         };
@@ -367,7 +364,7 @@ impl CameraOrchestrator {
     fn next_deadline(&self) -> Option<Instant> {
         match &self.state {
             CameraState::Idle | CameraState::Activating => None,
-            CameraState::Live { .. } => self.debouncer.next_deadline(now()),
+            CameraState::Live => self.debouncer.next_deadline(now()),
             CameraState::Failed { .. } => self.failed_deadline,
             CameraState::BatteryProtect { .. } => {
                 let wall = Local::now().naive_local();
@@ -383,8 +380,14 @@ impl CameraOrchestrator {
 
     async fn handle_event(&mut self, event: CameraEvent) -> Result<(), DomainError> {
         let signal = match event {
-            CameraEvent::Motion { .. } | CameraEvent::Audio { .. } => {
-                let Some(signal) = self.motion_signal() else {
+            CameraEvent::Motion { .. } => {
+                let Some(signal) = self.motion_signal("motion") else {
+                    return Ok(());
+                };
+                signal
+            }
+            CameraEvent::Audio { .. } => {
+                let Some(signal) = self.motion_signal("audio") else {
                     return Ok(());
                 };
                 signal
@@ -416,10 +419,17 @@ impl CameraOrchestrator {
     /// `None` when it must not touch the machine: while the user watches
     /// in the Arlo app, Arlo would refuse our session, so none is started
     /// — a session already running is still extended as usual.
-    fn motion_signal(&mut self) -> Option<StateTransition> {
-        let in_session = matches!(self.state, CameraState::Live { .. });
+    ///
+    /// `trigger` names the source (`motion`, `audio`, `admin-wake`) for
+    /// the debug line every pulse gets: Arlo repeats a motion pulse about
+    /// every 10 s while motion lasts, and each one restarts the cooldown.
+    fn motion_signal(&mut self, trigger: &'static str) -> Option<StateTransition> {
+        let in_session = matches!(self.state, CameraState::Live);
         if self.user_view_active() && !in_session {
-            debug!("motion while the user watches in the Arlo app; not activating");
+            debug!(
+                trigger,
+                "pulse while the user watches in the Arlo app; not activating"
+            );
             self.metrics
                 .record_motion(&self.camera_id, MotionOutcome::SuppressedUserView);
             return None;
@@ -431,8 +441,19 @@ impl CameraOrchestrator {
             self.debouncer.on_motion(now());
         }
         let signal = self.intercept_budget(StateTransition::MotionDetected);
-        self.metrics
-            .record_motion(&self.camera_id, classify_motion(&self.state, &signal));
+        let outcome = classify_motion(&self.state, &signal);
+        let at = now();
+        let session_ends_in_ms = self
+            .debouncer
+            .next_deadline(at)
+            .map(|deadline| deadline.saturating_duration_since(at).as_millis());
+        debug!(
+            trigger,
+            outcome = outcome.as_label(),
+            ?session_ends_in_ms,
+            "trigger pulse"
+        );
+        self.metrics.record_motion(&self.camera_id, outcome);
         Some(signal)
     }
 
@@ -510,7 +531,7 @@ impl CameraOrchestrator {
 
     async fn handle_deadline(&mut self) -> Result<(), DomainError> {
         let signal = match &self.state {
-            CameraState::Live { .. } => match self.debouncer.poll(now()) {
+            CameraState::Live => match self.debouncer.poll(now()) {
                 DebouncerVerdict::DebounceExpired => StateTransition::CooldownExpired,
                 DebouncerVerdict::MaxLiveExceeded => StateTransition::MaxLiveExceeded,
                 DebouncerVerdict::KeepLive | DebouncerVerdict::Idle => return Ok(()),
@@ -538,7 +559,7 @@ impl CameraOrchestrator {
             // ADR 0004 invariant: the session handle lives exactly as
             // long as the camera is live. Dropping it here, before any
             // side effect awaits, makes a late report unobservable.
-            if !matches!(to, CameraState::Live { .. }) {
+            if !matches!(to, CameraState::Live) {
                 self.live = None;
             }
             self.metrics
@@ -572,7 +593,7 @@ impl CameraOrchestrator {
                 follow_ups.extend(self.start_activation().await);
             }
             // Activation succeeded.
-            (CameraState::Activating, CameraState::Live { .. }) => {
+            (CameraState::Activating, CameraState::Live) => {
                 self.debouncer.on_live_attached(now());
                 self.budget.on_live_started(Local::now().naive_local());
             }
@@ -585,14 +606,11 @@ impl CameraOrchestrator {
             }
             // Cooldown / max-live / loss → idle, or budget exhausted
             // mid-session → battery-protect: release the session either way.
-            (CameraState::Live { .. }, CameraState::Idle | CameraState::BatteryProtect { .. }) => {
+            (CameraState::Live, CameraState::Idle | CameraState::BatteryProtect { .. }) => {
                 self.detach_and_refresh().await;
             }
             // Anywhere → Failed (transient error).
-            (
-                CameraState::Activating | CameraState::Live { .. },
-                CameraState::Failed { retries, .. },
-            ) => {
+            (CameraState::Activating | CameraState::Live, CameraState::Failed { retries, .. }) => {
                 let _ = self.media.detach_live(&self.camera_id).await;
                 self.stop_arlo_live().await;
                 self.budget.on_live_ended(Local::now().naive_local());
@@ -683,7 +701,7 @@ impl CameraOrchestrator {
         // The task ends here; drop the session handle so a report that
         // races the shutdown is never acted upon.
         self.live = None;
-        if matches!(self.state, CameraState::Live { .. }) {
+        if matches!(self.state, CameraState::Live) {
             if let Err(e) = self.media.detach_live(&self.camera_id).await {
                 warn!(error = %e, "detach on shutdown failed");
             }
@@ -782,7 +800,7 @@ fn classify_motion(state: &CameraState, signal: &StateTransition) -> MotionOutco
     }
     match state {
         CameraState::Failed { .. } => MotionOutcome::SuppressedFailed,
-        CameraState::Live { .. } => MotionOutcome::Absorbed,
+        CameraState::Live => MotionOutcome::Absorbed,
         _ => MotionOutcome::Triggered,
     }
 }
