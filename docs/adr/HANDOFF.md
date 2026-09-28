@@ -103,9 +103,8 @@ commits. Phase 9 is this session's work.
 Order agreed with the user; items 1–5 are done.
 
 1. **Unblock CI** — done (toolchain, crates.io dep, image deps, no
-   `-A dead_code`). **Open the PR `feat/init-v1` → `main`**: GitHub Actions
-   has never run on this repository (it triggers on `main` and PRs only), so
-   the coverage gate, the media-crate build and the doc job are unproven.
+   `-A dead_code`). PR `feat/init-v1` → `main` (#2) runs all 8 checks
+   green, media crate included.
 2. **Docs/config hygiene** — done (see Phase 9).
 3. **`LiveLost` feedback path + ADR 0004** — done (2026-09-27). `attach_live`
    returns a `LiveSession`; the orchestrator holds it while `Live|Cooling`
@@ -148,7 +147,7 @@ item 3 touches the port anyway.
 
 | Item | Notes |
 |---|---|
-| CI has never run | Open the PR. First run: tests + clippy green on ubuntu-latest (media crate compiles there); doc links, coverage exclusions and Sonar config fixed after it. All 8 checks green on the third run; gate raised to the measured 84 %. |
+| Coverage gate | 86 % (measured 88.31 % on 2026-09-28). GStreamer-bound files are excluded, so the WebRTC and RTSP wiring is covered only by live runs. |
 | HLS / DASH sinks not wired | ADR 0002; config accepts and warns. |
 | No recorded-session integration test | Would need a canned SDP offer/answer + RTP fixture. |
 | Live session vs RTSP client lifecycle | **Fixed 2026-09-28.** The pumps push into the *current* media's appsrc (slot set at `media-configure`, cleared at `unprepared`), discard while none exists, and a media built during a live session gets its switch armed. Validated live 2026-09-28: VLC disconnected and reconnected mid-session and got the live video back ("media built during a live session; live switch armed"). |
@@ -190,17 +189,18 @@ Verified in production; do not rediscover:
 
 ```bash
 # On this workstation every cargo command runs inside the rust-build
-# distrobox (libclang for BoringSSL). Only the non-media crates build there:
+# distrobox (libclang for BoringSSL, GStreamer 1.26 dev headers), through
+# mise for the pinned toolchain. The whole workspace builds there:
 distrobox enter rust-build
 export LIBCLANG_PATH=/usr/lib/llvm-19/lib
-P="-p streamer-domain -p streamer-app -p streamer-infra-arlo -p streamer-infra-ops"
-cargo fmt --all -- --check
-cargo clippy $P --all-targets --all-features -- -D warnings
-cargo test $P --all-features
-RUSTDOCFLAGS="-D warnings" cargo doc $P --no-deps --all-features
+mise exec -- cargo fmt --all -- --check
+mise exec -- cargo clippy --workspace --all-targets --all-features -- -D warnings
+mise exec -- cargo test --workspace --all-features
+RUSTDOCFLAGS="-D warnings" mise exec -- cargo doc --workspace --no-deps --all-features
+mise exec -- cargo build --release -p arlo-camera-streamer
 cargo audit && cargo deny check          # fine on the host
 
-# Full workspace (needs GStreamer dev headers): CI, or the Docker image
+# Container image
 podman build -t arlo-camera-streamer:local .
 
 # Run

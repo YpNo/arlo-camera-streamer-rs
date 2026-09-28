@@ -152,7 +152,7 @@ jobs:
             --exclude-files 'crates/streamer-infra-arlo/src/events.rs' \
             --exclude-files 'crates/streamer-infra-arlo/src/stream_requester.rs' \
             --exclude-files 'crates/streamer-infra-arlo/src/thumbnails.rs' \
-            --fail-under 84
+            --fail-under 86
       - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           fail_ci_if_error: false
