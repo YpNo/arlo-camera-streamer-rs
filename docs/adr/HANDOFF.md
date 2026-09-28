@@ -55,7 +55,7 @@ of each event is unchanged, which is why `event_mapper.rs` still works.
 
 ### Dependencies worth knowing
 
-- `arlo-rs` **0.2.0 from crates.io** (published 2026-09-26, sibling checkout
+- `arlo-rs` **0.2.1 from crates.io** (published 2026-09-26, sibling checkout
   at `../arlo-rs`, MSRV 1.98.1, browser-less `wreq` transport). A commented
   `[patch.crates-io]` block at the end of `Cargo.toml` is the local override.
 - Toolchain **1.98.1** everywhere (`rust-toolchain.toml`, `mise.toml`, CI,
@@ -126,8 +126,7 @@ Order agreed with the user; items 1–5 are done.
    a refused attach (`CameraBusy`, mapped from 14001) returns to idle
    without backoff. arlo-rs branch `feat/stream-peek-probe` carries the
    probe, the `data.error` envelope fix and the `mediaUploadNotification`
-   decode fix; once released (0.2.1), drop the message-text fallback in
-   `streamer-infra-arlo/src/error.rs`. `mediaUploadNotification` carries
+   decode fix; released as 0.2.1 and adopted 2026-09-28 (message-text fallback removed). `mediaUploadNotification` carries
    a fresh `presignedLastImageUrl` usable for idle thumbnails.
 5. **`list-devices` CLI subcommand** — done 2026-09-28. `streamer-bin/src/list_devices.rs`
    (pure rendering, tested) on top of `streamer_infra_arlo::discover_devices`

@@ -10,7 +10,7 @@ rigor: boundaries, failure-path tests, ADRs, CI.
 - Six-crate workspace, hexagonal: `streamer-domain` (ports + types),
   `streamer-app` (orchestrator), `streamer-infra-arlo`,
   `streamer-infra-media` (GStreamer), `streamer-infra-ops`, `streamer-bin`.
-- `arlo-rs` comes from crates.io. Local override: uncomment
+- `arlo-rs` 0.2.1 comes from crates.io. Local override: uncomment
   `[patch.crates-io]` at the end of `Cargo.toml` (never commit it on).
 
 ## Verified commands (2026-09-27)

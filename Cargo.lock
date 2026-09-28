@@ -121,9 +121,9 @@ dependencies = [
 
 [[package]]
 name = "arlo-rs"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a71bab79aefe995fd9288f507275e493662b998f97130656125fc58c6088687"
+checksum = "737ce8b3fe338945e67aa689ff0f7db0e5a6301f1a69268b37bc3e7616b4aad9"
 dependencies = [
  "async-trait",
  "base64",

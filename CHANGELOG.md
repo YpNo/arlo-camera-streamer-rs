@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `list-devices`). Containers and systemd capture both unchanged.
 - Toolchain and MSRV raised to 1.98.1 to follow `arlo-rs` 0.2.0, which is
   now consumed from crates.io instead of a sibling checkout.
+- `arlo-rs` 0.2.1: Arlo error codes stay structured (error 14001 is read
+  from the code, not the message) and `mediaUploadNotification` events are
+  decoded instead of logged as dropped.
 
 ### Fixed
 - A live session started while no RTSP client was connected sent its

@@ -27,16 +27,15 @@ pub fn arlo_to_domain(err: ArloError) -> DomainError {
     }
 }
 
-/// arlo-rs keeps Arlo's code structured from 0.2.1 on; 0.2.0 only
-/// carries it in the message's body excerpt, so both forms are checked.
+/// arlo-rs (≥ 0.2.1) keeps Arlo's own code structured on the error.
 fn is_stream_busy(err: &ArloError) -> bool {
-    match err {
+    matches!(
+        err,
         ArloError::ApiError {
-            error: Some(code), ..
-        } => *code == ARLO_STREAM_BUSY,
-        ArloError::ApiError { message, .. } => message.contains(r#""error":"14001""#),
-        _ => false,
-    }
+            error: Some(ARLO_STREAM_BUSY),
+            ..
+        }
+    )
 }
 
 #[cfg(test)]
@@ -54,17 +53,6 @@ mod tests {
             arlo_to_domain(structured),
             DomainError::CameraBusy(_)
         ));
-    }
-
-    #[test]
-    fn stream_busy_in_legacy_message_maps_to_camera_busy() {
-        // arlo-rs 0.2.0 shape, captured live.
-        let legacy = ArloError::ApiError {
-            code: 500,
-            error: None,
-            message: r#"Envelope reports success=false; body: {"data":{"error":"14001","message":"RTSP Streaming in progress"},"success":false}"#.to_string(),
-        };
-        assert!(matches!(arlo_to_domain(legacy), DomainError::CameraBusy(_)));
     }
 
     #[test]

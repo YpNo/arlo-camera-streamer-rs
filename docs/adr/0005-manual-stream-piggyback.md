@@ -66,9 +66,7 @@ because of one.
 
 - The NVR does not show the user's own view, and motion during it is
   not recorded by the daemon (Arlo would refuse the session anyway).
-- 14001 is detected from the message text while the workspace requires
-  arlo-rs 0.2.0; arlo-rs keeps the code structured from its next
-  release, and the adapter checks both forms.
+- 14001 is read from the structured error code arlo-rs 0.2.1 keeps.
 
 ## Alternatives considered
 
