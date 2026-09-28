@@ -54,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now consumed from crates.io instead of a sibling checkout.
 
 ### Fixed
+- A live session started while no RTSP client was connected sent its
+  video to a discard sink for its whole duration, even after a client
+  connected; a client reconnecting mid-session lost the live video the
+  same way (the pumps stopped at the first push into the torn-down
+  media). The live video now follows the media that currently exists and
+  is spliced in within one keyframe interval of a client connecting.
 - Admin wake and force-idle are acknowledged when dequeued instead of after
   the WebRTC negotiation completed, which exceeded the 2 s reply timeout
   and reported a healthy wake as "orchestrator unavailable".

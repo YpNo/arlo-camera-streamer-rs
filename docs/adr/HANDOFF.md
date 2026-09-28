@@ -149,8 +149,7 @@ item 3 touches the port anyway.
 | CI has never run | Open the PR. First run: tests + clippy green on ubuntu-latest (media crate compiles there); doc links, coverage exclusions and Sonar config fixed after it. All 8 checks green on the third run; gate raised to the measured 84 %. |
 | HLS / DASH sinks not wired | ADR 0002; config accepts and warns. |
 | No recorded-session integration test | Would need a canned SDP offer/answer + RTP fixture. |
-| Live session started with no RTSP client connected | `attach_live_sink` finds no media wiring, spawns discard pumps and warns "deferred wiring not implemented"; when a client connects later the media is rebuilt but the running session keeps discarding, so the camera streams for nothing until the session ends. Harmless with Frigate (always connected), visible with ad-hoc VLC. Fix: re-arm the pumps from the `media-configure` hook when a session is active. |
-| Media unprepared when the last client leaves | gst-rtsp-server tears the media down ~10 s after the last client disconnects (seen live 2026-09-27); the next attach then hits the gap above. Same fix. |
+| Live session vs RTSP client lifecycle | **Fixed 2026-09-28.** The pumps push into the *current* media's appsrc (slot set at `media-configure`, cleared at `unprepared`), discard while none exists, and a media built during a live session gets its switch armed. Needs the VLC check: motion first, then connect. |
 | Dependency currency | All within one minor of latest on 2026-09-27; `mockall` 0.15 / `rstest` 0.27 are the only minor bumps pending (dev-deps). |
 
 ---

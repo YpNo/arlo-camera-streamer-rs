@@ -91,3 +91,15 @@ Why:      Finding opaque device ids was the worst first-run step; running
 Tests:    Workspace 349 green in the container; clippy/doc/fmt clean; `--help`
           checked. Not yet run against the live account.
 Open:     Live run of `list-devices`; arlo-rs 0.2.1 bump; deferred wiring gap.
+
+## 2026-09-28 — live video follows the RTSP media lifecycle
+Changed:  gst_pipeline.rs: WiringSlot holds the current media's wiring (set at
+          media-configure, cleared at unprepared by media identity); pumps
+          look it up per buffer, discard while empty, survive push errors;
+          `live_active` flag arms the switch on a media built mid-session;
+          `expect()` on locks replaced by poison-tolerant `lock()`.
+Why:      Owner's VLC test: motion before connecting VLC showed only the
+          still for the whole session (camera streamed into a discard pump).
+Tests:    Workspace 349 green, clippy/doc clean, release build OK. Pipeline
+          behaviour needs the live VLC check (motion first, then connect).
+Open:     VLC re-test; arlo-rs 0.2.1 bump (next commit).

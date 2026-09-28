@@ -30,20 +30,24 @@
 //!    encoder `x264enc name=video_enc`.
 //! 3. [`attach_live_sink`](PipelineRegistry::attach_live_sink) hands back a
 //!    [`LiveSinks`] pair — each
-//!    receiver is drained by a tokio pump that calls
-//!    `appsrc.push_buffer(...)`. A pad probe on `sel.sink_1` waits
+//!    receiver is drained by a tokio pump that pushes into the live
+//!    `appsrc` of **whichever media currently exists** (looked up per
+//!    buffer). A pad probe on `sel.sink_1` waits
 //!    for the first decoded raw buffer, flips `active-pad = sink_1`,
 //!    and force-key-units the encoder. The probe self-removes.
 //! 4. [`detach_live_sink`](PipelineRegistry::detach_live_sink) flips `active-pad = sink_0`
 //!    synchronously, force-key-units the encoder, and aborts the
 //!    live pump.
 //!
-//! Edge case: if `attach_live_sink` is called before *any* client has
-//! connected, the media is not yet constructed and no `appsrc` exists.
-//! We spawn a discard pump in that case and log a warning; bytes are
-//! dropped until a client connects. In the user's documented workflow
-//! (an idle viewer is connected when motion fires) the wiring is
-//! always present.
+//! Media lifecycle vs live session: gst-rtsp-server builds the media
+//! when the first client connects and unprepares it after the last one
+//! leaves, so a live session can start with no media at all, or outlive
+//! the media it started with. The wiring slot therefore always holds the
+//! *current* media (set at `media-configure`, cleared at `unprepared`),
+//! the pumps discard while it is empty, and a media configured while a
+//! session is live gets its live switch armed at once. A client that
+//! connects in the middle of a session sees the live video within one
+//! keyframe interval.
 //!
 //! ## Thumbnail handling (Phase 5)
 //!
@@ -64,7 +68,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -95,6 +100,10 @@ use crate::rtsp::RtspServer;
 /// they're produced) and tokio tasks (where they're consumed).
 #[derive(Clone)]
 struct LiveWiring {
+    /// The media's top-level element: identifies which media this wiring
+    /// belongs to, so an `unprepared` of an older media never clears the
+    /// wiring of a newer one.
+    media_element: gst::Element,
     appsrc: gst_app::AppSrc,
     selector: gst::Element,
     /// `sel.sink_0` — idle branch input.
@@ -138,9 +147,24 @@ struct CameraEntry {
     /// Read by `attach_live_sink` to find the appsrc + selector pads.
     /// `StdMutex` so the `GLib` callback (sync) and tokio tasks (which
     /// only hold it for read snapshots, no `await` in scope) can share.
-    wiring: Arc<StdMutex<Option<LiveWiring>>>,
+    wiring: WiringSlot,
+    /// `true` while a live session is attached. Read by the
+    /// `media-configure` hook to arm the live switch on a media built in
+    /// the middle of a session.
+    live_active: Arc<AtomicBool>,
     /// Active live ingestion if any.
     session: Option<LiveSession>,
+}
+
+/// The wiring of the media currently serving this camera's clients, or
+/// `None` while no client is connected. Shared by the `GLib` media hooks,
+/// the tokio pumps and the registry.
+type WiringSlot = Arc<StdMutex<Option<LiveWiring>>>;
+
+/// Lock a mutex, recovering the data if a panicking holder poisoned it:
+/// every critical section here is a plain read or a single assignment.
+fn lock<T>(m: &StdMutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// GStreamer-backed [`PipelineRegistry`].
@@ -213,8 +237,10 @@ impl PipelineRegistry for GstPipelineRegistry {
         let launch = combined_launch_string(&idle, self.video_encoder);
         debug!(camera = %camera, launch_string = %launch, "combined launch string");
 
-        let wiring: Arc<StdMutex<Option<LiveWiring>>> = Arc::new(StdMutex::new(None));
+        let wiring: WiringSlot = Arc::new(StdMutex::new(None));
+        let live_active = Arc::new(AtomicBool::new(false));
         let wiring_for_cb = wiring.clone();
+        let live_for_cb = live_active.clone();
         let cam_for_cb = camera.clone();
         self.server.install_factory_with_media_hook(
             &outputs.rtsp_mount_path,
@@ -232,7 +258,14 @@ impl PipelineRegistry for GstPipelineRegistry {
                                 apply_thumbnail_overlay(overlay, &path);
                             }
                         }
-                        *wiring_for_cb.lock().expect("wiring poisoned") = Some(w);
+                        // A client connected in the middle of a live
+                        // session: splice the live video into this new
+                        // media as soon as its first frame arrives.
+                        if live_for_cb.load(Ordering::SeqCst) {
+                            arm_live_switch(&w);
+                            info!(camera = %cam_for_cb, "media built during a live session; live switch armed");
+                        }
+                        *lock(&wiring_for_cb) = Some(w);
                         debug!(camera = %cam_for_cb, "captured live wiring from media");
                     }
                     Err(e) => {
@@ -243,7 +276,7 @@ impl PipelineRegistry for GstPipelineRegistry {
                 // `ERROR`/`WARNING` messages via `tracing`. Without
                 // this the media dies silently and gst-rtsp-server
                 // just rebuilds it, giving no clue why.
-                attach_media_bus_watch(media, &cam_for_cb);
+                attach_media_bus_watch(media, &cam_for_cb, wiring_for_cb.clone());
             },
         )?;
         info!(mount = %outputs.rtsp_mount_path, idle = idle.kind_label(), "camera registered");
@@ -262,6 +295,7 @@ impl PipelineRegistry for GstPipelineRegistry {
                 idle,
                 last_thumbnail: None,
                 wiring,
+                live_active,
                 session: None,
             },
         );
@@ -285,33 +319,23 @@ impl PipelineRegistry for GstPipelineRegistry {
             video: video_rx,
             audio: audio_rx,
         } = rxs;
-        let wiring_snapshot = entry.wiring.lock().expect("wiring poisoned").clone();
-
-        let session = if let Some(wiring) = wiring_snapshot {
-            arm_live_switch(&wiring);
-            let video_pump = spawn_pump_to_appsrc(video_rx, wiring.appsrc, "video");
-            // Audio has no idle↔live selector — the audiomixer blends
-            // the live Opus onto silence automatically. If the media
-            // predates Phase 8b (no audio appsrc), discard audio bytes.
-            let audio_pump = match wiring.audio_appsrc {
-                Some(a) => spawn_pump_to_appsrc(audio_rx, a, "audio"),
-                None => spawn_discard_pump(audio_rx),
-            };
-            LiveSession {
-                video_pump,
-                audio_pump,
-            }
+        // Flag first, then look: a media configured concurrently either
+        // sees the flag (and arms itself) or is already in the slot.
+        entry.live_active.store(true, Ordering::SeqCst);
+        if let Some(wiring) = lock(&entry.wiring).as_ref() {
+            arm_live_switch(wiring);
         } else {
-            warn!(
+            info!(
                 camera = %camera,
-                "attach_live_sink before any RTSP client connected — \
-                 live RTP will be discarded until a client connects \
-                 (deferred wiring not implemented)"
+                "no RTSP client connected yet; the live video is spliced in when one connects"
             );
-            LiveSession {
-                video_pump: spawn_discard_pump(video_rx),
-                audio_pump: spawn_discard_pump(audio_rx),
-            }
+        }
+        let session = LiveSession {
+            video_pump: spawn_live_pump(video_rx, entry.wiring.clone(), video_appsrc, "video"),
+            // Audio has no idle↔live selector — the audiomixer blends the
+            // live Opus onto silence; a media without the audio appsrc
+            // (pre-8b launch) simply discards it.
+            audio_pump: spawn_live_pump(audio_rx, entry.wiring.clone(), audio_appsrc, "audio"),
         };
         entry.session = Some(session);
         info!(mount = %entry.mount_path, "live ingestion armed (video + audio)");
@@ -333,8 +357,11 @@ impl PipelineRegistry for GstPipelineRegistry {
             debug!(camera = %camera, "detach_live_sink: no active session (idempotent no-op)");
             return Ok(());
         };
+        // Clear the flag before flipping back, so a media configured from
+        // now on starts (and stays) on the idle branch.
+        entry.live_active.store(false, Ordering::SeqCst);
 
-        let wiring_snapshot = entry.wiring.lock().expect("wiring poisoned").clone();
+        let wiring_snapshot = lock(&entry.wiring).clone();
         if let Some(wiring) = wiring_snapshot {
             // Synchronous flip on the video selector: raw I420 frames
             // are independently complete, so any boundary works. A
@@ -376,7 +403,7 @@ impl PipelineRegistry for GstPipelineRegistry {
         // Apply to the running media if one is up. If no client has
         // connected yet the file is already in place and the overlay
         // is re-applied at the next `media-configure` (see `register`).
-        let wiring = entry.wiring.lock().expect("wiring poisoned").clone();
+        let wiring = lock(&entry.wiring).clone();
         if let Some(overlay) = wiring.and_then(|w| w.idle_overlay) {
             apply_thumbnail_overlay(&overlay, &path);
             debug!(path = %path.display(), "thumbnail applied to idle overlay");
@@ -401,13 +428,21 @@ impl PipelineRegistry for GstPipelineRegistry {
 /// "main context already acquired". The `RTSPMedia` `GObject`
 /// signals used below are dispatched via `GLib` signal emission,
 /// which is thread-safe.
-fn attach_media_bus_watch(media: &RTSPMedia, camera: &CameraId) {
+fn attach_media_bus_watch(media: &RTSPMedia, camera: &CameraId, wiring: WiringSlot) {
     let cam_prep = camera.clone();
     media.connect_prepared(move |_media| {
         info!(camera = %cam_prep, "RTSPMedia prepared (pipeline reached PLAYING)");
     });
     let cam_unprep = camera.clone();
-    media.connect_unprepared(move |_media| {
+    media.connect_unprepared(move |media| {
+        // Forget this media's wiring (only if a newer media has not
+        // replaced it yet): the pumps then discard instead of pushing
+        // into a torn-down appsrc.
+        let element = media.element();
+        let mut slot = lock(&wiring);
+        if slot.as_ref().is_some_and(|w| w.media_element == element) {
+            *slot = None;
+        }
         warn!(camera = %cam_unprep, "RTSPMedia unprepared (pipeline torn down)");
     });
     let cam_state = camera.clone();
@@ -419,8 +454,9 @@ fn attach_media_bus_watch(media: &RTSPMedia, camera: &CameraId) {
 /// Look up the live appsrc + input-selector + branch sink pads inside
 /// a freshly-constructed `RTSPMedia`'s pipeline.
 fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
-    let element = media.element();
-    let bin: gst::Bin = element
+    let media_element = media.element();
+    let bin: gst::Bin = media_element
+        .clone()
         .dynamic_cast::<gst::Bin>()
         .map_err(|_| MediaError::Pipeline("media element is not a Bin".into()))?;
 
@@ -459,6 +495,7 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
     }
 
     Ok(LiveWiring {
+        media_element,
         appsrc,
         selector,
         sink_idle,
@@ -514,15 +551,13 @@ fn arm_live_switch(wiring: &LiveWiring) {
     let selector = wiring.selector.clone();
     let sink_live = wiring.sink_live.clone();
     let encoder = wiring.encoder.clone();
-    let fired = Arc::new(StdMutex::new(false));
+    let fired = AtomicBool::new(false);
     wiring
         .sink_live
         .add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
-            let mut already = fired.lock().expect("flag poisoned");
-            if *already {
+            if fired.swap(true, Ordering::AcqRel) {
                 return gst::PadProbeReturn::Ok;
             }
-            *already = true;
             selector.set_property("active-pad", &sink_live);
             force_keyframe(&encoder);
             debug!("input-selector flipped to sink_1 (live); IDR forced on encoder");
@@ -542,36 +577,50 @@ fn force_keyframe(encoder: &gst::Element) {
     debug!(sent, "force-key-unit dispatched to encoder");
 }
 
-/// Drain an RTP byte channel into an `AppSrc`. Each `Bytes` becomes
-/// one `gst::Buffer`; the appsrc's `do-timestamp=true` re-stamps with
-/// the pipeline clock so the inputs into the selector share a
-/// timebase. Exits when the sink is dropped (channel closes) or when
-/// the task is aborted.
-fn spawn_pump_to_appsrc(
+/// Drain an RTP byte channel into the live `appsrc` of whichever media
+/// currently serves the camera (`pick` selects video or audio). Each
+/// `Bytes` becomes one `gst::Buffer`; the appsrc's `do-timestamp=true`
+/// re-stamps with the pipeline clock so the inputs into the selector
+/// share a timebase.
+///
+/// While no media exists the bytes are dropped, and a failed push (the
+/// media is being torn down) is logged and dropped too: the pump keeps
+/// draining so the WebRTC leg never back-pressures, and resumes feeding
+/// the next media. Exits when the sink is dropped or the task aborted.
+fn spawn_live_pump(
     mut rx: mpsc::Receiver<Bytes>,
-    appsrc: gst_app::AppSrc,
+    wiring: WiringSlot,
+    pick: fn(&LiveWiring) -> Option<gst_app::AppSrc>,
     label: &'static str,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut failing = false;
         while let Some(bytes) = rx.recv().await {
-            let buf = gst::Buffer::from_slice(bytes);
-            if let Err(e) = appsrc.push_buffer(buf) {
-                debug!(error = %e, kind = label, "appsrc.push_buffer failed; live pump stopping");
-                break;
+            let target = lock(&wiring).as_ref().and_then(pick);
+            let Some(appsrc) = target else {
+                continue;
+            };
+            match appsrc.push_buffer(gst::Buffer::from_slice(bytes)) {
+                Ok(_) => failing = false,
+                Err(e) if !failing => {
+                    debug!(error = %e, kind = label, "live push refused (media going down); dropping until the next media");
+                    failing = true;
+                }
+                Err(_) => {}
             }
         }
         debug!(kind = label, "live RTP pump exited");
     })
 }
 
-/// Discard pump used when no media has been constructed yet (no
-/// client connected). Drains the channel so `LiveRtpSink::push` never
-/// back-pressures the WebRTC ingestion thread.
-fn spawn_discard_pump(mut rx: mpsc::Receiver<Bytes>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while rx.recv().await.is_some() {
-            // intentional drop
-        }
-        debug!("discard pump exited");
-    })
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "same signature as audio_appsrc: both are passed as the `pick` of spawn_live_pump"
+)]
+fn video_appsrc(w: &LiveWiring) -> Option<gst_app::AppSrc> {
+    Some(w.appsrc.clone())
+}
+
+fn audio_appsrc(w: &LiveWiring) -> Option<gst_app::AppSrc> {
+    w.audio_appsrc.clone()
 }
