@@ -98,8 +98,9 @@ bind = "0.0.0.0:8554"
 
 # ---------------------------------------------------------------------------
 # Cameras — one [[cameras]] block per Arlo device you want to expose.
-# `arlo_device_id` is the opaque id from the Arlo cloud (visible in the
-# Arlo iOS / Android app under device info).
+# `arlo_device_id` is the opaque id from the Arlo cloud. To list them,
+# with a ready-to-paste block per camera:
+#   arlo-camera-streamer list-devices --config <this file>
 # ---------------------------------------------------------------------------
 
 [[cameras]]

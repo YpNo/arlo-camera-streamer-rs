@@ -151,12 +151,35 @@ holding the values.
 
 ## Usage
 
+### First run: find your device ids
+
+Arlo identifies cameras by opaque device ids. `list-devices` signs in with
+your configuration, lists the account's cameras and doorbells, and prints a
+ready-to-paste `[[cameras]]` block for each one not configured yet. It
+starts no server and needs no admin token. It also completes the MFA
+pairing, so the daemon's first start needs no OTP.
+
+```bash
+export ARLO_PASSWORD="…"
+export ARLO_IMAP_PASSWORD="…"
+arlo-camera-streamer list-devices --config /etc/arlo-streamer/streamer.toml
+```
+
+It also warns about configured `arlo_device_id` values the account does
+not have, which is how typos show up. Logs go to stderr, the report to
+stdout.
+
+### Run the daemon
+
 ```bash
 export ARLO_PASSWORD="…"
 export ARLO_IMAP_PASSWORD="…"
 export STREAMER_ADMIN_TOKEN="$(openssl rand -hex 32)"
 arlo-camera-streamer --config /etc/arlo-streamer/streamer.toml
 ```
+
+`run` is the default subcommand, so `arlo-camera-streamer run --config …`
+is equivalent.
 
 ### Docker run
 

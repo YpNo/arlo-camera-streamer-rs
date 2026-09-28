@@ -8,6 +8,7 @@
 //!
 //! - [`mod@boot`] — top-level orchestration: build + authenticate
 //! - [`device_registry`] — shared `CameraId → Device` cache
+//! - [`discovery`] — streamable devices on the account (`list-devices` CLI)
 //! - [`event_mapper`] — pure `arlo_rs::ArloEvent` → domain `CameraEvent`
 //! - [`events`] — [`ArloEventSource`](streamer_domain::port::ArloEventSource) impl
 //! - [`stream_requester`] — [`WebrtcSignaler`](streamer_domain::port::WebrtcSignaler) impl
@@ -18,6 +19,7 @@
 
 pub mod boot;
 pub mod device_registry;
+pub mod discovery;
 pub mod error;
 pub mod event_mapper;
 pub mod events;
@@ -26,6 +28,7 @@ pub mod thumbnails;
 
 pub use boot::boot;
 pub use device_registry::DeviceRegistry;
+pub use discovery::discover_devices;
 pub use events::ArloEventSourceAdapter;
 pub use stream_requester::ArloWebrtcSignalerAdapter;
 pub use thumbnails::ArloThumbnailSourceAdapter;

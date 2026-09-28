@@ -37,11 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a session already running continues. An attach refused with Arlo error
   14001 returns to idle as `camera-busy` instead of failing into backoff.
   The admin camera snapshot gains `user_view`.
+- `list-devices` subcommand: signs in, lists the account's cameras and
+  doorbells with their device ids, marks the configured ones, warns about
+  configured ids the account does not have, and prints a `[[cameras]]`
+  block with a suggested stream name for each unconfigured device. It
+  starts no server and completes the MFA pairing for the daemon. `run`
+  is the default subcommand, so existing invocations are unchanged.
 - Capture aid for the Arlo bus: `RUST_LOG=streamer_infra_arlo::events=debug`
   logs unmapped camera events with their property keys (never values);
   `trace` logs every event the same way.
 
 ### Changed
+- Logs go to stderr (stdout is reserved for command output such as
+  `list-devices`). Containers and systemd capture both unchanged.
 - Toolchain and MSRV raised to 1.98.1 to follow `arlo-rs` 0.2.0, which is
   now consumed from crates.io instead of a sibling checkout.
 

@@ -79,3 +79,15 @@ Tests:    Workspace 330 green in the container (app 110, domain 43,
 Open:     arlo-rs branch to merge + release 0.2.1, then bump the streamer and
           drop the 14001 message fallback. Item 5 list-devices. Deferred
           wiring gap (session with no RTSP client).
+
+## 2026-09-28 — step 5: list-devices subcommand
+Changed:  streamer-bin: clap subcommands `run` (default) and `list-devices`;
+          list_devices.rs renders table / unknown-id warnings / [[cameras]]
+          snippets (unique suggested stream names). infra-arlo: discovery.rs
+          (`discover_devices`, streamable = camera|doorbell|arloq). domain:
+          `DiscoveredDevice`, `StreamName::suggest`. Tracing to stderr.
+Why:      Finding opaque device ids was the worst first-run step; running
+          it once also completes MFA pairing for the daemon.
+Tests:    Workspace 349 green in the container; clippy/doc/fmt clean; `--help`
+          checked. Not yet run against the live account.
+Open:     Live run of `list-devices`; arlo-rs 0.2.1 bump; deferred wiring gap.

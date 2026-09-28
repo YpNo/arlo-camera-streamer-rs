@@ -33,7 +33,7 @@ pub mod state;
 pub mod stream;
 
 pub use admin::{AdminError, CameraSnapshot, SystemSnapshot};
-pub use camera::{CameraId, StreamName};
+pub use camera::{CameraId, DiscoveredDevice, StreamName};
 pub use config::{
     ArloConfig, CameraConfig, CooldownConfig, DEFAULT_LIVE_STALL_TIMEOUT_SECS, DashOutput,
     EmailMfaConfig, HlsOutput, MIN_LIVE_STALL_TIMEOUT_SECS, MfaConfig, OutputConfig, RtspOutput,

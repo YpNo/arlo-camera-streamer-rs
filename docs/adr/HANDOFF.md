@@ -100,7 +100,7 @@ commits. Phase 9 is this session's work.
 
 ## 4. Agreed plan (2026-09-27) and where we are
 
-Order agreed with the user; items 1–4 are done, 5 remains.
+Order agreed with the user; items 1–5 are done.
 
 1. **Unblock CI** — done (toolchain, crates.io dep, image deps, no
    `-A dead_code`). **Open the PR `feat/init-v1` → `main`**: GitHub Actions
@@ -129,10 +129,10 @@ Order agreed with the user; items 1–4 are done, 5 remains.
    decode fix; once released (0.2.1), drop the message-text fallback in
    `streamer-infra-arlo/src/error.rs`. `mediaUploadNotification` carries
    a fresh `presignedLastImageUrl` usable for idle thumbnails.
-5. **`list-devices` CLI subcommand** — authenticate through the existing
-   `boot()`, print `{device_id, device_name, device_type, model_id}` from
-   `ArloClient::get_devices`. Biggest first-run UX win; the whole boot path
-   already exists.
+5. **`list-devices` CLI subcommand** — done 2026-09-28. `streamer-bin/src/list_devices.rs`
+   (pure rendering, tested) on top of `streamer_infra_arlo::discover_devices`
+   and `StreamName::suggest`. Shares the daemon's session cache, never logs
+   out. Logs now go to stderr.
 
 Optional cleanups noted during the review: `Cooling` is declared but never
 produced by `transition()` (either produce it in the debounce window or

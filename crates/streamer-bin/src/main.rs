@@ -1,11 +1,15 @@
 //! Composition root for the Arlo camera streamer daemon.
 //!
-//! Boot sequence:
+//! Subcommands: `run` (the default) starts the daemon; `list-devices`
+//! signs in, lists the account's streamable devices and prints
+//! `[[cameras]]` suggestions, then exits (see [`list_devices`]).
+//!
+//! Boot sequence of `run`:
 //!
 //! 1. Parse CLI (`--config /path/to/streamer.toml`).
-//! 2. Initialize tracing subscriber from `RUST_LOG`.
-//! 3. Initialize GStreamer (must run before any `gstreamer::*` call).
-//! 4. Load and parse the TOML config.
+//! 2. Initialize tracing subscriber from `RUST_LOG` (logs go to stderr).
+//! 3. Load and parse the TOML config.
+//! 4. Initialize GStreamer (must run before any `gstreamer::*` call).
 //! 5. Build [`Metrics`] + [`Readiness`]; pre-warm per-camera state rows.
 //! 6. Boot the arlo-rs client (`streamer_infra_arlo::boot::boot`) →
 //!    construct the three Arlo port adapters from the shared
@@ -38,7 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -68,6 +72,8 @@ const ADMIN_TOKEN_ENV: &str = "STREAMER_ADMIN_TOKEN";
 /// exit. Generous enough for a clean drain under normal conditions.
 const SHUTDOWN_STAGE_TIMEOUT: Duration = Duration::from_secs(8);
 
+mod list_devices;
+
 /// CLI arguments.
 #[derive(Debug, Parser)]
 #[command(
@@ -77,30 +83,54 @@ const SHUTDOWN_STAGE_TIMEOUT: Duration = Duration::from_secs(8);
 )]
 struct Cli {
     /// Path to the TOML configuration file.
-    #[arg(long, short, default_value = "/etc/arlo-streamer/streamer.toml")]
+    #[arg(
+        long,
+        short,
+        global = true,
+        default_value = "/etc/arlo-streamer/streamer.toml"
+    )]
     config: PathBuf,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+enum Command {
+    /// Run the streaming daemon (the default when no subcommand is given).
+    Run,
+    /// List the account's cameras with their device ids.
+    ///
+    /// Signs in to Arlo, lists the account's cameras and doorbells with
+    /// their device ids, and prints a `[[cameras]]` block for each one not
+    /// yet configured. Starts no server. Completes the MFA pairing, so the
+    /// daemon's first start needs no OTP.
+    ListDevices,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
     init_tracing()?;
+    let config = load_config(&cli.config)?;
+    match cli.command.unwrap_or(Command::Run) {
+        Command::Run => run_daemon(config).await,
+        Command::ListDevices => list_devices::run(&config).await,
+    }
+}
+
+async fn run_daemon(config: StreamerConfig) -> Result<()> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         "starting arlo-camera-streamer"
     );
-
     gstreamer::init().context("failed to initialize GStreamer")?;
     info!("GStreamer initialized");
-
-    let cli = Cli::parse();
-    let config = load_config(&cli.config)?;
     info!(
         cameras = config.cameras.len(),
         rtsp_bind = %config.output.rtsp.bind,
         metrics_bind = %config.output.metrics_bind,
         "configuration loaded"
     );
-
     if let Err(e) = run(config).await {
         error!(error = %e, "fatal error");
         return Err(e);
@@ -346,9 +376,11 @@ fn load_config(path: &std::path::Path) -> Result<StreamerConfig> {
 fn init_tracing() -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,arlo_camera_streamer=debug"));
+    // stderr keeps stdout for command output (`list-devices`).
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
+        .with_writer(std::io::stderr)
         .try_init()
         .map_err(|e| anyhow::anyhow!("failed to init tracing: {e}"))?;
     Ok(())
