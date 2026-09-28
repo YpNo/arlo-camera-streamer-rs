@@ -9,8 +9,6 @@
 //! return them as JSON without a translation step. They live in the
 //! domain crate so we keep schema authority here.
 
-use std::time::Duration;
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -51,16 +49,12 @@ pub struct CameraSnapshot {
     /// Output stream name.
     pub stream_name: StreamName,
     /// Top-level state name (`"idle"`, `"activating"`, `"live"`,
-    /// `"cooling"`, `"battery-protect"`, `"failed"`).
+    /// `"battery-protect"`, `"failed"`).
     pub state: String,
     /// Total live time observed so far today, in seconds.
     pub live_secs_today: u64,
     /// Daily live budget, in seconds. `0` when disabled.
     pub daily_budget_secs: u64,
-    /// Cooldown remaining when in `Cooling`, otherwise `None`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub cooling_remaining: Option<Duration>,
     /// Last failure reason, if currently `Failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
@@ -96,12 +90,11 @@ mod tests {
         let snap = CameraSnapshot {
             id: CameraId::new("CAM"),
             stream_name: StreamName::parse("front").unwrap(),
-            state: "live".to_string(),
+            state: "failed".to_string(),
             live_secs_today: 12,
             daily_budget_secs: 600,
-            cooling_remaining: Some(Duration::from_secs(15)),
-            last_failure: None,
-            retries: 0,
+            last_failure: Some("boom".to_string()),
+            retries: 2,
             user_view: false,
         };
         let s = serde_json::to_string(&snap).unwrap();
@@ -117,13 +110,11 @@ mod tests {
             state: "idle".to_string(),
             live_secs_today: 0,
             daily_budget_secs: 0,
-            cooling_remaining: None,
             last_failure: None,
             retries: 0,
             user_view: false,
         };
         let s = serde_json::to_string(&snap).unwrap();
-        assert!(!s.contains("cooling_remaining"));
         assert!(!s.contains("last_failure"));
     }
 

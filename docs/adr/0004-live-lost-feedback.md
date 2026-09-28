@@ -41,12 +41,13 @@ detector; the first to fire wins:
 | `connection-state` / `ice-connection-state` reaching `failed` or `closed` | `peer-disconnected` |
 | Notifier dropped without a report (adapter vanished) | `adapter-dropped` |
 
-The orchestrator holds the handle exactly while the camera is `Live` or
-`Cooling` (the invariant is enforced in `process_signals`, right after
-the state is committed), awaits it as one `select!` arm that is pending
+The orchestrator holds the handle exactly while the camera is `Live`
+(the invariant is enforced in `process_signals`, right after the state
+is committed), awaits it as one `select!` arm that is pending
 otherwise, and turns a resolution into `StateTransition::LiveLost`.
-`LiveLost` maps `Live | Cooling → Idle` and is ignored in every other
-state; the `Live → Idle` side effects are the existing ones (detach,
+`LiveLost` maps `Live → Idle` and is ignored in every other state
+(the never-produced `Cooling` state that shared these rows was removed
+on 2026-09-28); the `Live → Idle` side effects are the existing ones (detach,
 `WebrtcSignaler::teardown`, budget, thumbnail refresh), so the battery
 symmetry rule is untouched.
 

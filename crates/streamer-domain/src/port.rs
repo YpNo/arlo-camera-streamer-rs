@@ -177,7 +177,7 @@ pub trait MediaMultiplexer: Send + Sync {
     async fn detach_live(&self, camera: &CameraId) -> Result<(), DomainError>;
 
     /// Refresh the idle still image (best-effort). Called on every
-    /// `Live → Cooling → Idle` transition with a freshly fetched
+    /// `Live → Idle` transition with a freshly fetched
     /// thumbnail so the next idle period reflects the latest scene.
     ///
     /// # Errors

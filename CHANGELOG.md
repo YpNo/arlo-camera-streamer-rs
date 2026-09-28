@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overlay), motion-triggered WebRTC ingest through `webrtcbin`, and a
   seamless `input-selector` / `audiomixer` splice so clients never
   reconnect (ADR 0003).
-- Per-camera state machine (`Idle`, `Activating`, `Live`, `Cooling`,
+- Per-camera state machine (`Idle`, `Activating`, `Live`,
   `BatteryProtect`, `Failed`) with debounce, continuous-live cap, daily
   live budget and exponential backoff.
 - Arlo adapter on `arlo-rs` 0.2.0: MQTT-over-WebSocket event bus, email /
@@ -55,6 +55,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `trace` logs every event the same way.
 
 ### Changed
+- The `Cooling` camera state is gone: it was declared but never entered.
+  The admin snapshot loses `cooling_remaining` (never serialized, it was
+  always empty) and `streamer_camera_state` loses its always-zero
+  `cooling` series.
 - Logs go to stderr (stdout is reserved for command output such as
   `list-devices`). Containers and systemd capture both unchanged.
 - Toolchain and MSRV raised to 1.98.1 to follow `arlo-rs` 0.2.0, which is

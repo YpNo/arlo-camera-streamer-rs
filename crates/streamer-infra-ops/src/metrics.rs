@@ -81,14 +81,7 @@ pub struct Metrics {
 /// All possible state labels emitted on `streamer_camera_state`.
 /// Centralized so [`Metrics::new`] pre-creates every row and so unit
 /// tests can iterate the full set.
-const STATE_LABELS: &[&str] = &[
-    "idle",
-    "activating",
-    "live",
-    "cooling",
-    "battery-protect",
-    "failed",
-];
+const STATE_LABELS: &[&str] = &["idle", "activating", "live", "battery-protect", "failed"];
 
 impl Metrics {
     /// Build a registry pre-populated with the full metric set.
@@ -273,7 +266,6 @@ fn state_label(state: &CameraState) -> &'static str {
         CameraState::Idle => "idle",
         CameraState::Activating => "activating",
         CameraState::Live { .. } => "live",
-        CameraState::Cooling { .. } => "cooling",
         CameraState::BatteryProtect { .. } => "battery-protect",
         CameraState::Failed { .. } => "failed",
     }
@@ -518,9 +510,6 @@ mod tests {
             CameraState::Idle,
             CameraState::Activating,
             CameraState::Live { since_secs: 0 },
-            CameraState::Cooling {
-                remaining: Duration::from_secs(1),
-            },
             CameraState::BatteryProtect {
                 reset_in: Duration::from_secs(1),
             },

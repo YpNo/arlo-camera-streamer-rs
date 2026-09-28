@@ -11,16 +11,19 @@ Follow-up signals go on a FIFO queue drained by `process_signals`, never by recu
 
 ## States and signals
 
-States: `Idle`, `Activating`, `Live { since_secs }`, `Cooling { remaining }`,
-`BatteryProtect { reset_in }`, `Failed { reason, retries }`.
-`Cooling` is declared and has reducer rows, but nothing produces it yet.
+States: `Idle`, `Activating`, `Live { since_secs }`, `BatteryProtect { reset_in }`,
+`Failed { reason, retries }`. The session ends `debounce_secs` after the last motion
+(or at `max_continuous_live`). A `Cooling` state was removed on 2026-09-28 because nothing
+produced it; reintroduce one only with a real input behind it (`motionDetected: false`,
+ignored today), after a capture shows how Arlo repeats `motionDetected` during sustained
+motion.
 
 | Signal | Effect |
 |---|---|
 | `MotionDetected` | `Idle → Activating`; in `Live` extends the session, never re-activates |
 | `LiveAttached` | `Activating → Live` |
 | `CooldownExpired`, `MaxLiveExceeded` | `Live → Idle` (detach + teardown + thumbnail refresh) |
-| `LiveLost(reason)` | `Live/Cooling → Idle`, same exit, **no backoff** (ADR 0004) |
+| `LiveLost(reason)` | `Live → Idle`, same exit, **no backoff** (ADR 0004) |
 | `CameraBusy` | `Activating → Idle`, **no backoff** (ADR 0005) |
 | `Failure(reason)` | `→ Failed`, exponential backoff, then `BackoffElapsed → Idle` |
 | `BudgetExhausted` / `BudgetReset` | `→ BatteryProtect` / back to `Idle` |
@@ -31,10 +34,10 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
 
 ## Invariants
 
-- **Live handle**: `self.live: Option<LiveSession>` is `Some` iff state is `Live|Cooling`.
+- **Live handle**: `self.live: Option<LiveSession>` is `Some` iff state is `Live`.
   It is dropped in `process_signals` *before* any side effect awaits; dropping it is what
   makes late loss reports harmless (no generation counters).
-- **Battery rule**: every exit from `Live|Cooling` pairs `detach_live` with
+- **Battery rule**: every exit from `Live` pairs `detach_live` with
   `WebrtcSignaler::teardown` (`stop_arlo_live`); a failed attach and shutdown call
   teardown too, since an `Activating` negotiation may have opened a session. Teardown
   must be idempotent. A leaked session keeps the camera streaming on battery.
@@ -43,7 +46,7 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   report), `ManualStreamEnded` clears it. Motion during a view is counted as
   `MotionOutcome::SuppressedUserView` and starts nothing; a running session is left alone.
   An unreported view shows up as `DomainError::CameraBusy` (Arlo 14001) from `attach_live`.
-- **Debouncer priming** only in `Idle|Live|Cooling` (`motion_signal()`); priming in
+- **Debouncer priming** only in `Idle|Live` (`motion_signal()`); priming in
   `Failed`/`BatteryProtect` left a stale hard-cap deadline that cut the next session short.
 - **Snapshots** (`CameraEvent::SnapshotAvailable`, no URL in the domain) refresh the idle
   still only in `Idle|BatteryProtect|Failed` — the states where the still is on screen.

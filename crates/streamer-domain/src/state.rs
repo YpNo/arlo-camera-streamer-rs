@@ -25,14 +25,6 @@ pub enum CameraState {
         /// the battery-protection cap.
         since_secs: u64,
     },
-    /// Motion ended; holding live for `remaining` before reverting to idle.
-    Cooling {
-        /// Time left before the cooldown expires.
-        ///
-        /// Reset to the configured `debounce_secs` when a fresh motion event
-        /// arrives within the cooldown window.
-        remaining: Duration,
-    },
     /// Daily live budget exhausted; motion is ignored until reset.
     BatteryProtect {
         /// Time until the daily budget resets and the camera returns to idle.
@@ -73,7 +65,7 @@ pub enum StateTransition {
     BackoffElapsed,
     /// The media adapter reported the attached live source dead (see
     /// [`LiveSession`](crate::stream::LiveSession)). Only meaningful in
-    /// `Live` / `Cooling`; ignored everywhere else.
+    /// `Live`; ignored everywhere else.
     LiveLost(LiveLossReason),
     /// The attach was refused because the camera is busy with a user
     /// view in the Arlo app (`DomainError::CameraBusy`). Returns

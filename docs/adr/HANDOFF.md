@@ -18,7 +18,7 @@ event-driven push:
 - **Motion event on the MQTT bus** → **Activating** → WebRTC offer/answer
   with Arlo's `FreeSWITCH` gateway → the live H.264 is spliced into the
   RTSP output.
-- **Cooling / Battery-protect**: revert to the idle still.
+- **Cooldown / Battery-protect**: revert to the idle still.
 
 The splice runs inside **one persistent RTSP pipeline per camera** with an
 `input-selector` on raw video and an `audiomixer` on audio, so connected
@@ -107,7 +107,7 @@ Order agreed with the user; items 1–5 are done.
    green, media crate included.
 2. **Docs/config hygiene** — done (see Phase 9).
 3. **`LiveLost` feedback path + ADR 0004** — done (2026-09-27). `attach_live`
-   returns a `LiveSession`; the orchestrator holds it while `Live|Cooling`
+   returns a `LiveSession`; the orchestrator holds it while `Live`
    and awaits it in `select!`; `StateTransition::LiveLost(reason)` maps to
    `Idle`; detectors: stall watchdog (`webrtc.live_stall_timeout_secs`),
    bus ERROR/EOS, connection-state failed/closed. Pure logic in
@@ -135,9 +135,10 @@ Order agreed with the user; items 1–5 are done.
    and `StreamName::suggest`. Shares the daemon's session cache, never logs
    out. Logs now go to stderr.
 
-Optional cleanups noted during the review: `Cooling` is declared but never
-produced by `transition()` (either produce it in the debounce window or
-drop it); the two-step `ice_servers` + `negotiate` protocol hides a
+Optional cleanups noted during the review: `Cooling` was declared but
+never produced; removed 2026-09-28 (a real cooldown state would follow
+`motionDetected: false`, which needs a capture of how Arlo repeats
+`motionDetected` during sustained motion first). The two-step `ice_servers` + `negotiate` protocol hides a
 per-camera cache in the adapter — fold the coordinates into one call if
 item 3 touches the port anyway.
 

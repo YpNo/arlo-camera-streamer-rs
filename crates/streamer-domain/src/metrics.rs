@@ -13,7 +13,7 @@ pub enum MotionOutcome {
     Triggered,
     /// Event was suppressed because the daily budget is exhausted.
     BudgetExhausted,
-    /// Event arrived while already live or cooling — debouncer absorbed
+    /// Event arrived while already live — debouncer absorbed
     /// it (no state change).
     Absorbed,
     /// Event arrived in a transient failed state — ignored until

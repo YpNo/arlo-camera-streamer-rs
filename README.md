@@ -17,8 +17,7 @@ Frigate's pull from Arlo's push**:
 |-------|--------------|--------------|
 | Idle  | Looped JPEG / synthetic frame at 1 fps | Sleeping |
 | Activating | Frame freezes briefly | `start_stream` in flight |
-| Live  | Real H.264/H.265 from the camera | Awake |
-| Cooling | Live continues for `debounce_secs` | Awake |
+| Live  | Real H.264/H.265 from the camera, until `debounce_secs` after the last motion | Awake |
 | Battery-protect | Idle frame returns | Sleeping (quota exhausted) |
 | Viewed in app | You watch the camera in the Arlo app: Arlo allows one stream per camera, so the daemon does not start one; motion resumes when you close the app | Awake (because of you) |
 

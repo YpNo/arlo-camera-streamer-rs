@@ -14,7 +14,6 @@
 //! | Idle               | Activ. | (ignored)    | (ignored) | (ignored)       | (ignored)       | BatteryProtect  | Idle        | Failed  | (ignored)      | (ignored) | (ignored)  |
 //! | Activating         | Activ. | Live         | Activ.    | (ignored)       | (ignored)       | BatteryProtect  | Activ.      | Failed  | (ignored)      | (ignored) | Idle       |
 //! | Live               | Live   | Live         | Live      | Idle            | Idle            | BatteryProtect  | Live        | Failed  | (ignored)      | Idle      | (ignored)  |
-//! | Cooling (reserved) | Live   | (ignored)    | (ignored) | Idle            | Idle            | BatteryProtect  | Cooling     | Failed  | (ignored)      | Idle      | (ignored)  |
 //! | BatteryProtect     | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | Idle        | Failed  | (ignored)      | (ignored) | (ignored)  |
 //! | Failed             | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | (ign.)      | Failed+ | Idle           | (ignored) | (ignored)  |
 //!
@@ -32,10 +31,6 @@
 //! The `Failed → Failed (Failure)` transition increments the retry counter
 //! so the orchestrator can apply exponential backoff before emitting
 //! `BackoffElapsed`.
-//!
-//! `Cooling` is **declared** in the domain but not produced by this
-//! function in v0.1 — the debouncer collapses Live and Cooling into a
-//! single output state. Reserved for v0.2 telemetry use.
 
 // The compact transition matrix above uses bare type names for legibility;
 // backticking each cell would defeat the table's purpose.
@@ -81,13 +76,6 @@ pub fn transition(state: &CameraState, signal: &StateTransition) -> CameraState 
         (S::Live { .. }, T::Failure(reason)) => fresh_failed(reason),
         (S::Live { .. }, _) => state.clone(),
 
-        // ---------- From Cooling (reserved) ----------
-        (S::Cooling { .. }, T::MotionDetected) => S::Live { since_secs: 0 },
-        (S::Cooling { .. }, T::CooldownExpired | T::MaxLiveExceeded | T::LiveLost(_)) => S::Idle,
-        (S::Cooling { .. }, T::BudgetExhausted) => battery_protect(),
-        (S::Cooling { .. }, T::Failure(reason)) => fresh_failed(reason),
-        (S::Cooling { .. }, _) => state.clone(),
-
         // ---------- From BatteryProtect ----------
         (S::BatteryProtect { .. }, T::BudgetReset) => S::Idle,
         (S::BatteryProtect { .. }, T::Failure(reason)) => fresh_failed(reason),
@@ -124,12 +112,6 @@ mod tests {
 
     fn live(secs: u64) -> CameraState {
         CameraState::Live { since_secs: secs }
-    }
-
-    fn cooling(secs: u64) -> CameraState {
-        CameraState::Cooling {
-            remaining: Duration::from_secs(secs),
-        }
     }
 
     fn battery() -> CameraState {
@@ -248,48 +230,6 @@ mod tests {
         ));
     }
 
-    // ---------- Cooling (reserved) ----------
-
-    #[test]
-    fn cooling_motion_returns_to_live() {
-        assert_eq!(
-            transition(&cooling(30), &StateTransition::MotionDetected),
-            live(0)
-        );
-    }
-
-    #[test]
-    fn cooling_cooldown_expired_returns_to_idle() {
-        assert_eq!(
-            transition(&cooling(30), &StateTransition::CooldownExpired),
-            CameraState::Idle
-        );
-    }
-
-    #[test]
-    fn cooling_budget_exhausted_enters_battery_protect() {
-        assert!(matches!(
-            transition(&cooling(30), &StateTransition::BudgetExhausted),
-            CameraState::BatteryProtect { .. }
-        ));
-    }
-
-    #[test]
-    fn cooling_failure_enters_failed() {
-        let result = transition(
-            &cooling(30),
-            &StateTransition::Failure("rtsp drop".to_string()),
-        );
-        assert!(matches!(result, CameraState::Failed { retries: 0, .. }));
-    }
-
-    #[test]
-    fn cooling_holds_on_irrelevant_signals() {
-        let s = cooling(30);
-        assert_eq!(transition(&s, &StateTransition::LiveAttached), s);
-        assert_eq!(transition(&s, &StateTransition::BudgetReset), s);
-    }
-
     // ---------- LiveLost (ADR 0004) ----------
 
     #[rstest]
@@ -305,23 +245,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cooling_live_lost_returns_idle() {
-        assert_eq!(
-            transition(
-                &cooling(30),
-                &StateTransition::LiveLost(LiveLossReason::RtpStalled)
-            ),
-            CameraState::Idle
-        );
-    }
-
     #[rstest]
     #[case(CameraState::Idle)]
     #[case(CameraState::Activating)]
     #[case(battery())]
     #[case(failed(2))]
-    fn live_lost_is_ignored_outside_live_and_cooling(#[case] state: CameraState) {
+    fn live_lost_is_ignored_outside_live(#[case] state: CameraState) {
         assert_eq!(
             transition(
                 &state,
@@ -344,7 +273,6 @@ mod tests {
     #[rstest]
     #[case(CameraState::Idle)]
     #[case(live(3))]
-    #[case(cooling(3))]
     #[case(battery())]
     #[case(failed(1))]
     fn camera_busy_is_ignored_outside_activating(#[case] state: CameraState) {
