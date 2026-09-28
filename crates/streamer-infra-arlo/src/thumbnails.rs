@@ -83,7 +83,10 @@ impl ArloThumbnailSource for ArloThumbnailSourceAdapter {
     async fn last_thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, DomainError> {
         if let Some(url) = self.snapshots.fresh(camera.as_str(), Instant::now()) {
             match self.fetch_jpeg(&url, camera).await {
-                Ok(bytes) => return Ok(Some(bytes)),
+                Ok(bytes) => {
+                    debug!(%camera, source = "bus", bytes = bytes.len(), "idle snapshot fetched");
+                    return Ok(Some(bytes));
+                }
                 Err(e) => {
                     debug!(%camera, error = %e, "cached snapshot URL failed; using the device list");
                     self.snapshots.forget(camera.as_str());
@@ -94,6 +97,8 @@ impl ArloThumbnailSource for ArloThumbnailSourceAdapter {
             debug!(%camera, "no presigned thumbnail url available");
             return Ok(None);
         };
-        self.fetch_jpeg(&url, camera).await.map(Some)
+        let bytes = self.fetch_jpeg(&url, camera).await?;
+        debug!(%camera, source = "device-list", bytes = bytes.len(), "idle snapshot fetched");
+        Ok(Some(bytes))
     }
 }
