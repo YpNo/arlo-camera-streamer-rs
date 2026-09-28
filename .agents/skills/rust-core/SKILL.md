@@ -26,8 +26,9 @@ cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
 
-CI adds tarpaulin with `--fail-under 86` (GStreamer-bound files and the binary are
-excluded in `ci.yml`), audit/deny, Sonar, GitGuardian. Clippy is pedantic: functions over
+CI adds tarpaulin with `--fail-under 86` (the binary and the infra-arlo network wrappers
+are excluded in `ci.yml`; the GStreamer files count through `tests/live_session.rs`),
+audit/deny, Sonar, GitGuardian. Clippy is pedantic: functions over
 100 lines fail (`too_many_lines`) — extract a helper rather than `allow`. An `allow` needs a
 `reason` or an adjacent comment. Rustdoc links to private items fail the doc job.
 

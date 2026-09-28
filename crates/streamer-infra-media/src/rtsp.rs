@@ -156,6 +156,14 @@ impl RtspServer {
         debug!(mount = %mount_path, "rtsp factory removed");
     }
 
+    /// The TCP port the server listens on, which differs from the
+    /// configured one when that was `0` (tests bind an ephemeral port).
+    /// `None` before the socket is bound.
+    #[must_use]
+    pub fn bound_port(&self) -> Option<u16> {
+        u16::try_from(self.server.bound_port()).ok()
+    }
+
     /// Stop the main loop. Called during graceful shutdown.
     pub fn stop(&self) {
         if self.main_loop.is_running() {

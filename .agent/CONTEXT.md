@@ -46,8 +46,8 @@ alias cargo='mise exec -- cargo'
   container). The host still has none. Pipeline behaviour needs a camera.
 - Root disk is small; `target/` directories of the sibling projects grow
   to tens of GB. Clean them before an image build.
-- Coverage gate: 86 % via tarpaulin (measured 88.31 % on 2026-09-28), GStreamer-bound
-  files and the binary excluded (`ci.yml`). Raise deliberately.
+- Coverage gate: 86 % via tarpaulin (measured 88.25 % on 2026-09-28, GStreamer files
+  counted); the binary and infra-arlo network wrappers excluded (`ci.yml`). Raise deliberately.
 - Battery rule: every `Live` exit pairs `detach_live` with
   `WebrtcSignaler::teardown`.
 - One stream per camera (ADR 0005): while the user watches in the Arlo app,

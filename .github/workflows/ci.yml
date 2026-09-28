@@ -58,18 +58,26 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install system build deps (btls-sys/BoringSSL + GStreamer)
+        # The runtime plugins are for `streamer-infra-media/tests/live_session.rs`,
+        # which runs a real WebRTC call and RTSP client; STREAMER_REQUIRE_GST_IT
+        # makes a missing element fail the job instead of skipping the tests.
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             cmake build-essential libssl-dev libclang-dev nasm golang-go \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev
+            libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav gstreamer1.0-nice
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace --all-features
+        env:
+          STREAMER_REQUIRE_GST_IT: "1"
 
   security:
     name: Security & License Audit
@@ -113,7 +121,10 @@ jobs:
           sudo apt-get install -y \
             cmake build-essential libssl-dev libclang-dev nasm golang-go \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev
+            libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav gstreamer1.0-nice
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.98.1
@@ -128,26 +139,23 @@ jobs:
         # package's tests from running while its lines still count, which
         # is how the first run reported the media crate at 0 %):
         # - `crates/streamer-bin/*` — composition root, only glue
-        # - GStreamer-bound media files (`gst_pipeline.rs`, `rtsp.rs`,
-        #   `webrtc_pipeline.rs`) need a running pipeline and a camera; the
-        #   crate's pure modules (`live_watch`, `splice`, `pipeline_desc`,
-        #   `multiplexer` with its fake registry, …) are unit-tested and count.
+        # - The GStreamer-bound media files count: `tests/live_session.rs`
+        #   drives them through real WebRTC calls (STREAMER_REQUIRE_GST_IT
+        #   makes a missing plugin fail instead of silently skipping).
         # - I/O-heavy infra-arlo files — `boot.rs` async auth, `events.rs`
         #   live MQTT bus, `stream_requester.rs` and `thumbnails.rs` real
         #   network calls. Their pure logic (`event_mapper.rs`, `error.rs`,
         #   the `build_arlo_rs_config` and `utf8_path` helpers) IS unit-tested
         #   inline; the wrappers belong to integration tests against a real
         #   Arlo account.
-        # Threshold: 84 — measured 84.13 % on 2026-09-27 (second CI run, media
-        # crate's pure modules counted). Raise deliberately; never set above
-        # what is held.
+        # Threshold: 86 — measured 88.25 % on 2026-09-28 with the media files
+        # counted. Raise deliberately; never set above what is held.
+        env:
+          STREAMER_REQUIRE_GST_IT: "1"
         run: |
           cargo tarpaulin --workspace --all-features --timeout 180 --out xml \
             --exclude arlo-camera-streamer \
             --exclude-files 'crates/streamer-bin/*' \
-            --exclude-files 'crates/streamer-infra-media/src/gst_pipeline.rs' \
-            --exclude-files 'crates/streamer-infra-media/src/rtsp.rs' \
-            --exclude-files 'crates/streamer-infra-media/src/webrtc_pipeline.rs' \
             --exclude-files 'crates/streamer-infra-arlo/src/boot.rs' \
             --exclude-files 'crates/streamer-infra-arlo/src/events.rs' \
             --exclude-files 'crates/streamer-infra-arlo/src/stream_requester.rs' \

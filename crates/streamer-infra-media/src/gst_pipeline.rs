@@ -61,9 +61,8 @@
 //! `media-configure`. The cached bytes are also kept in per-camera
 //! state for a future `/admin/thumbnail/<cam>` endpoint.
 //!
-//! This file is excluded from coverage in CI — it requires a running
-//! GStreamer environment with `gst-rtsp-server` plugins, which is
-//! integration-test territory.
+//! Exercised by `tests/live_session.rs`: a real RTSP client watches
+//! the idle → live → idle splice and a client joining mid-session.
 
 #![allow(clippy::module_name_repetitions)]
 

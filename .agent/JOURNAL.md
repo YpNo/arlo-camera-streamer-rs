@@ -144,3 +144,18 @@ Why:      ICE failure or a bus error during setup reported nothing useful:
 Tests:    Five setup_or_loss tests on the paused clock (red first: the two
           loss cases hung until bounded), error mapping test.
 Open:     Not provoked live (needs an ICE failure, e.g. blocked UDP).
+
+## 2026-09-28 — skills refreshed; GStreamer integration tests; Cooling removed
+Changed:  .agents skills rewritten from the code (orchestrator, media, rust-core) +
+          new live-validation skill; splicing audit workflow fixed; arlo-rs
+          protocol-specialist gains the live-proven facts (branch
+          docs/skills-arlo-live-facts). tests/live_session.rs: FakeGateway
+          (second webrtcbin) + RtspProbe (mean luma) — idle→live→idle on one
+          client, mid-session join, stall → RtpStalled, hang-up → setup loss
+          (peer-disconnected at 14.7 s, libnice timer). CI installs runtime
+          plugins, STREAMER_REQUIRE_GST_IT=1. Cooling state removed.
+Why:      The GStreamer-bound files had no automated test; a recording cannot be
+          replayed (per-call DTLS), a local peer can. Cooling had no producer.
+Tests:    Integration suite 4/4, stable over 5 runs (~21 s).
+Open:     Cooldown on motionDetected:false needs a capture of how Arlo repeats
+          motionDetected during sustained motion.

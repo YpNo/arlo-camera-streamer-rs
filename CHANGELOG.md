@@ -50,6 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   battery-protect, failed) each new snapshot refreshes it at once; at the
   end of a session the refresh uses the cached snapshot and saves a cloud
   round-trip.
+- GStreamer integration tests (`streamer-infra-media/tests/live_session.rs`):
+  real live sessions through the production media stack against a local
+  `webrtcbin` gateway and an RTSP client, covering the idle → live → idle
+  splice on one connection, a client joining mid-session, a stalled
+  source and a call lost during setup. CI installs the runtime plugins
+  and requires them (`STREAMER_REQUIRE_GST_IT=1`). `RtspServer::bound_port`
+  reports the port of an ephemeral bind.
 - Capture aid for the Arlo bus: `RUST_LOG=streamer_infra_arlo::events=debug`
   logs unmapped camera events with their property keys (never values);
   `trace` logs every event the same way.

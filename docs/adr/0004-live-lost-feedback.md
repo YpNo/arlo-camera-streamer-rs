@@ -87,9 +87,12 @@ and needs no new port method or counter.
   first line and stops it on drop.
 - One extra tokio task per live session (the watchdog wakes once per
   timeout on a healthy source).
-- The GStreamer-side detectors cannot run on a workstation without
-  GStreamer; they are validated by CI and on the Frigate box. The stall
-  timeout is a config key rather than a constant for that reason.
+- The GStreamer-side detectors need GStreamer and a WebRTC peer. Since
+  2026-09-28 `streamer-infra-media/tests/live_session.rs` runs them
+  against a local `webrtcbin` gateway (stall → `rtp-stalled`, call lost
+  during setup → `peer-disconnected`); the Frigate box remains the
+  check against Arlo itself. The stall timeout is a config key so the
+  test can use the 4 s floor.
 
 ## Alternatives considered
 

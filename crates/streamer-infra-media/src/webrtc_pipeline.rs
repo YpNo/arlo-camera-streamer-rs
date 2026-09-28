@@ -39,9 +39,9 @@
 //!   may recover per the WebRTC state machine and is only logged; a
 //!   persistent one is caught by the watchdog).
 //!
-//! This file requires a live GStreamer + camera and is excluded from
-//! unit coverage (integration / manual-gate territory), mirroring
-//! `gst_pipeline.rs` / `rtsp.rs`.
+//! Exercised end to end by `tests/live_session.rs` against a local
+//! `webrtcbin` standing in for Arlo's gateway; behaviour specific to
+//! Arlo itself (TURN, SDP quirks) still needs the live gate.
 
 #![allow(clippy::module_name_repetitions)]
 

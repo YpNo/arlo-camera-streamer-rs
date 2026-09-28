@@ -6,8 +6,22 @@ description: GStreamer patterns for streamer-infra-media — webrtcbin against A
 
 Target: GStreamer 1.26 (Debian trixie, the `rust-build` distrobox and the image); keep
 1.22 working (Debian 12). `webrtc_pipeline.rs`, `gst_pipeline.rs` and `rtsp.rs` are
-excluded from unit coverage — put every decision that can be pure into `live_watch.rs`,
-`pipeline_desc.rs` or `splice.rs`, and validate the rest with the `live-validation` skill.
+exercised by `tests/live_session.rs` (a local `webrtcbin` gateway + an RTSP client) —
+put every decision that can be pure into `live_watch.rs`, `pipeline_desc.rs` or
+`splice.rs`, extend the integration test for behaviour a viewer can see, and validate
+Arlo-specific behaviour with the `live-validation` skill.
+
+## Integration test harness (`tests/live_session.rs`, `tests/support/`)
+
+- `FakeGateway` implements `WebrtcSignaler` with a second `webrtcbin`: non-bundled,
+  audio sendrecv, white `videotestsrc` → H.264 pt 103 through a `valve`
+  (`stall_video()` closes it); `hanging_up()` answers then drops the call.
+- `RtspProbe` plays the mount over TCP, decodes to GRAY8 and keeps the mean luma: idle is
+  black (< 80), live is white (> 180); `interrupted()` records any EOS or error.
+- Tests share the default GLib main context through `RtspServer`, so they hold a static
+  lock and run one at a time. `STREAMER_REQUIRE_GST_IT=1` turns a missing element into a
+  failure (CI); locally the tests skip without the plugins.
+- A recorded session cannot be replayed (DTLS keys are per call) — hence a live peer.
 
 ## webrtcbin against Arlo (FreeSWITCH, non-bundled)
 

@@ -306,14 +306,20 @@ cargo audit                                  # CVE scan (cargo-audit needed)
 cargo deny  check                            # license + duplicate scan
 ```
 
-GStreamer-dependent tests (`streamer-infra-media`) require system
-GStreamer; CI runs them on Linux runners with the plugin set installed.
+`streamer-infra-media/tests/live_session.rs` runs real live sessions
+through the production media stack with no camera: a second `webrtcbin`
+plays Arlo's gateway and an RTSP client checks what a viewer sees
+(idle → live → idle on one connection, a client joining mid-session, a
+stalled source, a call lost during setup). It needs the GStreamer
+runtime plugins (base, good, bad, ugly, libav, nice) and skips when one
+is missing; set `STREAMER_REQUIRE_GST_IT=1` to make that a failure, as
+CI does.
 
 ## CI/CD
 
 GitHub Actions workflows live in [`.github/workflows/`](./.github/workflows/).
 The `ci.yml` pipeline runs lint → typecheck → test → coverage gate
-(>84 %, the measured number on 2026-09-27; raised deliberately, never above what is held) → security scan on every PR.
+(86 %; raised deliberately, never above what is held) → security scan on every PR.
 
 ## Security
 

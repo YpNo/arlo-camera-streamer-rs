@@ -36,7 +36,8 @@ the zero-warning gates intact.
   them, build and test the other crates with `-p` and let CI cover the media
   crate.
 - Coverage is gated by tarpaulin at the number the project holds (86 % as of
-  2026-09-28, measured 88.3 %; GStreamer-bound files excluded), raised deliberately. New behavior
+  2026-09-28, measured 88.25 %; the binary and the Arlo network wrappers
+  excluded), raised deliberately. New behavior
   ships with tests; failure paths are tested, not only happy paths.
 - Test names follow `<unit>_<scenario>_<expectedOutcome>`.
 
