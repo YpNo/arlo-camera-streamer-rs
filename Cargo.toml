@@ -81,8 +81,8 @@ gstreamer-webrtc      = "0.25"
 gstreamer-sdp         = "0.25"
 
 # ---- Test ----
-mockall    = "0.14"
-rstest     = "0.26"
+mockall    = "0.15"
+rstest     = "0.27"
 tokio-test = "0.4"
 
 # Local development against an unreleased ../arlo-rs. Keep commented in git:
