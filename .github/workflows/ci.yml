@@ -129,11 +129,18 @@ jobs:
         with:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Install cargo-tarpaulin (binary release)
+      - name: Install cargo-tarpaulin (pinned binary release, checksum-verified)
+        # Bump both lines together; the digest is the one GitHub publishes
+        # for the release asset.
+        env:
+          TARPAULIN_VERSION: "0.37.5"
+          TARPAULIN_SHA256: edd214e46aedd1692bf8601f9754da5c6ade83da78f73d291f5dd611c940b590
         run: |
-          curl -s https://api.github.com/repos/xd009642/tarpaulin/releases/latest \
-            | grep browser_download_url | grep x86_64-unknown-linux-musl \
-            | cut -d '"' -f 4 | xargs curl -L | tar xz -C /usr/local/bin
+          curl -fsSL -o tarpaulin.tar.gz \
+            "https://github.com/xd009642/tarpaulin/releases/download/${TARPAULIN_VERSION}/cargo-tarpaulin-x86_64-unknown-linux-musl.tar.gz"
+          echo "${TARPAULIN_SHA256}  tarpaulin.tar.gz" | sha256sum --check --strict
+          tar xzf tarpaulin.tar.gz -C /usr/local/bin cargo-tarpaulin
+          rm tarpaulin.tar.gz
       - name: Run cargo-tarpaulin
         # Exclusions (files, not packages: `--exclude <pkg>` only stops a
         # package's tests from running while its lines still count, which
