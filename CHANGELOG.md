@@ -63,9 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Every motion / audio pulse is logged at `debug`, on the bus
-  (`camera trigger pulse`) and in the orchestrator (`trigger pulse` with
+  (`camera trigger pulse kind=motion`) and in the orchestrator (`trigger pulse` with
   its outcome and when the session will end), so a capture shows how a
-  long motion keeps a session alive.
+  long motion keeps a session alive. The `idle` report Arlo sends after
+  every motion snapshot is logged at `trace` while our session runs.
 - `CameraState::Live` no longer carries `since_secs`, which was never
   updated (logs showed `since_secs: 0` after minutes of live); the
   debouncer has always timed the session.

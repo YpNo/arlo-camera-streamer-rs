@@ -72,7 +72,7 @@ use chrono::{Local, NaiveDateTime};
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use streamer_domain::camera::CameraId;
 use streamer_domain::config::CameraConfig;
@@ -487,9 +487,13 @@ impl CameraOrchestrator {
 
     /// The camera went idle. Ends a known user view; otherwise (after a
     /// motion recording or our own session) there is nothing to do.
+    /// During our own session Arlo reports `idle` after every motion
+    /// snapshot, about every 10 s, so that case stays at `trace`.
     fn on_user_view_ended(&mut self) {
         if self.user_view_until.take().is_some() {
             info!("user view in the Arlo app ended; motion activations resumed");
+        } else if self.state == CameraState::Live {
+            trace!("camera idle report during our session (after a motion snapshot)");
         } else {
             debug!(state = ?self.state, "camera idle report without a known user view");
         }

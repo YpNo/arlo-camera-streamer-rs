@@ -122,17 +122,24 @@ fn observe_raw(event: &ArloEvent, mapped: Option<&CameraEvent>) {
         ?mapped,
         "arlo bus event"
     );
-    match mapped {
-        None if event.resource.starts_with("cameras/") => debug!(
+    if let Some(kind) = mapped.and_then(pulse_kind) {
+        debug!(resource = %event.resource, kind, "camera trigger pulse");
+    } else if mapped.is_none() && event.resource.starts_with("cameras/") {
+        debug!(
             resource = %event.resource,
             ?keys,
             ?activity,
             "unmapped camera event"
-        ),
-        Some(trigger @ (CameraEvent::Motion { .. } | CameraEvent::Audio { .. })) => {
-            debug!(resource = %event.resource, ?trigger, "camera trigger pulse");
-        }
-        _ => {}
+        );
+    }
+}
+
+/// Short label for a trigger pulse, `None` for every other event.
+const fn pulse_kind(event: &CameraEvent) -> Option<&'static str> {
+    match event {
+        CameraEvent::Motion { .. } => Some("motion"),
+        CameraEvent::Audio { .. } => Some("audio"),
+        _ => None,
     }
 }
 
@@ -147,6 +154,21 @@ const fn map_connection_state(state: &ArloConnectionState) -> ConnectionStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use streamer_domain::camera::CameraId;
+
+    #[test]
+    fn pulse_kind_labels_motion_and_audio_only() {
+        let cam = || CameraId::new("CAM");
+        assert_eq!(
+            pulse_kind(&CameraEvent::Motion { device_id: cam() }),
+            Some("motion")
+        );
+        assert_eq!(
+            pulse_kind(&CameraEvent::Audio { device_id: cam() }),
+            Some("audio")
+        );
+        assert_eq!(pulse_kind(&CameraEvent::Online { device_id: cam() }), None);
+    }
 
     #[test]
     fn observe_raw_handles_mapped_and_unmapped_events_without_panicking() {
