@@ -43,6 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   block with a suggested stream name for each unconfigured device. It
   starts no server and completes the MFA pairing for the daemon. `run`
   is the default subcommand, so existing invocations are unchanged.
+- The idle still follows Arlo's snapshots: a `presignedLastImageUrl`
+  announced on the event bus is cached (in memory, never logged, https
+  only, trusted 10 minutes) and used by the thumbnail fetch before the
+  device-list query. While the idle image is on screen (idle,
+  battery-protect, failed) each new snapshot refreshes it at once; at the
+  end of a session the refresh uses the cached snapshot and saves a cloud
+  round-trip.
 - Capture aid for the Arlo bus: `RUST_LOG=streamer_infra_arlo::events=debug`
   logs unmapped camera events with their property keys (never values);
   `trace` logs every event the same way.

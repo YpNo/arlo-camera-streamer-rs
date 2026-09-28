@@ -12,6 +12,7 @@
 //! | [`CameraEvent::ManualStreamEnded`] | `cameras/{device_id}` | `activityState == "idle"`            |
 //! | [`CameraEvent::Online`] | `cameras/{device_id}`   | `connectionState == "available"`              |
 //! | [`CameraEvent::Offline`]| `cameras/{device_id}`   | `connectionState == "unavailable"`            |
+//! | [`CameraEvent::SnapshotAvailable`] | `cameras/{device_id}` | `presignedLastImageUrl` is a non-empty string |
 //!
 //! Precedence is the table order: a payload carrying both a motion
 //! flag and an activity state is the motion recording starting, and the
@@ -36,6 +37,7 @@ const CAMERAS_PREFIX: &str = "cameras/";
 const ACTIVITY_STATE: &str = "activityState";
 const USER_STREAM_ACTIVE: &str = "userStreamActive";
 const ACTIVITY_IDLE: &str = "idle";
+const PRESIGNED_LAST_IMAGE_URL: &str = "presignedLastImageUrl";
 
 /// Translate an [`ArloEvent`] to a domain [`CameraEvent`], returning
 /// [`None`] when the event is uninteresting or malformed.
@@ -68,7 +70,26 @@ pub fn map_event(event: &ArloEvent) -> Option<CameraEvent> {
             _ => None,
         };
     }
+    if snapshot_url(event).is_some() {
+        return Some(CameraEvent::SnapshotAvailable {
+            device_id: CameraId::new(device_id),
+        });
+    }
     None
+}
+
+/// `(device_id, url)` when the event announces a new snapshot of a
+/// camera. The URL is a presigned credential: callers must not log it.
+#[must_use]
+pub fn snapshot_url(event: &ArloEvent) -> Option<(&str, &str)> {
+    let device_id = extract_device_id(&event.resource)?;
+    let url = event
+        .properties
+        .as_ref()?
+        .get(PRESIGNED_LAST_IMAGE_URL)
+        .and_then(Value::as_str)
+        .filter(|u| !u.is_empty())?;
+    Some((device_id, url))
 }
 
 fn map_activity_state(device_id: &str, props: &Value) -> Option<CameraEvent> {
@@ -248,6 +269,61 @@ mod tests {
         );
         assert_eq!(activity_state(Some(&json!({ "activityState": 7 }))), None);
         assert_eq!(activity_state(None), None);
+    }
+
+    // ---------- Snapshot ----------
+
+    #[test]
+    fn maps_presigned_last_image_url_to_snapshot_available() {
+        let event = ev(
+            "cameras/CAM5",
+            Some(json!({ "presignedLastImageUrl": "https://s3.example/x.jpg" })),
+        );
+        assert_eq!(
+            map_event(&event),
+            Some(CameraEvent::SnapshotAvailable {
+                device_id: CameraId::new("CAM5")
+            })
+        );
+        assert_eq!(
+            snapshot_url(&event),
+            Some(("CAM5", "https://s3.example/x.jpg"))
+        );
+    }
+
+    #[rstest]
+    #[case(json!({ "presignedLastImageUrl": "" }))]
+    #[case(json!({ "presignedLastImageUrl": 7 }))]
+    #[case(json!({ "batteryLevel": 80 }))]
+    fn ignores_missing_or_malformed_snapshot_url(#[case] props: Value) {
+        let event = ev("cameras/CAM5", Some(props));
+        assert_eq!(snapshot_url(&event), None);
+        assert!(map_event(&event).is_none());
+    }
+
+    #[test]
+    fn snapshot_url_outside_a_camera_resource_is_ignored() {
+        let event = ev(
+            "mediaUploadNotification",
+            Some(json!({ "presignedLastImageUrl": "https://s3.example/x.jpg" })),
+        );
+        assert_eq!(snapshot_url(&event), None);
+    }
+
+    #[test]
+    fn motion_takes_precedence_over_a_snapshot_url() {
+        let event = ev(
+            "cameras/CAM5",
+            Some(
+                json!({ "motionDetected": true, "presignedLastImageUrl": "https://s3.example/x.jpg" }),
+            ),
+        );
+        assert!(matches!(
+            map_event(&event),
+            Some(CameraEvent::Motion { .. })
+        ));
+        // The URL is still recorded by the adapter.
+        assert!(snapshot_url(&event).is_some());
     }
 
     // ---------- Connection state ----------

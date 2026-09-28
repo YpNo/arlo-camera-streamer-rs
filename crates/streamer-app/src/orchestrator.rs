@@ -407,6 +407,10 @@ impl CameraOrchestrator {
                 self.on_user_view_ended();
                 return Ok(());
             }
+            CameraEvent::SnapshotAvailable { .. } => {
+                self.on_snapshot_available().await;
+                return Ok(());
+            }
             CameraEvent::Online { .. } => {
                 debug!("camera online");
                 return Ok(());
@@ -443,6 +447,22 @@ impl CameraOrchestrator {
         self.metrics
             .record_motion(&self.camera_id, classify_motion(&self.state, &signal));
         Some(signal)
+    }
+
+    /// Arlo took a fresh snapshot. Refresh the idle still now only when it
+    /// is what clients see (idle, battery-protect, failed); during a
+    /// session the end-of-session refresh picks the same snapshot up from
+    /// the adapter's cache.
+    async fn on_snapshot_available(&self) {
+        if matches!(
+            self.state,
+            CameraState::Idle | CameraState::BatteryProtect { .. } | CameraState::Failed { .. }
+        ) {
+            debug!("new snapshot; refreshing the idle still");
+            self.refresh_idle_thumbnail().await;
+        } else {
+            debug!(state = ?self.state, "new snapshot during a session; refreshed when it ends");
+        }
     }
 
     fn user_view_active(&self) -> bool {
@@ -1233,6 +1253,85 @@ mod tests {
             signal_label(&StateTransition::LiveLost(LiveLossReason::RtpStalled)),
             "live-lost-rtp-stalled"
         );
+    }
+
+    // ---------- Snapshots → idle still ----------
+
+    /// Thumbnail source that always has an image and counts its calls.
+    #[derive(Default)]
+    struct CountingThumbnails {
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl CountingThumbnails {
+        fn count(&self) -> u32 {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl ArloThumbnailSource for CountingThumbnails {
+        async fn last_thumbnail(&self, _camera: &CameraId) -> Result<Option<Bytes>, DomainError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(Bytes::from_static(b"jpeg")))
+        }
+    }
+
+    fn snapshot() -> CameraEvent {
+        CameraEvent::SnapshotAvailable {
+            device_id: CameraId::new("CAM"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_refreshes_the_idle_still_only_when_it_is_visible() {
+        let cfg = camera_cfg(2, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let thumbs = Arc::new(CountingThumbnails::default());
+        let (tx, rx) = mpsc::channel(32);
+        let token = CancellationToken::new();
+        let orch = CameraOrchestrator::new_minimal(
+            &cfg,
+            sr,
+            thumbs.clone(),
+            media.clone(),
+            rx,
+            token.clone(),
+        )
+        .unwrap();
+        let handle = tokio::spawn(orch.run());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(thumbs.count(), 1, "startup primes the idle still");
+
+        // Idle: a new snapshot refreshes the still at once.
+        send(&tx, snapshot()).await;
+        assert_eq!(thumbs.count(), 2);
+        assert_eq!(
+            media
+                .calls()
+                .await
+                .iter()
+                .filter(|c| **c == MediaCall::RefreshThumbnail)
+                .count(),
+            2
+        );
+
+        // Live: skipped, the session end refreshes instead.
+        send(&tx, motion()).await;
+        send(&tx, snapshot()).await;
+        assert_eq!(
+            thumbs.count(),
+            2,
+            "no refresh while the live video is on screen"
+        );
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(thumbs.count(), 3, "the session end refreshes the still");
+
+        token.cancel();
+        handle.await.unwrap();
     }
 
     // ---------- User views in the Arlo app (ADR 0005) ----------

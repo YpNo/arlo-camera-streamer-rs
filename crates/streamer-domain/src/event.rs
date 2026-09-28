@@ -36,6 +36,13 @@ pub enum CameraEvent {
         /// Camera that went idle.
         device_id: CameraId,
     },
+    /// Arlo published a fresh snapshot of the camera (after motion or on
+    /// request). The adapter keeps the snapshot's location; the
+    /// application only decides whether to refresh the idle still now.
+    SnapshotAvailable {
+        /// Camera the snapshot shows.
+        device_id: CameraId,
+    },
     /// Device transitioned to online / reachable.
     Online {
         /// Camera whose connectivity changed.
@@ -56,6 +63,7 @@ impl CameraEvent {
             | Self::Audio { device_id }
             | Self::ManualStream { device_id }
             | Self::ManualStreamEnded { device_id }
+            | Self::SnapshotAvailable { device_id }
             | Self::Online { device_id }
             | Self::Offline { device_id } => device_id,
         }
@@ -91,6 +99,9 @@ mod tests {
                 device_id: id.clone(),
             },
             CameraEvent::ManualStreamEnded {
+                device_id: id.clone(),
+            },
+            CameraEvent::SnapshotAvailable {
                 device_id: id.clone(),
             },
             CameraEvent::Online {

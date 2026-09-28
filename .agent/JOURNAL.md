@@ -110,3 +110,15 @@ Tests:    Owner's VLC run: session attached to an existing media; VLC closed
           "media built during a live session; live switch armed", live video
           shown. Connect-after-motion uses the same hook path.
 Open:     Optional: idle thumbnail from the bus `presignedLastImageUrl`.
+
+## 2026-09-28 — idle still from bus snapshots
+Changed:  CameraEvent::SnapshotAvailable (URL-free); infra-arlo
+          snapshot_cache.rs (per-camera presigned URL, https only, 10 min,
+          redacted Debug); mapper `snapshot_url`; events adapter records;
+          thumbnail adapter uses the cached URL first, forgets it on
+          failure, falls back to the device list; orchestrator refreshes
+          on SnapshotAvailable only in Idle/BatteryProtect/Failed.
+Why:      Newer idle image (motion snapshot), fewer get_devices calls, and
+          a still that stays current while motion is suppressed.
+Tests:    Workspace 361 green; clippy/doc clean. Live check pending.
+Open:     Live check (snapshot line + refreshed still while idle).

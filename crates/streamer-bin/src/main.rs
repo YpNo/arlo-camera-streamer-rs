@@ -58,7 +58,7 @@ use streamer_domain::port::{
 };
 use streamer_infra_arlo::{
     ArloEventSourceAdapter, ArloThumbnailSourceAdapter, ArloWebrtcSignalerAdapter, DeviceRegistry,
-    boot::boot,
+    SnapshotUrlCache, boot::boot,
 };
 use streamer_infra_media::{GstMediaMultiplexer, GstPipelineRegistry, RtspServer};
 use streamer_infra_ops::{AdminServer, Metrics, OpsServer, Readiness};
@@ -167,14 +167,22 @@ async fn run(config: StreamerConfig) -> Result<()> {
     // One shared device cache: stream requests resolve CameraId → Device
     // through it instead of hitting get_devices() on every live request.
     let device_registry = Arc::new(DeviceRegistry::new(arlo_client.clone()));
-    let event_source: Arc<dyn ArloEventSource> =
-        Arc::new(ArloEventSourceAdapter::new(arlo_client.clone()));
+    // Snapshot URLs announced on the bus, shared by the event adapter
+    // (writer) and the thumbnail adapter (reader).
+    let snapshots = Arc::new(SnapshotUrlCache::default());
+    let event_source: Arc<dyn ArloEventSource> = Arc::new(ArloEventSourceAdapter::new(
+        arlo_client.clone(),
+        snapshots.clone(),
+    ));
     let signaler: Arc<dyn WebrtcSignaler> = Arc::new(ArloWebrtcSignalerAdapter::new(
         arlo_client.clone(),
         device_registry,
     ));
-    let thumbnails: Arc<dyn ArloThumbnailSource> =
-        Arc::new(ArloThumbnailSourceAdapter::new(arlo_client, http));
+    let thumbnails: Arc<dyn ArloThumbnailSource> = Arc::new(ArloThumbnailSourceAdapter::new(
+        arlo_client,
+        http,
+        snapshots,
+    ));
 
     // -- Media adapter --
     let rtsp_server =

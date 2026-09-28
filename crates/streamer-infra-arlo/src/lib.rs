@@ -11,6 +11,7 @@
 //! - [`discovery`] — streamable devices on the account (`list-devices` CLI)
 //! - [`event_mapper`] — pure `arlo_rs::ArloEvent` → domain `CameraEvent`
 //! - [`events`] — [`ArloEventSource`](streamer_domain::port::ArloEventSource) impl
+//! - [`snapshot_cache`] — latest snapshot URL per camera, filled from the bus
 //! - [`stream_requester`] — [`WebrtcSignaler`](streamer_domain::port::WebrtcSignaler) impl
 //! - [`thumbnails`] — [`ArloThumbnailSource`](streamer_domain::port::ArloThumbnailSource) impl
 //! - [`error`] — `ArloError` → `DomainError` translation
@@ -23,6 +24,7 @@ pub mod discovery;
 pub mod error;
 pub mod event_mapper;
 pub mod events;
+pub mod snapshot_cache;
 pub mod stream_requester;
 pub mod thumbnails;
 
@@ -30,5 +32,6 @@ pub use boot::boot;
 pub use device_registry::DeviceRegistry;
 pub use discovery::discover_devices;
 pub use events::ArloEventSourceAdapter;
+pub use snapshot_cache::SnapshotUrlCache;
 pub use stream_requester::ArloWebrtcSignalerAdapter;
 pub use thumbnails::ArloThumbnailSourceAdapter;

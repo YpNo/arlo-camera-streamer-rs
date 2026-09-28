@@ -31,6 +31,7 @@
 //! [`ArloEvent`]: arlo_rs::models::events::ArloEvent
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use arlo_rs::client::ArloClient;
 use arlo_rs::events::ConnectionState as ArloConnectionState;
@@ -45,21 +46,25 @@ use streamer_domain::event::{CameraEvent, ConnectionStatus};
 use streamer_domain::port::ArloEventSource;
 
 use crate::error::arlo_to_domain;
-use crate::event_mapper::{activity_state, map_event, property_keys};
+use crate::event_mapper::{activity_state, map_event, property_keys, snapshot_url};
+use crate::snapshot_cache::SnapshotUrlCache;
 
 /// Adapter that exposes the arlo-rs MQTT event bus as the domain
 /// [`ArloEventSource`] port.
 pub struct ArloEventSourceAdapter {
     client: Arc<ArloClient>,
+    snapshots: Arc<SnapshotUrlCache>,
 }
 
 impl ArloEventSourceAdapter {
     /// Construct from a shared [`ArloClient`] handle. The client must
     /// already be authenticated; the adapter does not boot the bus by
-    /// itself — `events()` does that on first use.
+    /// itself — `events()` does that on first use. Snapshot URLs seen on
+    /// the bus are recorded in `snapshots`, shared with the thumbnail
+    /// adapter.
     #[must_use]
-    pub fn new(client: Arc<ArloClient>) -> Self {
-        Self { client }
+    pub fn new(client: Arc<ArloClient>, snapshots: Arc<SnapshotUrlCache>) -> Self {
+        Self { client, snapshots }
     }
 }
 
@@ -68,18 +73,16 @@ impl ArloEventSource for ArloEventSourceAdapter {
     async fn subscribe(&self) -> Result<BoxStream<'static, CameraEvent>, DomainError> {
         let bus = self.client.events().await.map_err(arlo_to_domain)?;
         let rx = bus.subscribe();
-        let stream = BroadcastStream::new(rx).filter_map(|item| async move {
-            match item {
-                Ok(event) => {
-                    let mapped = map_event(&event);
-                    observe_raw(&event, mapped.as_ref());
-                    mapped
-                }
+        let snapshots = self.snapshots.clone();
+        let stream = BroadcastStream::new(rx).filter_map(move |item| {
+            let mapped = match item {
+                Ok(event) => translate(&event, &snapshots),
                 Err(err) => {
                     warn!(error = %err, "arlo event bus lagged; skipping");
                     None
                 }
-            }
+            };
+            futures::future::ready(mapped)
         });
         Ok(Box::pin(stream))
     }
@@ -90,6 +93,18 @@ impl ArloEventSource for ArloEventSourceAdapter {
         let stream = WatchStream::new(rx).map(|state| map_connection_state(&state));
         Ok(Box::pin(stream))
     }
+}
+
+/// Map one bus event, recording its snapshot URL (if any) on the way.
+fn translate(event: &ArloEvent, snapshots: &SnapshotUrlCache) -> Option<CameraEvent> {
+    if let Some((device_id, url)) = snapshot_url(event)
+        && !snapshots.record(device_id, url, Instant::now())
+    {
+        debug!(%device_id, "snapshot URL rejected (not https)");
+    }
+    let mapped = map_event(event);
+    observe_raw(event, mapped.as_ref());
+    mapped
 }
 
 /// Redacted diagnostics for the capture workflow (module docs): never

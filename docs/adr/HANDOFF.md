@@ -127,7 +127,10 @@ Order agreed with the user; items 1–5 are done.
    without backoff. arlo-rs branch `feat/stream-peek-probe` carries the
    probe, the `data.error` envelope fix and the `mediaUploadNotification`
    decode fix; released as 0.2.1 and adopted 2026-09-28 (message-text fallback removed). `mediaUploadNotification` carries
-   a fresh `presignedLastImageUrl` usable for idle thumbnails.
+   a fresh `presignedLastImageUrl` (top-level, not kept by arlo-rs's
+   `ArloEvent`); the idle still instead follows the `cameras/<id>`
+   `presignedLastImageUrl` property event (done 2026-09-28,
+   `snapshot_cache.rs`).
 5. **`list-devices` CLI subcommand** — done 2026-09-28. `streamer-bin/src/list_devices.rs`
    (pure rendering, tested) on top of `streamer_infra_arlo::discover_devices`
    and `StreamName::suggest`. Shares the daemon's session cache, never logs
