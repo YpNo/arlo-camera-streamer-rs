@@ -22,16 +22,16 @@ pub enum CameraEvent {
         device_id: CameraId,
     },
     /// The user opened a live view in the Arlo app
-    /// (`activityState == "userStreamActive"`). The camera is awake on
-    /// the user's account, so the daemon may piggy-back its own WebRTC
-    /// leg without charging the daily budget (ADR 0005).
+    /// (`activityState == "userStreamActive"`). Observed only: Arlo
+    /// refuses a second transport while the app streams, so motion
+    /// activations pause until the view ends (ADR 0005).
     ManualStream {
         /// Camera the user is watching.
         device_id: CameraId,
     },
     /// The camera reported `activityState == "idle"`. Also arrives after
     /// motion recordings and after the daemon's own sessions; the
-    /// orchestrator acts on it only while a piggy-backed session is live.
+    /// orchestrator only uses it to end a known user view.
     ManualStreamEnded {
         /// Camera that went idle.
         device_id: CameraId,

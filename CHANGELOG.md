@@ -31,13 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `webrtc.live_stall_timeout_secs` (default 10) instead of waiting for
   the debounce or the continuous-live cap. The reason is visible as the
   `live-lost-<reason>` signal on the state-transition metric.
-- Manual-stream piggy-back (ADR 0005): when the user opens a live view in
-  the Arlo app (`activityState == "userStreamActive"`), the daemon
-  attaches its own WebRTC leg and splices it into the RTSP output. The
-  session is not charged to the daily budget, has no debounce window
-  (only `max_continuous_live`), works even in battery-protect, and ends
-  on the camera's `idle` report, the live-loss watchdog or the cap. The
-  admin camera snapshot gains an optional `trigger` (`motion` / `manual`).
+- User views in the Arlo app are observed (ADR 0005): while the camera
+  reports `activityState == "userStreamActive"`, motion does not start a
+  session (Arlo would refuse it) and is counted as `suppressed-user-view`;
+  a session already running continues. An attach refused with Arlo error
+  14001 returns to idle as `camera-busy` instead of failing into backoff.
+  The admin camera snapshot gains `user_view`.
 - Capture aid for the Arlo bus: `RUST_LOG=streamer_infra_arlo::events=debug`
   logs unmapped camera events with their property keys (never values);
   `trace` logs every event the same way.

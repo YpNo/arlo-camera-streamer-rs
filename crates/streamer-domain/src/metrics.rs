@@ -19,6 +19,9 @@ pub enum MotionOutcome {
     /// Event arrived in a transient failed state — ignored until
     /// backoff elapses.
     SuppressedFailed,
+    /// Event arrived while the user watches the camera in the Arlo app;
+    /// Arlo would refuse our session, so none is started (ADR 0005).
+    SuppressedUserView,
 }
 
 impl MotionOutcome {
@@ -32,6 +35,7 @@ impl MotionOutcome {
             Self::BudgetExhausted => "budget-exhausted",
             Self::Absorbed => "absorbed",
             Self::SuppressedFailed => "suppressed-failed",
+            Self::SuppressedUserView => "suppressed-user-view",
         }
     }
 }
@@ -98,6 +102,10 @@ mod tests {
         assert_eq!(
             MotionOutcome::SuppressedFailed.as_label(),
             "suppressed-failed"
+        );
+        assert_eq!(
+            MotionOutcome::SuppressedUserView.as_label(),
+            "suppressed-user-view"
         );
     }
 

@@ -61,3 +61,21 @@ Open:     LIVE CAPTURE of the ADR 0005 checklist from the phone (debug target
           streamer_infra_arlo::events). If key/value differ, edit the three
           constants in event_mapper.rs. Item 5 list-devices remains. Deferred
           wiring gap (no client at wake) still open.
+
+## 2026-09-28 — ADR 0005 revised: observe user views, never compete
+Changed:  Removed the piggy-back session (LiveTrigger, debouncer Held state,
+          manual transitions, echo guard, BatteryProtect activation). Added
+          user_view_until flag (120 s hold), MotionOutcome::SuppressedUserView,
+          DomainError::CameraBusy (Arlo 14001, both message and structured
+          forms), StateTransition::CameraBusy (Activating → Idle, no backoff),
+          snapshot `user_view`. arlo-rs branch feat/stream-peek-probe:
+          event-driven probe with a 3-variant manifest test, `data.error`
+          kept structured, events without `action` decoded.
+Why:      Captures: our leg refused while the app streams (14001); the
+          watch-along DASH URL answers 502 from Arlo's ALB for every client
+          identity; `get` on idle cameras wakes them. Owner: one session only.
+Tests:    Workspace 330 green in the container (app 110, domain 43,
+          infra-arlo 55, media 84, ops 38); clippy/doc clean. arlo-rs 342.
+Open:     arlo-rs branch to merge + release 0.2.1, then bump the streamer and
+          drop the 14001 message fallback. Item 5 list-devices. Deferred
+          wiring gap (session with no RTSP client).

@@ -9,21 +9,18 @@
 //!
 //! ## Transition matrix (Phase 1 v0.1)
 //!
-//! | From / Signal      | Motion | LiveAttached | LiveReady | CooldownExpired | MaxLiveExceeded | BudgetExhausted | BudgetReset | Failure | BackoffElapsed | LiveLost  | ManualStreamDetected | ManualStreamEnded |
-//! |--------------------|--------|--------------|-----------|-----------------|-----------------|-----------------|-------------|---------|----------------|-----------|----------------------|-------------------|
-//! | Idle               | Activ. | (ignored)    | (ignored) | (ignored)       | (ignored)       | BatteryProtect  | Idle        | Failed  | (ignored)      | (ignored) | Activ.               | (ignored)         |
-//! | Activating         | Activ. | Live         | Activ.    | (ignored)       | (ignored)       | BatteryProtect  | Activ.      | Failed  | (ignored)      | (ignored) | (ignored)            | (ignored)         |
-//! | Live               | Live   | Live         | Live      | Idle            | Idle            | BatteryProtect  | Live        | Failed  | (ignored)      | Idle      | (ignored)            | Idle              |
-//! | Cooling (reserved) | Live   | (ignored)    | (ignored) | Idle            | Idle            | BatteryProtect  | Cooling     | Failed  | (ignored)      | Idle      | (ignored)            | Idle              |
-//! | BatteryProtect     | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | Idle        | Failed  | (ignored)      | (ignored) | Activ.               | (ignored)         |
-//! | Failed             | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | (ign.)      | Failed+ | Idle           | (ignored) | (ignored)            | (ignored)         |
+//! | From / Signal      | Motion | LiveAttached | LiveReady | CooldownExpired | MaxLiveExceeded | BudgetExhausted | BudgetReset | Failure | BackoffElapsed | LiveLost  | CameraBusy |
+//! |--------------------|--------|--------------|-----------|-----------------|-----------------|-----------------|-------------|---------|----------------|-----------|------------|
+//! | Idle               | Activ. | (ignored)    | (ignored) | (ignored)       | (ignored)       | BatteryProtect  | Idle        | Failed  | (ignored)      | (ignored) | (ignored)  |
+//! | Activating         | Activ. | Live         | Activ.    | (ignored)       | (ignored)       | BatteryProtect  | Activ.      | Failed  | (ignored)      | (ignored) | Idle       |
+//! | Live               | Live   | Live         | Live      | Idle            | Idle            | BatteryProtect  | Live        | Failed  | (ignored)      | Idle      | (ignored)  |
+//! | Cooling (reserved) | Live   | (ignored)    | (ignored) | Idle            | Idle            | BatteryProtect  | Cooling     | Failed  | (ignored)      | Idle      | (ignored)  |
+//! | BatteryProtect     | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | Idle        | Failed  | (ignored)      | (ignored) | (ignored)  |
+//! | Failed             | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | (ign.)      | Failed+ | Idle           | (ignored) | (ignored)  |
 //!
-//! `ManualStreamDetected` / `ManualStreamEnded` (ADR 0005) are the user's
-//! live view in the Arlo app. Piggy-backing on it costs the camera
-//! nothing, so it activates even from `BatteryProtect`; the orchestrator
-//! emits `ManualStreamEnded` only while the live session is a manual one
-//! (it holds the trigger), and re-checks the budget on the way back to
-//! `Idle` so a piggy-back started in `BatteryProtect` returns there.
+//! `CameraBusy` (ADR 0005) is an attach refused because the user is
+//! watching the camera in the Arlo app. It returns to `Idle` without the
+//! `Failed` backoff: nothing is broken, the camera is simply taken.
 //!
 //! `LiveLost` (ADR 0004) is the media adapter reporting a dead live
 //! source. It is a plain return to `Idle`, not a `Failure`: the source
@@ -66,39 +63,33 @@ pub fn transition(state: &CameraState, signal: &StateTransition) -> CameraState 
 
     match (state, signal) {
         // ---------- From Idle ----------
-        (S::Idle, T::MotionDetected | T::ManualStreamDetected) => S::Activating,
+        (S::Idle, T::MotionDetected) => S::Activating,
         (S::Idle, T::BudgetExhausted) => battery_protect(),
         (S::Idle, T::Failure(reason)) => fresh_failed(reason),
         (S::Idle, _) => S::Idle,
 
         // ---------- From Activating ----------
         (S::Activating, T::LiveAttached) => S::Live { since_secs: 0 },
+        (S::Activating, T::CameraBusy) => S::Idle,
         (S::Activating, T::Failure(reason)) => fresh_failed(reason),
         (S::Activating, T::BudgetExhausted) => battery_protect(),
         (S::Activating, _) => S::Activating,
 
         // ---------- From Live ----------
-        (
-            S::Live { .. },
-            T::CooldownExpired | T::MaxLiveExceeded | T::LiveLost(_) | T::ManualStreamEnded,
-        ) => S::Idle,
+        (S::Live { .. }, T::CooldownExpired | T::MaxLiveExceeded | T::LiveLost(_)) => S::Idle,
         (S::Live { .. }, T::BudgetExhausted) => battery_protect(),
         (S::Live { .. }, T::Failure(reason)) => fresh_failed(reason),
         (S::Live { .. }, _) => state.clone(),
 
         // ---------- From Cooling (reserved) ----------
         (S::Cooling { .. }, T::MotionDetected) => S::Live { since_secs: 0 },
-        (
-            S::Cooling { .. },
-            T::CooldownExpired | T::MaxLiveExceeded | T::LiveLost(_) | T::ManualStreamEnded,
-        ) => S::Idle,
+        (S::Cooling { .. }, T::CooldownExpired | T::MaxLiveExceeded | T::LiveLost(_)) => S::Idle,
         (S::Cooling { .. }, T::BudgetExhausted) => battery_protect(),
         (S::Cooling { .. }, T::Failure(reason)) => fresh_failed(reason),
         (S::Cooling { .. }, _) => state.clone(),
 
         // ---------- From BatteryProtect ----------
         (S::BatteryProtect { .. }, T::BudgetReset) => S::Idle,
-        (S::BatteryProtect { .. }, T::ManualStreamDetected) => S::Activating,
         (S::BatteryProtect { .. }, T::Failure(reason)) => fresh_failed(reason),
         (S::BatteryProtect { .. }, _) => state.clone(),
 
@@ -340,52 +331,24 @@ mod tests {
         );
     }
 
-    // ---------- Manual stream (ADR 0005) ----------
+    // ---------- CameraBusy (ADR 0005) ----------
 
-    #[rstest]
-    #[case(CameraState::Idle)]
-    #[case(battery())]
-    fn manual_stream_detected_activates_from_idle_and_battery_protect(#[case] state: CameraState) {
+    #[test]
+    fn activating_camera_busy_returns_idle_without_failure() {
         assert_eq!(
-            transition(&state, &StateTransition::ManualStreamDetected),
-            CameraState::Activating
-        );
-    }
-
-    #[rstest]
-    #[case(CameraState::Activating)]
-    #[case(live(3))]
-    #[case(cooling(3))]
-    #[case(failed(1))]
-    fn manual_stream_detected_is_ignored_while_a_session_exists_or_failed(
-        #[case] state: CameraState,
-    ) {
-        assert_eq!(
-            transition(&state, &StateTransition::ManualStreamDetected),
-            state
-        );
-    }
-
-    #[rstest]
-    #[case(live(3))]
-    #[case(cooling(3))]
-    fn manual_stream_ended_returns_live_and_cooling_to_idle(#[case] state: CameraState) {
-        assert_eq!(
-            transition(&state, &StateTransition::ManualStreamEnded),
+            transition(&CameraState::Activating, &StateTransition::CameraBusy),
             CameraState::Idle
         );
     }
 
     #[rstest]
     #[case(CameraState::Idle)]
-    #[case(CameraState::Activating)]
+    #[case(live(3))]
+    #[case(cooling(3))]
     #[case(battery())]
     #[case(failed(1))]
-    fn manual_stream_ended_is_ignored_elsewhere(#[case] state: CameraState) {
-        assert_eq!(
-            transition(&state, &StateTransition::ManualStreamEnded),
-            state
-        );
+    fn camera_busy_is_ignored_outside_activating(#[case] state: CameraState) {
+        assert_eq!(transition(&state, &StateTransition::CameraBusy), state);
     }
 
     // ---------- BatteryProtect ----------

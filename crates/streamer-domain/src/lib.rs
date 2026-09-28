@@ -46,7 +46,7 @@ pub use port::{
     AdminControl, ArloEventSource, ArloThumbnailSource, MediaMultiplexer, MetricsRecorder,
     WebrtcSignaler,
 };
-pub use state::{CameraState, LiveLossReason, LiveTrigger, StateTransition};
+pub use state::{CameraState, LiveLossReason, StateTransition};
 pub use stream::{
     Codec, IceAddressFamily, IceServer, LiveLossNotifier, LiveSession, SignalingAnswer,
 };

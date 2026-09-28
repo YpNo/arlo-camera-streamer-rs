@@ -65,11 +65,11 @@ pub struct CameraSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub last_failure: Option<String>,
-    /// Why the current session exists (`"motion"` / `"manual"`) while
-    /// activating, live or cooling; omitted otherwise (ADR 0005).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub trigger: Option<String>,
+    /// `true` while the user is watching the camera in the Arlo app;
+    /// motion activations are paused meanwhile (ADR 0005). Omitted when
+    /// `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user_view: bool,
     /// Number of retries since the last successful attach.
     pub retries: u32,
 }
@@ -102,7 +102,7 @@ mod tests {
             cooling_remaining: Some(Duration::from_secs(15)),
             last_failure: None,
             retries: 0,
-            trigger: None,
+            user_view: false,
         };
         let s = serde_json::to_string(&snap).unwrap();
         let back: CameraSnapshot = serde_json::from_str(&s).unwrap();
@@ -120,7 +120,7 @@ mod tests {
             cooling_remaining: None,
             last_failure: None,
             retries: 0,
-            trigger: None,
+            user_view: false,
         };
         let s = serde_json::to_string(&snap).unwrap();
         assert!(!s.contains("cooling_remaining"));

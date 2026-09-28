@@ -100,7 +100,7 @@ commits. Phase 9 is this session's work.
 
 ## 4. Agreed plan (2026-09-27) and where we are
 
-Order agreed with the user; items 1–4 are done (4 pending its live capture), 5 remains.
+Order agreed with the user; items 1–4 are done, 5 remains.
 
 1. **Unblock CI** — done (toolchain, crates.io dep, image deps, no
    `-A dead_code`). **Open the PR `feat/init-v1` → `main`**: GitHub Actions
@@ -116,26 +116,19 @@ Order agreed with the user; items 1–4 are done (4 pending its live capture), 5
    until CI / the Frigate box runs it (see ADR §Consequences). Follow-up:
    race the first-RTP wait against an early loss so an attach that dies
    during ICE fails with the real reason instead of the 20 s timeout.
-4. **Two event contexts, two domain events** — built 2026-09-27 (ADR 0005),
-   **captured 2026-09-27: event side confirmed, media side refuted** —
-   Arlo refuses our WebRTC leg (error 14001 "RTSP Streaming in progress,
-   SIP Streaming is not allowed") while the app streams over RTSP. Next:
-   ADR 0006. Second capture (2026-09-28): during a user view,
-   `get_stream_url` returns a **`watchalong=true` MPEG-DASH** URL
-   (`https://weblivestream-…:80/…/*.mpd`) joining the user's session;
-   on idle cameras the same call wakes them (never poll it). Next: a
-   playback test of the watch-along URL with `gst-discoverer-1.0`, then
-   ADR 0006 — a DASH live-source kind in the media adapter. `CameraEvent::ManualStream` / `ManualStreamEnded`
-   from `activityState == "userStreamActive"` / `"idle"`; `LiveTrigger`
-   field on the orchestrator; manual sessions: no debounce (debouncer
-   `Held`), cap only, budget never charged, motion absorbed, activation
-   allowed from `BatteryProtect` with a return there afterwards; 5 s echo
-   guard after our own exits. **Run the ADR 0005 checklist from the phone**
-   with `RUST_LOG=info,streamer_infra_arlo::events=debug`: if the key or
-   value differs, the mapper constants in `event_mapper.rs` are the only
-   change. Follow-up if the capture shows our own leg echoes
-   `userStreamActive`: keep or tune the guard; if `idle` never arrives while
-   our leg is attached, consider a shorter cap for manual sessions.
+4. **Two event contexts** — done 2026-09-28 (ADR 0005, revised). The
+   piggy-back idea was built, then refuted by three live captures: Arlo
+   refuses our WebRTC leg while the app streams (error 14001) and answers
+   502 for the watch-along DASH URL. Owner's decision: observe only.
+   `ManualStream` / `ManualStreamEnded` drive a `user_view_until` flag
+   (120 s hold, refreshed by reports); while set, motion does not start a
+   session (`suppressed-user-view`), a running session is left alone, and
+   a refused attach (`CameraBusy`, mapped from 14001) returns to idle
+   without backoff. arlo-rs branch `feat/stream-peek-probe` carries the
+   probe, the `data.error` envelope fix and the `mediaUploadNotification`
+   decode fix; once released (0.2.1), drop the message-text fallback in
+   `streamer-infra-arlo/src/error.rs`. `mediaUploadNotification` carries
+   a fresh `presignedLastImageUrl` usable for idle thumbnails.
 5. **`list-devices` CLI subcommand** — authenticate through the existing
    `boot()`, print `{device_id, device_name, device_type, model_id}` from
    `ArloClient::get_devices`. Biggest first-run UX win; the whole boot path

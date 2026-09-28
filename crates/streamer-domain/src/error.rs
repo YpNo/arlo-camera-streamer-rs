@@ -29,4 +29,11 @@ pub enum DomainError {
     /// infrastructure-specific error types.
     #[error("adapter transport failure: {0}")]
     AdapterTransport(String),
+
+    /// The camera is streaming to another client over a transport that
+    /// excludes ours: Arlo refuses our WebRTC session (error 14001) while
+    /// the user watches the camera in the mobile app. Not a fault — the
+    /// application waits for the view to end instead of backing off.
+    #[error("camera busy: {0}")]
+    CameraBusy(String),
 }

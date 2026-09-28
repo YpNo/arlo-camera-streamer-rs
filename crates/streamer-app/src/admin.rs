@@ -211,7 +211,7 @@ fn stub_snapshot(id: &CameraId, stream_name: &StreamName) -> CameraSnapshot {
         cooling_remaining: None,
         last_failure: Some("orchestrator did not reply".to_string()),
         retries: 0,
-        trigger: None,
+        user_view: false,
     }
 }
 
@@ -254,7 +254,7 @@ mod tests {
                         cooling_remaining: None,
                         last_failure: None,
                         retries: 0,
-                        trigger: None,
+                        user_view: false,
                     });
                 }
             }

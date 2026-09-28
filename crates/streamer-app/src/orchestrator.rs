@@ -40,18 +40,18 @@
 //! Dropping the handle on every live exit is what makes late reports
 //! from a finished session unobservable — no generation counters.
 //!
-//! # Two triggers (ADR 0005)
+//! # User views in the Arlo app (ADR 0005)
 //!
-//! A session is either **motion**-triggered (PIR/ML, audio, admin wake:
-//! debounce + hard cap + daily budget) or **manual** (the user opened a
-//! live view in the Arlo app and the daemon piggy-backs: hard cap only,
-//! budget not charged, ends on the camera's `idle` report with
-//! `LiveLost` and the cap as backstops). The trigger is an orchestrator
-//! field set at activation and cleared on every exit; `ManualStreamEnded`
-//! is only turned into a signal while the live session is manual, and a
-//! `ManualStream` arriving within `MANUAL_ECHO_GUARD` of our own live
-//! exit is dropped in case the camera reports our own leg as a user
-//! stream (capture item in ADR 0005).
+//! Arlo serves one live transport per camera: while the user watches in
+//! the mobile app (RTSP), our WebRTC session is refused (Arlo 14001) and
+//! the app's stream cannot be joined. User views are therefore only
+//! *observed*: `ManualStream` marks the camera as viewed for
+//! `USER_VIEW_HOLD` (refreshed by every report), `ManualStreamEnded`
+//! clears it, and meanwhile a motion pulse does not start a session — it
+//! is recorded as `suppressed-user-view` instead of failing into backoff.
+//! A session already running is left to end normally. A view the bus
+//! did not report surfaces as the attach failing with `CameraBusy`, which
+//! returns to `Idle` without backoff and marks the camera as viewed.
 //!
 //! [`EventRouter`]: crate::router::EventRouter
 
@@ -82,7 +82,7 @@ use streamer_domain::metrics::{BudgetDecision, MotionOutcome, SpliceOutcome};
 use streamer_domain::port::{
     ArloThumbnailSource, MediaMultiplexer, MetricsRecorder, WebrtcSignaler,
 };
-use streamer_domain::state::{CameraState, LiveLossReason, LiveTrigger, StateTransition};
+use streamer_domain::state::{CameraState, LiveLossReason, StateTransition};
 use streamer_domain::stream::LiveSession;
 
 use crate::budget::{BudgetVerdict, LiveBudgetTracker};
@@ -91,10 +91,11 @@ use crate::debouncer::{DebouncerVerdict, MotionDebouncer};
 use crate::metrics_noop::NoopRecorder;
 use crate::transition::transition;
 
-/// Window after our own live exit during which a `ManualStream` event
-/// is treated as an echo of that exit rather than a new user view. Long
-/// enough for MQTT propagation, short enough to not hide a real view.
-const MANUAL_ECHO_GUARD: Duration = Duration::from_secs(5);
+/// How long one `ManualStream` report keeps motion activations paused
+/// when no `idle` report follows, so a lost MQTT event cannot pause
+/// motion for good. Every report refreshes it; a view that outlives it
+/// is caught again by the attach failing with `CameraBusy`.
+const USER_VIEW_HOLD: Duration = Duration::from_secs(120);
 
 /// Per-camera state-machine task.
 pub struct CameraOrchestrator {
@@ -111,11 +112,9 @@ pub struct CameraOrchestrator {
     /// state leaves live, so a report from a finished session can never
     /// be observed.
     live: Option<LiveSession>,
-    /// Why the current session exists (ADR 0005). `Some` from activation
-    /// until the exit to `Idle` / `BatteryProtect` / `Failed`.
-    trigger: Option<LiveTrigger>,
-    /// When the last live session ended; drives [`MANUAL_ECHO_GUARD`].
-    last_live_exit: Option<Instant>,
+    /// Until when the user is considered to be watching the camera in
+    /// the Arlo app (ADR 0005); `None` when no view is known.
+    user_view_until: Option<Instant>,
     signaler: Arc<dyn WebrtcSignaler>,
     thumbnails: Arc<dyn ArloThumbnailSource>,
     media: Arc<dyn MediaMultiplexer>,
@@ -167,8 +166,7 @@ impl CameraOrchestrator {
             budget,
             failed_deadline: None,
             live: None,
-            trigger: None,
-            last_live_exit: None,
+            user_view_until: None,
             signaler,
             thumbnails,
             media,
@@ -355,7 +353,7 @@ impl CameraOrchestrator {
             cooling_remaining,
             last_failure,
             retries,
-            trigger: self.trigger.map(|t| t.as_label().to_string()),
+            user_view: self.user_view_active(),
         }
     }
 
@@ -402,18 +400,12 @@ impl CameraOrchestrator {
                 signal
             }
             CameraEvent::ManualStream { .. } => {
-                let Some(signal) = self.manual_stream_signal() else {
-                    return Ok(());
-                };
-                signal
+                self.on_user_view_started();
+                return Ok(());
             }
             CameraEvent::ManualStreamEnded { .. } => {
-                if self.trigger != Some(LiveTrigger::Manual) {
-                    debug!(state = ?self.state, "camera idle report outside a manual session; ignored");
-                    return Ok(());
-                }
-                info!("user live view ended; releasing the piggy-backed session");
-                StateTransition::ManualStreamEnded
+                self.on_user_view_ended();
+                return Ok(());
             }
             CameraEvent::Online { .. } => {
                 debug!("camera online");
@@ -426,23 +418,25 @@ impl CameraOrchestrator {
         self.process_signals(VecDeque::from([signal])).await
     }
 
-    /// Turn a motion / audio pulse into a signal, or `None` when it must
-    /// not touch the machine: during a manual session the pulse is
-    /// absorbed without re-arming the debounce or polling the budget
-    /// (an exhausted budget must not cut a free piggy-back short).
+    /// Turn a motion / audio pulse (or an admin wake) into a signal, or
+    /// `None` when it must not touch the machine: while the user watches
+    /// in the Arlo app, Arlo would refuse our session, so none is started
+    /// — a session already running is still extended as usual.
     fn motion_signal(&mut self) -> Option<StateTransition> {
-        if self.trigger == Some(LiveTrigger::Manual) {
+        let in_session = matches!(
+            self.state,
+            CameraState::Live { .. } | CameraState::Cooling { .. }
+        );
+        if self.user_view_active() && !in_session {
+            debug!("motion while the user watches in the Arlo app; not activating");
             self.metrics
-                .record_motion(&self.camera_id, MotionOutcome::Absorbed);
+                .record_motion(&self.camera_id, MotionOutcome::SuppressedUserView);
             return None;
         }
         // Prime the debouncer only where a session can start or extend;
         // a pulse in BatteryProtect / Failed would leave a stale
         // `live_since` that trips the hard cap right after the next attach.
-        if matches!(
-            self.state,
-            CameraState::Idle | CameraState::Live { .. } | CameraState::Cooling { .. }
-        ) {
+        if in_session || self.state == CameraState::Idle {
             self.debouncer.on_motion(now());
         }
         let signal = self.intercept_budget(StateTransition::MotionDetected);
@@ -451,17 +445,26 @@ impl CameraOrchestrator {
         Some(signal)
     }
 
-    /// A user live view started. `None` when it is most likely the echo
-    /// of our own session that just ended (see [`MANUAL_ECHO_GUARD`]).
-    fn manual_stream_signal(&self) -> Option<StateTransition> {
-        if let Some(exit) = self.last_live_exit
-            && now().saturating_duration_since(exit) < MANUAL_ECHO_GUARD
-        {
-            debug!("manual stream event within the echo guard of our own live exit; ignored");
-            return None;
+    fn user_view_active(&self) -> bool {
+        self.user_view_until.is_some_and(|until| now() < until)
+    }
+
+    /// Mark the camera as viewed in the Arlo app, or refresh the mark.
+    fn on_user_view_started(&mut self) {
+        if !self.user_view_active() {
+            info!(state = ?self.state, "user is watching in the Arlo app; motion activations paused");
         }
-        info!(state = ?self.state, "user live view started; piggy-backing");
-        Some(StateTransition::ManualStreamDetected)
+        self.user_view_until = Some(now() + USER_VIEW_HOLD);
+    }
+
+    /// The camera went idle. Ends a known user view; otherwise (after a
+    /// motion recording or our own session) there is nothing to do.
+    fn on_user_view_ended(&mut self) {
+        if self.user_view_until.take().is_some() {
+            info!("user view in the Arlo app ended; motion activations resumed");
+        } else {
+            debug!(state = ?self.state, "camera idle report without a known user view");
+        }
     }
 
     /// The media adapter reported the attached source dead. Route it
@@ -544,7 +547,7 @@ impl CameraOrchestrator {
                 self.metrics
                     .record_budget(&self.camera_id, BudgetDecision::Reset);
             }
-            let follow_ups = self.apply_state_change(&from, &to, &signal).await?;
+            let follow_ups = self.apply_state_change(&from, &to).await?;
             for f in follow_ups {
                 signals.push_back(f);
             }
@@ -556,33 +559,32 @@ impl CameraOrchestrator {
         &mut self,
         from: &CameraState,
         to: &CameraState,
-        signal: &StateTransition,
     ) -> Result<Vec<StateTransition>, DomainError> {
         let mut follow_ups = Vec::new();
         match (from, to) {
-            // Activation: from Idle on motion or a user view, from
-            // BatteryProtect on a user view only (piggy-backing is free).
-            (CameraState::Idle | CameraState::BatteryProtect { .. }, CameraState::Activating) => {
-                let trigger = match signal {
-                    StateTransition::ManualStreamDetected => LiveTrigger::Manual,
-                    _ => LiveTrigger::Motion,
-                };
-                self.trigger = Some(trigger);
+            // Cold-start activation: kick off the async stream request.
+            (CameraState::Idle, CameraState::Activating) => {
                 follow_ups.extend(self.start_activation().await);
             }
             // Activation succeeded.
-            (CameraState::Activating, CameraState::Live { .. }) => self.on_live_entered(),
-            // Cooldown / max-live / loss / user view ended → idle.
-            (CameraState::Live { .. } | CameraState::Cooling { .. }, CameraState::Idle) => {
-                follow_ups.extend(self.on_idle_entered().await);
+            (CameraState::Activating, CameraState::Live { .. }) => {
+                self.debouncer.on_live_attached(now());
+                self.budget.on_live_started(Local::now().naive_local());
             }
-            // Live → BatteryProtect (budget exhausted mid-session).
+            // Attach refused because the user watches in the Arlo app:
+            // release whatever the attempt left behind, no backoff.
+            (CameraState::Activating, CameraState::Idle) => {
+                let _ = self.media.detach_live(&self.camera_id).await;
+                self.stop_arlo_live().await;
+                self.debouncer.on_idle();
+            }
+            // Cooldown / max-live / loss → idle, or budget exhausted
+            // mid-session → battery-protect: release the session either way.
             (
                 CameraState::Live { .. } | CameraState::Cooling { .. },
-                CameraState::BatteryProtect { .. },
+                CameraState::Idle | CameraState::BatteryProtect { .. },
             ) => {
                 self.detach_and_refresh().await;
-                self.on_session_over();
             }
             // Anywhere → Failed (transient error).
             (
@@ -593,7 +595,6 @@ impl CameraOrchestrator {
                 self.stop_arlo_live().await;
                 self.budget.on_live_ended(Local::now().naive_local());
                 self.debouncer.on_idle();
-                self.on_session_over();
                 self.failed_deadline = Some(now() + backoff_duration(*retries));
             }
             // Failed → Idle (backoff elapsed; ready to retry).
@@ -608,44 +609,6 @@ impl CameraOrchestrator {
             _ => {}
         }
         Ok(follow_ups)
-    }
-
-    /// Arm the timers for the session that just attached. A motion
-    /// session gets debounce + cap and is billed; a manual session gets
-    /// the cap only and is free (the user woke the camera, not us).
-    fn on_live_entered(&mut self) {
-        let now = now();
-        match self.trigger {
-            Some(LiveTrigger::Manual) => self.debouncer.on_manual_session(now),
-            _ => {
-                self.debouncer.on_live_attached(now);
-                self.budget.on_live_started(Local::now().naive_local());
-            }
-        }
-    }
-
-    /// `Live | Cooling → Idle`: release everything, then — after a manual
-    /// session only — re-check the budget so a piggy-back that started
-    /// in `BatteryProtect` returns there instead of leaving the camera
-    /// armed for motion with an exhausted quota.
-    async fn on_idle_entered(&mut self) -> Vec<StateTransition> {
-        let was_manual = self.trigger == Some(LiveTrigger::Manual);
-        self.detach_and_refresh().await;
-        self.on_session_over();
-        if was_manual && self.budget.poll(Local::now().naive_local()) == BudgetVerdict::Exhausted {
-            debug!(
-                "budget still exhausted after the piggy-backed session; back to battery-protect"
-            );
-            return vec![StateTransition::BudgetExhausted];
-        }
-        Vec::new()
-    }
-
-    /// Bookkeeping shared by every session exit: the trigger is gone and
-    /// the exit instant feeds the manual-stream echo guard.
-    fn on_session_over(&mut self) {
-        self.trigger = None;
-        self.last_live_exit = Some(now());
     }
 
     /// Bring up a fresh live session. The media adapter owns the
@@ -666,6 +629,11 @@ impl CameraOrchestrator {
                     elapsed_ms(started),
                 );
                 vec![StateTransition::LiveAttached]
+            }
+            Err(DomainError::CameraBusy(reason)) => {
+                info!(%reason, "camera busy with a user view in the Arlo app; not activating");
+                self.user_view_until = Some(now() + USER_VIEW_HOLD);
+                vec![StateTransition::CameraBusy]
             }
             Err(e) => {
                 let latency = elapsed_ms(started);
@@ -799,8 +767,7 @@ fn signal_label(s: &StateTransition) -> &'static str {
         StateTransition::Failure(_) => "failure",
         StateTransition::BackoffElapsed => "backoff-elapsed",
         StateTransition::LiveLost(reason) => reason.signal_label(),
-        StateTransition::ManualStreamDetected => "manual-stream-detected",
-        StateTransition::ManualStreamEnded => "manual-stream-ended",
+        StateTransition::CameraBusy => "camera-busy",
     }
 }
 
@@ -1268,13 +1235,7 @@ mod tests {
         );
     }
 
-    // ---------- Manual stream piggy-back (ADR 0005) ----------
-
-    fn camera_cfg_budget(debounce: u64, max: u64, budget: u64) -> CameraConfig {
-        let mut cfg = camera_cfg(debounce, max);
-        cfg.cooldown.daily_live_budget = budget;
-        cfg
-    }
+    // ---------- User views in the Arlo app (ADR 0005) ----------
 
     async fn send(tx: &mpsc::Sender<CameraEvent>, event: CameraEvent) {
         tx.send(event).await.unwrap();
@@ -1299,13 +1260,12 @@ mod tests {
         }
     }
 
-    /// Let the wall clock (which the budget tracker reads) move on.
-    fn let_wall_clock_pass(d: Duration) {
-        std::thread::sleep(d);
+    fn busy() -> DomainError {
+        DomainError::CameraBusy("RTSP Streaming in progress".to_string())
     }
 
     #[tokio::test(start_paused = true)]
-    async fn manual_stream_drives_idle_to_live_and_ends_on_manual_stream_ended() {
+    async fn user_view_pauses_motion_activation_until_it_ends() {
         let cfg = camera_cfg(60, 300);
         let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
         let media = RecordingMedia::new();
@@ -1313,180 +1273,118 @@ mod tests {
         let handle = tokio::spawn(orch.run());
 
         send(&tx, manual()).await;
-        let calls = media.calls().await;
-        assert!(calls.iter().any(|c| matches!(c, MediaCall::AttachLive(_))));
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 0, "no attach while the user watches");
+        assert_eq!(media.calls().await, vec![MediaCall::Register]);
 
         send(&tx, manual_ended()).await;
+        send(&tx, motion()).await;
+        assert_eq!(
+            sr.call_count().await,
+            1,
+            "motion activates once the view ended"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_view_never_triggers_an_attach() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        send(&tx, manual_ended()).await;
+        assert_eq!(sr.call_count().await, 0);
+        assert_eq!(media.calls().await, vec![MediaCall::Register]);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_view_leaves_a_running_motion_session_alone_then_blocks_the_next() {
+        let cfg = camera_cfg(2, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer()), Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        media.calls().await;
+        send(&tx, manual()).await;
+        assert!(
+            media.calls().await.is_empty(),
+            "a user view must not end our running session"
+        );
+        // The session ends on its own debounce …
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(media.calls().await.contains(&MediaCall::DetachLive));
+        // … and while the user still watches, motion does not re-activate.
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 1);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_view_hold_expires_without_an_idle_report() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        tokio::time::advance(USER_VIEW_HOLD + Duration::from_secs(1)).await;
+        send(&tx, motion()).await;
+        assert_eq!(
+            sr.call_count().await,
+            1,
+            "a lost idle report must not pause motion for good"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn camera_busy_attach_returns_to_idle_without_backoff() {
+        // The bus missed the user view: the attach itself is refused.
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![Err(busy()), Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 1);
         assert_eq!(
             sr.stop_count().await,
             1,
-            "teardown pairs with the manual exit"
+            "a refused attach still releases the signaling"
         );
-
-        token.cancel();
-        handle.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn manual_session_outlives_debounce_window_until_max_cap() {
-        // debounce 2 s must NOT end a manual session; the 10 s cap must.
-        let cfg = camera_cfg(2, 10);
-        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
-        let media = RecordingMedia::new();
-        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
-        let handle = tokio::spawn(orch.run());
-
-        send(&tx, manual()).await;
-        media.calls().await;
-        tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(
-            !media.calls().await.contains(&MediaCall::DetachLive),
-            "a manual session has no debounce window"
-        );
-        tokio::time::advance(Duration::from_secs(6)).await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(
-            media.calls().await.contains(&MediaCall::DetachLive),
-            "the hard cap still ends a manual session"
-        );
-
-        token.cancel();
-        handle.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn manual_session_is_not_charged_to_the_daily_budget() {
-        let cfg = camera_cfg_budget(60, 300, 1);
-        let sr = StubSignaler::with_responses(vec![Ok(ok_answer()), Ok(ok_answer())]);
-        let media = RecordingMedia::new();
-        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
-        let handle = tokio::spawn(orch.run());
-
-        send(&tx, manual()).await;
-        let_wall_clock_pass(Duration::from_millis(1100));
+        // The refusal marked the camera as viewed: motion is paused …
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 1);
+        // … and once the view ends, the next pulse activates at once —
+        // no Failed backoff to wait out.
         send(&tx, manual_ended()).await;
-        assert_eq!(sr.call_count().await, 1);
-
-        // A charged session of 1.1 s would have exhausted the 1 s budget
-        // and this motion would be denied.
         send(&tx, motion()).await;
-        assert_eq!(
-            sr.call_count().await,
-            2,
-            "motion after a free manual session still activates"
-        );
-
-        token.cancel();
-        handle.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn manual_stream_in_battery_protect_piggybacks_then_returns_there() {
-        let cfg = camera_cfg_budget(2, 300, 1);
-        let sr = StubSignaler::with_responses(vec![Ok(ok_answer()), Ok(ok_answer())]);
-        let media = RecordingMedia::new();
-        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
-        let handle = tokio::spawn(orch.run());
-
-        // Motion session that exhausts the 1 s budget.
-        send(&tx, motion()).await;
-        let_wall_clock_pass(Duration::from_millis(1100));
-        tokio::time::advance(Duration::from_secs(3)).await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(media.calls().await.contains(&MediaCall::DetachLive));
-        // Next motion is denied → BatteryProtect.
-        send(&tx, motion()).await;
-        assert_eq!(sr.call_count().await, 1);
-
-        // A user view piggy-backs even in BatteryProtect … (past the echo
-        // guard of the session that just ended)
-        tokio::time::advance(MANUAL_ECHO_GUARD + Duration::from_secs(1)).await;
-        send(&tx, manual()).await;
         assert_eq!(sr.call_count().await, 2);
-        media.calls().await;
-        // … and the machine returns to BatteryProtect afterwards:
-        send(&tx, manual_ended()).await;
-        assert!(media.calls().await.contains(&MediaCall::DetachLive));
-        assert_eq!(sr.stop_count().await, 2);
-        send(&tx, motion()).await;
-        assert_eq!(
-            sr.call_count().await,
-            2,
-            "budget still exhausted after the free session"
-        );
-
-        token.cancel();
-        handle.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn manual_stream_ended_is_noop_during_a_motion_session_and_in_idle() {
-        let cfg = camera_cfg(60, 300);
-        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
-        let media = RecordingMedia::new();
-        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
-        let handle = tokio::spawn(orch.run());
-
-        send(&tx, manual_ended()).await;
-        assert_eq!(media.calls().await, vec![MediaCall::Register]);
-
-        send(&tx, motion()).await;
-        media.calls().await;
-        send(&tx, manual_ended()).await;
         assert!(
-            media.calls().await.is_empty(),
-            "an idle report must not end a motion session"
+            media
+                .calls()
+                .await
+                .iter()
+                .any(|c| matches!(c, MediaCall::AttachLive(_)))
         );
-        assert_eq!(sr.stop_count().await, 0);
-
-        token.cancel();
-        handle.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn manual_stream_within_echo_guard_of_own_exit_is_ignored() {
-        let cfg = camera_cfg(2, 300);
-        let sr = StubSignaler::with_responses(vec![Ok(ok_answer()), Ok(ok_answer())]);
-        let media = RecordingMedia::new();
-        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
-        let handle = tokio::spawn(orch.run());
-
-        send(&tx, motion()).await;
-        tokio::time::advance(Duration::from_secs(3)).await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        media.calls().await; // session 1 ended by cooldown
-
-        // Echo of our own exit: ignored.
-        send(&tx, manual()).await;
-        assert_eq!(sr.call_count().await, 1);
-
-        // Past the guard: a real user view is honoured.
-        tokio::time::advance(MANUAL_ECHO_GUARD + Duration::from_secs(1)).await;
-        send(&tx, manual()).await;
-        assert_eq!(sr.call_count().await, 2);
-
-        token.cancel();
-        handle.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn motion_during_manual_session_is_absorbed_without_ending_it() {
-        let cfg = camera_cfg(2, 300);
-        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
-        let media = RecordingMedia::new();
-        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
-        let handle = tokio::spawn(orch.run());
-
-        send(&tx, manual()).await;
-        media.calls().await;
-        send(&tx, motion()).await;
-        // If the pulse had re-armed a debounce, the session would end 2 s later.
-        tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(media.calls().await.is_empty());
-        assert_eq!(sr.call_count().await, 1);
 
         token.cancel();
         handle.await.unwrap();
@@ -1527,9 +1425,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn snapshot_reports_trigger_while_live_and_omits_it_when_idle() {
+    async fn snapshot_reports_user_view() {
         let cfg = camera_cfg(60, 300);
-        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let sr = StubSignaler::with_responses(vec![]);
         let media = RecordingMedia::new();
         let (tx, rx) = mpsc::channel(32);
         let (admin_tx, admin_rx) = mpsc::channel(4);
@@ -1556,30 +1454,21 @@ mod tests {
             rx.await.unwrap()
         };
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(snap(admin_tx.clone()).await.trigger, None);
-
+        assert!(!snap(admin_tx.clone()).await.user_view);
         send(&tx, manual()).await;
-        let live = snap(admin_tx.clone()).await;
-        assert_eq!(live.state, "live");
-        assert_eq!(live.trigger.as_deref(), Some("manual"));
-
+        let viewed = snap(admin_tx.clone()).await;
+        assert!(viewed.user_view);
+        assert_eq!(viewed.state, "idle");
         send(&tx, manual_ended()).await;
-        assert_eq!(snap(admin_tx).await.trigger, None);
+        assert!(!snap(admin_tx).await.user_view);
 
         token.cancel();
         handle.await.unwrap();
     }
 
     #[test]
-    fn signal_label_covers_manual_signals() {
-        assert_eq!(
-            signal_label(&StateTransition::ManualStreamDetected),
-            "manual-stream-detected"
-        );
-        assert_eq!(
-            signal_label(&StateTransition::ManualStreamEnded),
-            "manual-stream-ended"
-        );
+    fn signal_label_covers_camera_busy() {
+        assert_eq!(signal_label(&StateTransition::CameraBusy), "camera-busy");
     }
 
     // ---------- Failure path ----------
