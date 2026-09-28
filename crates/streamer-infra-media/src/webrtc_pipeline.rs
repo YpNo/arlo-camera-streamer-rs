@@ -68,11 +68,12 @@ use streamer_domain::stream::{IceAddressFamily, IceServer, LiveLossNotifier};
 use crate::error::MediaError;
 use crate::live_rtp_sink::{LiveRtpSink, LiveSinks};
 use crate::live_watch::{RtpActivity, stall_verdict};
+use crate::pipeline_desc::{LIVE_RTP_H264_PT as H264_PT, LIVE_RTP_OPUS_PT as OPUS_PT};
 
-/// H.264 payload type pinned in our offer (Arlo's gateway answers 103).
-const H264_PT: i32 = 103;
-/// Opus payload type for the mandatory SIP audio leg.
-const OPUS_PT: i32 = 111;
+/// RTP clock rates fixed by the codecs (RFC 6184, RFC 7587).
+const H264_CLOCK_RATE: i32 = 90_000;
+const OPUS_CLOCK_RATE: i32 = 48_000;
+
 /// Periodic keyframe-request cadence (force-key-unit → PLI/FIR).
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(3);
 /// Max wait from `set-remote-description` to the first inbound RTP.
@@ -167,8 +168,8 @@ impl WebrtcLive {
         apply_ice_address_family(&webrtcbin, cfg.ice_address_family);
         apply_ice(&webrtcbin, ice);
 
-        let audio_caps = rtp_caps("audio", "OPUS", OPUS_PT, 48000);
-        let video_caps = rtp_caps("video", "H264", H264_PT, 90000);
+        let audio_caps = rtp_caps("audio", "OPUS", OPUS_PT, OPUS_CLOCK_RATE);
+        let video_caps = rtp_caps("video", "H264", H264_PT, H264_CLOCK_RATE);
 
         // m-line 0: audio Opus **sendrecv** (silence) — FreeSWITCH only
         // relays video once the SIP audio leg exists. Linking the send
@@ -180,7 +181,7 @@ impl WebrtcLive {
         let resample = make("audioresample")?;
         let opusenc = make("opusenc")?;
         let pay = make("rtpopuspay")?;
-        pay.set_property("pt", u32::try_from(OPUS_PT).unwrap_or(111));
+        pay.set_property("pt", OPUS_PT.unsigned_abs());
         let paycaps = make("capsfilter")?;
         paycaps.set_property("caps", &audio_caps);
         pipeline

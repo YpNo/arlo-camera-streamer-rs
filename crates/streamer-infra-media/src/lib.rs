@@ -20,9 +20,7 @@
 //! pipeline**, connected RTSP clients (VLC *and* Frigate) see a
 //! continuous stream with no reconnect. The live H.264 + Opus RTP is
 //! delivered by the per-camera [`webrtc_pipeline`] leg. See
-//! `docs/adr/0003-seamless-input-selector-splice.md`. The legacy
-//! factory-restart builders remain in [`pipeline_desc`] but are off the
-//! production path.
+//! `docs/adr/0003-seamless-input-selector-splice.md`.
 //!
 //! ## Crate layout
 //!
@@ -34,11 +32,11 @@
 //! | [`splice`]      |  ✓   | Keyframe / IDR detection helpers.                  |
 //! | [`codec_cache`] |  ✓   | Per-camera codec-hint cache.                       |
 //! | [`multiplexer`] |  ✓   | [`PipelineRegistry`] trait + [`GstMediaMultiplexer`].|
-//! | [`rtsp`]        |      | Wraps `gst-rtsp-server` (excluded from coverage).  |
-//! | [`gst_pipeline`]|      | Production [`PipelineRegistry`] (excluded from cov).|
+//! | [`rtsp`]        |      | Wraps `gst-rtsp-server` (integration-tested).      |
+//! | [`gst_pipeline`]|      | Production [`PipelineRegistry`] (integration-tested).|
 //! | [`live_rtp_sink`]|  ✓  | Per-camera RTP byte sink (`appsink` → consumer).   |
 //! | [`live_watch`]  |  ✓   | Live-loss detector logic: RTP activity clock + stall rule (ADR 0004). |
-//! | [`webrtc_pipeline`]| | Per-camera `webrtcbin` live leg (excluded from cov).|
+//! | [`webrtc_pipeline`]| | Per-camera `webrtcbin` live leg (integration-tested).|
 //!
 //! [`MediaMultiplexer`]: streamer_domain::port::MediaMultiplexer
 //! [`DomainError`]: streamer_domain::error::DomainError
@@ -65,9 +63,7 @@ pub use live_rtp_sink::{LiveRtpSink, LiveSinkReceivers, LiveSinks};
 pub use live_watch::{RtpActivity, stall_verdict};
 pub use multiplexer::{GstMediaMultiplexer, PipelineRegistry};
 pub use pipeline_desc::{
-    DashBranchConfig, HlsBranchConfig, OutputBranches, build_output_branches, idle_audio_desc,
-    idle_launch_string, idle_video_desc, idle_video_jpeg_desc, idle_video_synthetic_desc,
-    live_audio_desc, live_launch_string, live_video_desc, rtsp_mount_path,
+    DashBranchConfig, HlsBranchConfig, OutputBranches, build_output_branches, rtsp_mount_path,
 };
 pub use rtsp::RtspServer;
 pub use splice::{KeyframeWatcher, is_keyframe};

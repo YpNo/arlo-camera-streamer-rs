@@ -61,6 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logs unmapped camera events with their property keys (never values);
   `trace` logs every event the same way.
 
+### Removed
+- The Phase-4 factory-rebind launch builders (`idle_launch_string`,
+  `live_launch_string`, `idle_video_desc`, `idle_video_jpeg_desc`,
+  `idle_video_synthetic_desc`, `idle_audio_desc`, `live_video_desc`,
+  `live_audio_desc`), unused since the persistent splice pipeline.
+
 ### Changed
 - Every motion / audio pulse is logged at `debug`, on the bus
   (`camera trigger pulse kind=motion`) and in the orchestrator (`trigger pulse` with

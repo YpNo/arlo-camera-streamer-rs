@@ -5,23 +5,14 @@
 //! them trivially unit-testable and lets ops grep the launch syntax
 //! without instantiating a pipeline.
 //!
-//! ## Splicing strategy
+//! ## Splicing strategy (ADR 0003)
 //!
-//! Two builders coexist during the Phase-6 cutover:
-//!
-//! - **Phase 4 (legacy, scheduled for removal in Phase 6.6)**:
-//!   [`idle_launch_string`] / [`live_launch_string`] — each camera's
-//!   `RTSPMediaFactory` is rebound between idle and live; existing
-//!   clients reconnect within ~1 s (works for Frigate, breaks VLC).
-//!
-//! - **Phase 6 (seamless)**: [`combined_launch_string`] — one
-//!   persistent factory binding, idle and live both feed an
-//!   `input-selector` switched at an IDR boundary by
-//!   [`crate::splice::KeyframeWatcher`]. Connected clients never
-//!   disconnect. Both video branches use `h264parse config-interval=-1`
-//!   so SPS/PPS inline at every IDR, letting the receiver re-init its
-//!   decoder transparently across the splice (idle's x264 params and
-//!   live's Arlo H.264 params differ).
+//! [`combined_launch_string`] is the one persistent launch per camera:
+//! idle and decoded live video both reach an `input-selector` as raw
+//! I420 at identical caps, and a single encoder downstream gives
+//! clients one continuous H.264 stream with stable SPS/PPS. The Phase-4
+//! builders that re-bound the factory between idle and live (clients
+//! had to reconnect) were removed on 2026-09-28.
 //!
 //! ## Audio
 //!
@@ -33,22 +24,19 @@
 //!
 //! ## Output
 //!
-//! All branches end in a `tee` named `out_t` so the same encoded
-//! stream feeds RTSP (mandatory), HLS (optional), and DASH (optional).
-//! The RTSP server attaches via the GStreamer-RTSP-server's
-//! `pay0`/`pay1` payload-type contract.
+//! The RTSP server attaches through gst-rtsp-server's `pay0` (video) /
+//! `pay1` (audio) payloader contract.
 
 use std::path::Path;
 
 use streamer_domain::camera::StreamName;
 use streamer_domain::config::{DashOutput, HlsOutput, OutputConfig, VideoEncoder};
-use streamer_domain::stream::Codec;
 
 use crate::idle_source::{IDLE_FPS, IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH};
 
-/// H.264 RTP payload type pinned on the live video appsrc's caps.
-/// **Must** match `webrtc_pipeline::H264_PT` (pinned in the WebRTC
-/// offer to Arlo); a future cleanup will consolidate the two literals.
+/// H.264 RTP payload type of the live video: pinned in our WebRTC offer
+/// to Arlo (whose gateway answers 103) and on the live video appsrc's
+/// caps. One constant, so the two cannot drift.
 pub(crate) const LIVE_RTP_H264_PT: i32 = 103;
 
 /// Framerate of the **unified** Phase-7 splice: both the idle branch
@@ -85,9 +73,8 @@ pub(crate) const IDLE_OVERLAY_NAME: &str = "idle_overlay";
 /// are independent).
 pub(crate) const UNIFIED_AUDIO_ENCODER_NAME: &str = "audio_enc";
 
-/// Opus RTP payload type pinned on the live audio appsrc's caps.
-/// **Must** match `webrtc_pipeline::OPUS_PT` (the audio transceiver's
-/// PT in our offer to Arlo).
+/// Opus RTP payload type of the live audio: the audio transceiver's PT
+/// in our WebRTC offer and the live audio appsrc's caps.
 pub(crate) const LIVE_RTP_OPUS_PT: i32 = 111;
 
 // ── Phase 8b (Opus audio bridging) — via `audiomixer` ────────────────
@@ -187,124 +174,6 @@ fn format_dir(root: &Path, name: &StreamName) -> String {
     format!("{}/{}", root.display(), name)
 }
 
-/// Build the idle-mode video chain, terminating in a parsed encoded
-/// stream. The result is **not** payloaded — the caller appends
-/// `! rtph26{4,5}pay name=pay0 pt=96` for RTSP, or hooks into a tee.
-#[must_use]
-pub fn idle_video_desc(idle: &IdleKind) -> String {
-    match idle {
-        IdleKind::JpegStill { .. } => idle_video_jpeg_desc(),
-        IdleKind::Synthetic { overlay, .. } => idle_video_synthetic_desc(overlay),
-    }
-}
-
-/// Idle video — JPEG still loop. The actual JPEG bytes are pushed via
-/// `appsrc` at runtime; the description here covers the post-`appsrc`
-/// chain.
-///
-/// `h264parse config-interval=-1` emits SPS/PPS in front of every IDR
-/// (`key-int-max=1` makes every encoded frame an IDR). This is what
-/// lets a receiver re-initialize its decoder transparently across the
-/// Phase-6 idle↔live splice — the cost over `config-interval=1` is a
-/// negligible ~30 B per frame of SPS/PPS.
-#[must_use]
-pub fn idle_video_jpeg_desc() -> String {
-    format!(
-        "appsrc name=idle_jpeg_src is-live=true format=time \
-         caps=image/jpeg,framerate={IDLE_FPS}/1 \
-         ! jpegdec ! videoconvert ! videorate \
-         ! video/x-raw,framerate={IDLE_FPS}/1 \
-         ! x264enc tune=zerolatency bitrate=512 key-int-max=1 \
-         ! h264parse config-interval=-1"
-    )
-}
-
-/// Idle video — synthetic black frame with a `STANDBY · …` overlay.
-/// See [`idle_video_jpeg_desc`] for the `config-interval=-1` rationale.
-#[must_use]
-pub fn idle_video_synthetic_desc(overlay: &str) -> String {
-    let escaped = escape_gst_text(overlay);
-    format!(
-        "videotestsrc pattern=black is-live=true \
-         ! video/x-raw,width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={IDLE_FPS}/1 \
-         ! textoverlay text=\"{escaped}\" valignment=bottom halignment=center font-desc=\"Sans 24\" \
-         ! videoconvert \
-         ! x264enc tune=zerolatency bitrate=512 key-int-max=1 \
-         ! h264parse config-interval=-1"
-    )
-}
-
-/// Idle audio — silent AAC at 48 kHz / stereo (matches Arlo's output).
-#[must_use]
-pub fn idle_audio_desc() -> &'static str {
-    "audiotestsrc wave=silence is-live=true \
-     ! audio/x-raw,rate=48000,channels=2 \
-     ! audioconvert ! audioresample \
-     ! avenc_aac bitrate=64000 \
-     ! aacparse"
-}
-
-/// Live video — the rtspsrc → depay → parse chain. Codec hint, when
-/// supplied, picks the depay element directly; without it we pipe into
-/// `parsebin` for runtime detection.
-#[must_use]
-pub fn live_video_desc(url: &str, codec_hint: Option<Codec>) -> String {
-    let escaped_url = escape_gst_property(url);
-    let depay_chain = match codec_hint {
-        Some(Codec::H264) => "rtph264depay ! h264parse config-interval=1",
-        Some(Codec::H265) => "rtph265depay ! h265parse config-interval=1",
-        None => "parsebin",
-    };
-    // `protocols=tcp`: the source is our localhost loopback RTSP, which
-    // serves TCP-interleaved only — UDP SETUP attempts would just be
-    // rejected and retried.
-    format!(
-        "rtspsrc location=\"{escaped_url}\" latency=200 protocols=tcp \
-         do-retransmission=true name=live_src \
-         ! {depay_chain}"
-    )
-}
-
-/// Live audio — pass-through Arlo's AAC.
-#[must_use]
-pub fn live_audio_desc() -> &'static str {
-    "rtpmp4adepay ! aacparse"
-}
-
-/// Build the complete idle-mode launch string for a single camera —
-/// suitable for `RTSPMediaFactory::set_launch`. Bundles video + audio
-/// into the dual-payload (`pay0` = video, `pay1` = audio) layout that
-/// `gst-rtsp-server` expects.
-#[must_use]
-pub fn idle_launch_string(idle: &IdleKind) -> String {
-    format!(
-        "( {video} ! rtph264pay name=pay0 pt=96 \
-            {audio} ! rtpmp4apay name=pay1 pt=97 )",
-        video = idle_video_desc(idle),
-        audio = idle_audio_desc(),
-    )
-}
-
-/// Build the legacy Phase-4 live-mode launch string for a camera.
-///
-/// **Video-only.** Used by the factory-rebind splice strategy. Kept
-/// only as a backward-compatible builder for callers that still rely
-/// on the rebind flow; the production registry now uses
-/// [`combined_launch_string`] and never rebinds the factory.
-#[must_use]
-pub fn live_launch_string(url: &str, codec_hint: Option<Codec>) -> String {
-    let pay = match codec_hint {
-        Some(Codec::H265) => "rtph265pay name=pay0 pt=96",
-        // Default to H.264 payloader for None — parsebin will produce
-        // h264-parsed buffers when the actual codec is H.264.
-        Some(Codec::H264) | None => "rtph264pay name=pay0 pt=96",
-    };
-    format!(
-        "( {video} ! {pay} )",
-        video = live_video_desc(url, codec_hint),
-    )
-}
-
 /// Build the **Phase-7 unified-encoder** per-camera launch string — a
 /// single persistent pipeline where the `input-selector` operates on
 /// **raw I420** and a single `x264enc` downstream produces the H.264
@@ -386,9 +255,7 @@ fn video_encoder_segment(encoder: VideoEncoder) -> String {
 }
 
 /// Idle producer normalized to the **unified raw caps** (Phase 7).
-/// Same content as the legacy [`idle_video_desc`] but with the
-/// encoder/parser tail stripped — the selector forwards raw frames to
-/// a single downstream encoder.
+/// The selector forwards raw frames to the single downstream encoder.
 fn idle_raw_chain(idle: &IdleKind) -> String {
     match idle {
         IdleKind::JpegStill { .. } => format!(
@@ -471,11 +338,6 @@ fn escape_gst_text(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Escape a value embedded in a `key="value"` property.
-fn escape_gst_property(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,115 +400,18 @@ mod tests {
     }
 
     #[test]
-    fn idle_video_desc_jpeg_uses_appsrc_and_jpegdec() {
-        let desc = idle_video_desc(&IdleKind::JpegStill {
-            jpeg: bytes::Bytes::from_static(&[0]),
-        });
-        assert!(desc.contains("appsrc"));
-        assert!(desc.contains("jpegdec"));
-        assert!(desc.contains("x264enc"));
-    }
-
-    #[test]
-    fn idle_video_desc_synthetic_includes_overlay_text() {
-        let desc = idle_video_desc(&IdleKind::Synthetic {
+    fn combined_launch_string_escapes_quotes_and_backslashes_in_overlay() {
+        let idle = IdleKind::Synthetic {
             stream_name: name(),
-            overlay: "STANDBY · front_door · 2026-05-08T10:00:00".to_string(),
-        });
-        assert!(desc.contains("videotestsrc"));
-        assert!(desc.contains("textoverlay"));
-        assert!(desc.contains("STANDBY"));
-        assert!(desc.contains("front_door"));
-    }
-
-    #[test]
-    fn idle_video_synthetic_desc_escapes_quotes_in_overlay() {
-        let desc = idle_video_synthetic_desc("has \"quotes\"");
-        // Backslash-escape the embedded double quotes.
-        assert!(desc.contains("\\\"quotes\\\""));
-    }
-
-    #[test]
-    fn idle_video_synthetic_desc_escapes_backslashes_in_overlay() {
-        let desc = idle_video_synthetic_desc("path\\sub");
-        assert!(desc.contains("path\\\\sub"));
-    }
-
-    #[test]
-    fn idle_audio_desc_emits_silent_aac() {
-        let desc = idle_audio_desc();
-        assert!(desc.contains("audiotestsrc"));
-        assert!(desc.contains("wave=silence"));
-        assert!(desc.contains("avenc_aac"));
-    }
-
-    #[test]
-    fn live_video_desc_with_h264_hint_uses_h264_depay() {
-        let desc = live_video_desc("rtsps://camera.local/path", Some(Codec::H264));
-        assert!(desc.contains("rtspsrc"));
-        assert!(desc.contains("rtph264depay"));
-        assert!(desc.contains("h264parse"));
-        assert!(!desc.contains("parsebin"));
-    }
-
-    #[test]
-    fn live_video_desc_with_h265_hint_uses_h265_depay() {
-        let desc = live_video_desc("rtsps://camera.local/path", Some(Codec::H265));
-        assert!(desc.contains("rtph265depay"));
-        assert!(desc.contains("h265parse"));
-    }
-
-    #[test]
-    fn live_video_desc_without_hint_uses_parsebin() {
-        let desc = live_video_desc("rtsps://camera.local/path", None);
-        assert!(desc.contains("parsebin"));
-        assert!(!desc.contains("rtph264depay"));
-    }
-
-    #[test]
-    fn live_video_desc_escapes_url_quotes() {
-        let desc = live_video_desc("rtsps://host/path?\"q\"=1", Some(Codec::H264));
-        assert!(desc.contains("\\\"q\\\""));
-    }
-
-    #[test]
-    fn idle_launch_string_includes_pay0_and_pay1() {
-        let s = idle_launch_string(&IdleKind::Synthetic {
-            stream_name: name(),
-            overlay: "X".to_string(),
-        });
-        assert!(s.contains("pay0"));
-        assert!(s.contains("pay1"));
-    }
-
-    #[test]
-    fn live_launch_string_h264_hint_uses_h264_payloader() {
-        let s = live_launch_string("rtsps://camera/path", Some(Codec::H264));
-        assert!(s.contains("rtph264pay"));
-        assert!(!s.contains("rtph265pay"));
-    }
-
-    #[test]
-    fn live_launch_string_h265_hint_uses_h265_payloader() {
-        let s = live_launch_string("rtsps://camera/path", Some(Codec::H265));
-        assert!(s.contains("rtph265pay"));
-    }
-
-    #[test]
-    fn live_launch_string_without_hint_defaults_to_h264_payloader() {
-        let s = live_launch_string("rtsps://camera/path", None);
-        // No hint → safe default to H.264 payloader.
-        assert!(s.contains("rtph264pay"));
+            overlay: r#"say "hi" \ bye"#.to_string(),
+        };
+        let desc = combined_launch_string(&idle, VideoEncoder::X264);
+        assert!(desc.contains(r#"text="say \"hi\" \\ bye""#), "{desc}");
     }
 
     #[test]
     fn escape_gst_text_escapes_quotes_and_backslashes() {
         assert_eq!(escape_gst_text("a\"b\\c"), "a\\\"b\\\\c");
-    }
-
-    #[test]
-    fn escape_gst_property_escapes_quotes_and_backslashes() {
-        assert_eq!(escape_gst_property("a\"b\\c"), "a\\\"b\\\\c");
     }
 
     #[test]
