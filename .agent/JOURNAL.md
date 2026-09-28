@@ -103,3 +103,10 @@ Why:      Owner's VLC test: motion before connecting VLC showed only the
 Tests:    Workspace 349 green, clippy/doc clean, release build OK. Pipeline
           behaviour needs the live VLC check (motion first, then connect).
 Open:     VLC re-test; arlo-rs 0.2.1 bump (next commit).
+
+## 2026-09-28 — live-wiring fix validated
+Tests:    Owner's VLC run: session attached to an existing media; VLC closed
+          (media unprepared 14:54:28) and reopened mid-session (14:54:32):
+          "media built during a live session; live switch armed", live video
+          shown. Connect-after-motion uses the same hook path.
+Open:     Optional: idle thumbnail from the bus `presignedLastImageUrl`.

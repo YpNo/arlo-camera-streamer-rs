@@ -148,7 +148,7 @@ item 3 touches the port anyway.
 | CI has never run | Open the PR. First run: tests + clippy green on ubuntu-latest (media crate compiles there); doc links, coverage exclusions and Sonar config fixed after it. All 8 checks green on the third run; gate raised to the measured 84 %. |
 | HLS / DASH sinks not wired | ADR 0002; config accepts and warns. |
 | No recorded-session integration test | Would need a canned SDP offer/answer + RTP fixture. |
-| Live session vs RTSP client lifecycle | **Fixed 2026-09-28.** The pumps push into the *current* media's appsrc (slot set at `media-configure`, cleared at `unprepared`), discard while none exists, and a media built during a live session gets its switch armed. Needs the VLC check: motion first, then connect. |
+| Live session vs RTSP client lifecycle | **Fixed 2026-09-28.** The pumps push into the *current* media's appsrc (slot set at `media-configure`, cleared at `unprepared`), discard while none exists, and a media built during a live session gets its switch armed. Validated live 2026-09-28: VLC disconnected and reconnected mid-session and got the live video back ("media built during a live session; live switch armed"). |
 | Dependency currency | All within one minor of latest on 2026-09-27; `mockall` 0.15 / `rstest` 0.27 are the only minor bumps pending (dev-deps). |
 
 ---
