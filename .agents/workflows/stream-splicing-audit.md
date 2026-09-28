@@ -2,36 +2,39 @@
 **Role**: Senior Media Quality Engineer
 
 ## Objective
-Verify that the transition from the "Idle" dummy stream to the "Live" Arlo feed is within latency targets and does not cause RTSP client disconnects.
+Verify that switching between the idle still and the live Arlo feed stays seamless:
+RTSP clients never disconnect, the live picture appears within one keyframe interval,
+and the camera returns to idle cleanly.
 
 ## Triggers
-- Modification of `crates/streamer-infra-media/src/splice.rs`.
-- Changes to GStreamer pipeline descriptions in `crates/streamer-infra-media/src/pipeline_desc.rs`.
-- Updates to `arlo-rs` that affect stream startup time.
+- Changes to `crates/streamer-infra-media/src/{splice,pipeline_desc,gst_pipeline,webrtc_pipeline,rtsp}.rs`.
+- Changes to the orchestrator's attach/detach paths.
+- An `arlo-rs` update that touches signaling or the event bus.
 
 ## Steps
 
-### 1. Instrumentation Check
-Ensure that the following spans are active and capturing timestamps:
-- `stream_request_latency`: Time from trigger to first live packet.
-- `splice_duration`: Time to swap sources in the GStreamer pipeline.
-
-### 2. Integration Testing
-Run the integration tests with `GST_DEBUG` enabled to inspect pipeline transitions:
+### 1. Pure checks
 ```bash
-GST_DEBUG=2 rtk cargo test -p streamer-infra-media --test splice_tests
+cargo test -p streamer-infra-media --all-features
 ```
+Launch-string builders (`pipeline_desc.rs`), splice logic (`splice.rs`), the loss
+rules (`live_watch.rs`) and the multiplexer mapping are unit-tested; the recorded-session
+integration test replays a captured WebRTC session through the real pipeline when
+GStreamer is present. Add `GST_DEBUG=2` to see pipeline warnings.
 
-### 3. Log Analysis
-Check the logs for "Idle-to-Live" transition events:
-- Verify that "Requesting Live" is followed by "Live Active".
-- Ensure no "EOS" (End of Stream) messages are sent to the RTSP sink during splicing.
+### 2. Invariants to re-read in the diff
+- Both video branches reach `input-selector` as raw I420 at identical caps; one encoder.
+- Audio stays on `audiomixer`, F32LE everywhere.
+- `set_launch` is never re-bound on a running media.
+- `WebrtcLive::start` stays cancel-safe; `shutdown` stays idempotent.
+- The wiring slot follows the current media (`media-configure` / `unprepared`).
 
-### 4. Visual Verification (Manual)
-If running in an environment with a display or using `filesink`:
-- Record a transition and verify there is no significant frame drop or artifacting during the switch.
+### 3. Live gate
+Follow the `live-validation` skill. At minimum: a motion session end to end, a VLC
+reconnect in the middle of a session, and the return to the idle still.
 
-## Success Criteria
-- [ ] Transition latency (trigger to live) < 5 seconds.
-- [ ] Zero RTSP client disconnects during splicing.
-- [ ] No "broken pipeline" errors on the GStreamer bus.
+## Success criteria
+- [ ] Trigger to live picture under 5 s (`state transition to=Activating` → `first RTP flowing`).
+- [ ] Zero RTSP client disconnects across idle → live → idle.
+- [ ] No `ERROR` on either pipeline bus; `webrtcbin bus watch exited` at session end.
+- [ ] Idle still refreshed after the session (`thumbnail applied to idle overlay`).

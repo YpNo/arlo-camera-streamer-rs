@@ -1,43 +1,80 @@
 ---
 name: media-specialist
-description: GStreamer pipeline, webrtcbin, and gst-rtsp-server patterns for the camera streamer.
+description: GStreamer patterns for streamer-infra-media — webrtcbin against Arlo's non-bundled FreeSWITCH gateway, the persistent gst-rtsp-server media with the idle/live splice, live-loss detectors, and the media lifecycle. Use before touching webrtc_pipeline.rs, gst_pipeline.rs, rtsp.rs or pipeline_desc.rs.
 ---
 # Media Specialist Skill
 
-## webrtcbin against a non-bundled foreign gateway (e.g. Arlo FreeSWITCH)
+Target: GStreamer 1.26 (Debian trixie, the `rust-build` distrobox and the image); keep
+1.22 working (Debian 12). `webrtc_pipeline.rs`, `gst_pipeline.rs` and `rtsp.rs` are
+excluded from unit coverage — put every decision that can be pure into `live_watch.rs`,
+`pipeline_desc.rs` or `splice.rs`, and validate the rest with the `live-validation` skill.
 
-1. **`bundle-policy=none`** on webrtcbin — webrtc-rs cannot negotiate non-bundled SDP; only webrtcbin can.
-2. **Audio m-line is sendrecv, video is recvonly**. Link an audio-silence chain into `sink_%u` (creates m0 sendrecv); use `add-transceiver` **only** for the recvonly video (m1). Adding audio via `add-transceiver` too produces a duplicate m-line.
-3. **Drain unwanted src pads to `fakesink`.** Leaving the audio recv pad unlinked fails with `GST_FLOW_NOT_LINKED` → "Internal data stream error" on `nicesrc`.
-4. **Percent-encode TURN userinfo.** Arlo TURN credentials contain `:`, `/`, `=`. Pass raw and `add-turn-server` returns `accepted=false`.
-5. **PLI / force-key-unit direction.** Send an upstream `GstForceKeyUnit` via `send_event` on the webrtcbin **src** pad (peer of the appsink sink). `push_event` on that pad, or `send_event` on the *sink* pad, both warn "wrong direction" and never reach rtpbin.
+## webrtcbin against Arlo (FreeSWITCH, non-bundled)
 
-## gst-rtsp-server seamless splice
+1. `bundle-policy=none`; apply the answer verbatim. `webrtc-rs` cannot negotiate it.
+2. m0 = audio Opus **sendrecv** from a silent `audiotestsrc` chain linked into `sink_%u`
+   (request the pad **with caps**: 1.22 returns NULL otherwise). m1 = video H.264
+   **recvonly** via `add-transceiver`. Audio first, then video. FreeSWITCH relays video
+   only once the audio leg exists.
+3. Every src pad goes to an `appsink` (video → `sinks.video`, Opus → `sinks.audio`).
+   An unlinked pad fails with `GST_FLOW_NOT_LINKED` on `nicesrc`.
+4. Percent-encode TURN userinfo (`pct`); Arlo credentials contain `: / = +`.
+   Arlo's TCP TURN is unusable — keep STUN + UDP TURN only.
+5. Keyframes: send an upstream `GstForceKeyUnit` with `send_event` on the webrtcbin
+   **src** pad, every 3 s. Arlo withholds video until it gets a PLI.
+6. Payload types are pinned: H.264 103, Opus 111 (`H264_PT`/`OPUS_PT` must equal
+   `LIVE_RTP_H264_PT`/`LIVE_RTP_OPUS_PT` in `pipeline_desc.rs`).
+7. Non-trickle: send the offer once `ice-gathering-state` is `complete`.
 
-- One persistent factory per camera. `set_shared(true) + set_suspend_mode(None)` so the media survives client disconnects.
-- The `media-configure` signal is the only place to capture named elements (`appsrc`, `input-selector`, encoder) — they don't exist before construction. Store handles behind an `Arc<StdMutex<Option<Wiring>>>` shared between the GLib thread and tokio.
-- **Never re-bind `set_launch`** for a running client — it sends EOS to existing clients (Frigate reconnects; VLC just freezes on the old stream).
+## `WebrtcLive` lifetime and live-loss detection (ADR 0004)
 
-## Unified-encoder splice pattern (Phase 7 — video)
+- `WebrtcLive::owning(pipeline)` is taken on `start`'s first line: every early `?` and
+  every cancellation stops the pipeline through `Drop`. Keep `start` **cancel-safe** —
+  the multiplexer drops it when a detector fires during setup (`setup_or_loss`).
+- `shutdown` is idempotent (`stopped` flag): the multiplexer calls it and `Drop` runs it.
+  It aborts tasks, posts `BUS_WATCH_STOP` **before** `set_state(Null)` (a flushing bus
+  drops posts and the bus thread would block forever), then goes to `Null`.
+- Detectors share one `LiveLossNotifier`, first wins: bus `ERROR`/`EOS`,
+  `connection-state`/`ice-connection-state` `failed|closed` (`disconnected` only logs;
+  it may recover), and the stall watchdog — spawned **after** the first RTP, never
+  counting silence during negotiation (`webrtc.live_stall_timeout_secs`, floor 4 s).
+- A loss before the first RTP fails the attach with `MediaError::LostDuringSetup(reason)`;
+  no RTP at all is `SpliceTimeout` after 20 s.
 
-- Naive H.264-in / H.264-out through the selector makes VLC render the post-splice branch as **black with no text** because its decoder keeps the pre-splice SPS/PPS.
-- Fix: both branches produce **raw I420 at identical caps** into the `input-selector`; **one** `x264enc name=video_enc` downstream. Clients see one continuous SPS/PPS.
-- Live branch decodes via `avdec_h264 ! videoconvert ! videoscale ! videorate` to normalize to the unified caps.
-- Dispatch a downstream `CustomDownstream("GstForceKeyUnit", all-headers=true)` to the encoder on every flip so the next encoded frame is a clean IDR.
-- Attach probe waits for **first raw buffer** at `sel.sink_1` (no IDR concept on raw video). Detach flips synchronously — every idle raw frame is complete.
+## Persistent RTSP media and the splice
 
-## Opus audio bridging — deferred (Phase 8b)
+- One factory per camera, `shared=true`, `suspend-mode=None`. Never re-bind
+  `set_launch` on a running media: it sends EOS to clients.
+- **Video**: idle and decoded live both produce raw I420 at identical caps into
+  `input-selector name=sel`; one encoder `video_enc` downstream, so clients see one
+  SPS/PPS. Force-key-unit the encoder on every flip. Attach flips on the first decoded
+  raw buffer at `sel.sink_1`; detach flips synchronously.
+- **Audio**: `audiomixer`, never a second `input-selector` (an empty inactive selector
+  pad stalls media prepare). Silent bed + live `rtpopusdepay ! opusdec` mixed, all
+  pinned to **F32LE** stereo 48 kHz — `avenc_aac` rejects S16LE ("not-negotiated").
+- Idle still: `gdkpixbufoverlay name=idle_overlay` is a pass-through until a thumbnail
+  file is set; a rebuilt media re-applies it at `media-configure`.
+- Pin each branch's final caps in one capsfilter; keep launch strings as pure builders
+  in `pipeline_desc.rs` with their constants beside them.
 
-- Do **not** put a decode chain (`rtpopusdepay ! opusdec` or `rtph264depay ! avdec_h264`) inside the *persistent factory pipeline* fed by an initially-empty `appsrc`. The decoder can't determine its src caps until the first buffer, so `PAUSED` preroll blocks, gst-rtsp-server times out, and the shared media is rebuilt in a loop. Both idle and live become unplayable.
-- The correct design: **decode on the webrtcbin side** and push **raw samples** (not RTP) through `LiveRtpSink`. The persistent pipeline's `appsrc` then declares known raw caps (`I420` for video, `S16LE` for audio) at construction time — no decoder-waits-for-data preroll issue.
-- Until Phase 8b lands: audio pad on webrtcbin drains to `fakesink`; the persistent pipeline's audio side is silent-AAC linear (`audiotestsrc silence → avenc_aac → rtpmp4apay pay1`) — no `input-selector` on audio.
+## Media lifecycle vs live session
 
-## Pipeline description hygiene
+gst-rtsp-server builds the media on the first client and unprepares it after the last,
+so a session can start with no media or outlive it.
 
-- Keep launch strings as pure builders in `pipeline_desc.rs`. Unit-testable, greppable, no GStreamer runtime in tests.
-- **Pin every branch's final caps identically.** Splitting `format` and `dims/rate` across two capsfilters breaks selector symmetry.
-- Constants for the splice contract (`UNIFIED_FPS`, `UNIFIED_GOP`, `UNIFIED_ENCODER_NAME`, `LIVE_RTP_H264_PT`) live next to the builder and are referenced by name from the registry.
+- `WiringSlot` holds the **current** media's elements: set at `media-configure`,
+  cleared at `unprepared` by media identity (not by "last one wins").
+- Pumps (`spawn_live_pump`) look the appsrc up **per buffer** and discard while the slot
+  is empty; they never stop on a refused push.
+- `live_active` arms the switch on a media configured mid-session, so a reconnecting
+  client gets live video within one keyframe interval.
+- Locks go through the poison-tolerant `lock()` helper.
 
-## Coverage exclusion
+## GLib/threading traps
 
-`gst_pipeline.rs`, `rtsp.rs`, `webrtc_pipeline.rs` require live GStreamer and are excluded from unit coverage. Every change here needs a manual live-gate run — mechanical tests will not catch behavior regressions.
+- Never `bus.add_watch_local()` inside `media-configure` ("no default main context");
+  use `bus.set_sync_handler` for diagnostics, or a dedicated thread with `iter_timed`
+  that exits on EOS or `BUS_WATCH_STOP`.
+- Signal closures hold `WeakRef`s to the pipeline/pads, never strong refs.
+- `gupnp … 1900: Address already in use` at live start is harmless.
+- VAAPI needs `/dev/dri` in the container.

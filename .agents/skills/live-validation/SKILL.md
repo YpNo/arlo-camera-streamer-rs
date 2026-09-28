@@ -1,0 +1,57 @@
+---
+name: live-validation
+description: Manual live gate against a real Arlo camera — build the release binary in the rust-build distrobox, run it, watch with VLC, and read the log lines that prove each path (motion session, stall, user view, reconnect, idle snapshot). Use after any change to the GStreamer-bound files or to the event/orchestration paths, and when asking the owner for a live check.
+---
+# Live Validation Skill
+
+The GStreamer-bound files (`webrtc_pipeline.rs`, `gst_pipeline.rs`, `rtsp.rs`) are excluded
+from coverage, so only a live run proves them. The owner runs the camera; the agent
+prepares the exact commands and says which log lines to look for.
+
+## Build and run
+
+The tool shell cannot run the camera session; hand these to the owner.
+
+```bash
+distrobox enter rust-build -- bash -lc 'cd ~/workspace/arlo-camera-streamer/arlo-camera-streamer-rs && LIBCLANG_PATH=/usr/lib/llvm-19/lib mise exec -- cargo build --release -p arlo-camera-streamer'
+```
+
+```bash
+RUST_LOG=info,arlo_camera_streamer=debug,streamer_infra_media=debug,streamer_infra_arlo=debug ./target/release/arlo-camera-streamer --config config/streamer.toml
+```
+
+Credentials come from the environment (`ARLO_PASSWORD`, `ARLO_IMAP_PASSWORD`,
+`STREAMER_ADMIN_TOKEN`). Logs go to stderr. `list-devices` (same `--config`) signs in,
+completes the MFA pairing and prints `[[cameras]]` snippets without starting servers.
+
+Watch with VLC: `rtsp://<host>:8554/<stream_name>` (bind from `[output.rtsp]`).
+Manual wake without motion: `POST /admin/cameras/<id>/wake` on `admin_bind` with the
+bearer token.
+
+**Stale binary check first.** Before reading a surprising log, confirm the binary is
+the one just built: compare its mtime with the last build, or grep it for a string the
+change introduced (`strings target/release/arlo-camera-streamer | grep '<new log text>'`).
+A stale binary has already cost a validation round.
+
+## What each path must log
+
+| Path | Expected lines, in order |
+|---|---|
+| Motion session | `state transition … to=Activating` → `webrtcbin offer ready` → `answer applied; awaiting first RTP` → `live webrtcbin ready; first RTP flowing` → `to=Live` → (cooldown) `to=Idle` → `webrtcbin bus watch exited` |
+| Stall (kill the source, e.g. cut the camera's network) | `no inbound video RTP; live source stalled` about `live_stall_timeout_secs` after the last packet → `signal=LiveLost(RtpStalled)` → `to=Idle` |
+| Loss during setup (block outbound UDP to Arlo TURN) | `attach_live failed … live source lost during setup: peer-disconnected` quickly, not after 20 s |
+| User view in the Arlo app | `user is watching in the Arlo app; motion activations paused`; motion then logs `not activating` (metric `suppressed-user-view`); `user view … ended; motion activations resumed` |
+| View the bus did not report | `camera busy with a user view in the Arlo app; not activating` (Arlo 14001), back to `Idle` without backoff |
+| VLC reconnect mid-session | one `live push refused` per pump, then `media built during a live session; live switch armed`, live video within ~1 keyframe interval |
+| Idle still | `idle snapshot fetched source="bus"` (or `"device-list"` fallback) → `thumbnail applied to idle overlay` |
+
+Harmless: `gupnp … 1900: Address already in use` at live start.
+
+## Rules for live probes
+
+- Never poll `get_stream_url` (action `get`): it wakes idle cameras. Probes must be
+  event-driven.
+- Never log or paste presigned URLs, egress tokens, cookies or credentials. Event capture
+  (`RUST_LOG=streamer_infra_arlo::events=debug`) logs property **keys** only.
+- Record each validated path in `docs/adr/HANDOFF.md` and `.agent/JOURNAL.md` with the
+  date and the log evidence; say plainly which paths were only unit-tested.

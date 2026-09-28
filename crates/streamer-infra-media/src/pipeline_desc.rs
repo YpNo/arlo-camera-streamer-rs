@@ -27,9 +27,9 @@
 //!
 //! Frigate always wants a complete audio track (silence or live):
 //!
-//! - **Idle**: `audiotestsrc wave=silence` → AAC encode.
-//! - **Live**: pass-through the camera's AAC payload via
-//!   `rtpmp4adepay` → `aacparse`.
+//! - **Idle**: `audiotestsrc wave=silence`, always on.
+//! - **Live**: the camera's Opus RTP, `rtpopusdepay ! opusdec`, mixed
+//!   onto the silent bed by an `audiomixer`; one `avenc_aac` after it.
 //!
 //! ## Output
 //!
@@ -101,21 +101,12 @@ pub(crate) const LIVE_RTP_OPUS_PT: i32 = 111;
 // simply stops receiving live buffers and reverts to silence — no
 // active-pad switch, no detach flip. Raw audio is pinned to F32LE
 // (avenc_aac's only accepted input) on every branch.
-
-// ── Phase 8 (Opus audio bridging) — deferred ────────────────────────
-// A first attempt fed Arlo's Opus RTP into a second `input-selector`
-// via an `appsrc → rtpopusdepay → opusdec` chain. This blocked
-// gst-rtsp-server's media prep because the decoder can't establish
-// its src caps until the first RTP buffer arrives, so PAUSED preroll
-// never completed and the shared media was rebuilt in a loop (no
-// client could play idle either). Reverted to silent-AAC linear
-// audio to restore the daemon.
 //
-// The clean fix (Phase 8b) is to decode audio + video on the
-// **webrtcbin side** and push **raw samples** (not RTP) through
-// `LiveRtpSink`. The persistent pipeline's appsrc then advertises
-// known raw caps (`I420` / `S16LE`) at construction time, no
-// decoder-waits-for-data preroll issue.
+// History: a first attempt fed the same `appsrc → rtpopusdepay →
+// opusdec` chain into a second `input-selector`. Its inactive pad never
+// produced caps, so PAUSED preroll never completed and the shared media
+// was rebuilt in a loop. The decode chain was never the problem; the
+// selector was.
 
 /// Effective sink configuration, materialized per-camera.
 ///

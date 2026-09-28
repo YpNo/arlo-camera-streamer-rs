@@ -16,8 +16,9 @@
 //! on the client side. Each splice fires a force-key-unit at the
 //! encoder so the next encoded frame is a clean IDR.
 //!
-//! Audio is silent AAC at all times (Opus bridging deferred to
-//! Phase 8b — see the `pipeline_desc` module-level note).
+//! Audio goes through an `audiomixer`: a silent bed always, plus the
+//! camera's decoded Opus while live (Phase 8b — see the
+//! `pipeline_desc` module-level note).
 //!
 //! Lifecycle (per camera):
 //!
