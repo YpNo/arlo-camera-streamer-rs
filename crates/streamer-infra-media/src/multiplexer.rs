@@ -35,6 +35,7 @@ use crate::codec_cache::CodecCache;
 use crate::error::MediaError;
 use crate::idle_source::{IdleKind, select_idle_source};
 use crate::live_rtp_sink::LiveSinks;
+use crate::live_watch::setup_or_loss;
 use crate::pipeline_desc::{OutputBranches, build_output_branches};
 use crate::webrtc_pipeline::WebrtcLive;
 
@@ -209,9 +210,11 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         // The session handle goes back to the orchestrator; the
         // notifier is shared by the webrtcbin leg's death detectors
         // (stall watchdog, bus watch, connection-state) — ADR 0004.
-        let (session, notifier) = LiveSession::new();
-        let webrtc =
-            WebrtcLive::start(camera, &ice, signaler, sinks, &self.webrtc, notifier).await?;
+        // A detector that fires during setup fails the attach with its
+        // reason instead of the first-RTP timeout.
+        let (mut session, notifier) = LiveSession::new();
+        let setup = WebrtcLive::start(camera, &ice, signaler, sinks, &self.webrtc, notifier);
+        let webrtc = setup_or_loss(setup, &mut session).await?;
         // On a failure above, the registry's pump task naturally exits
         // once the dropped sink closes the channel; the orchestrator
         // pairs the failure exit with `WebrtcSignaler::teardown`.

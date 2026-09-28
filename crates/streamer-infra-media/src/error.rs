@@ -7,6 +7,7 @@
 //! crate boundary is a `DomainError`.
 
 use streamer_domain::error::DomainError;
+use streamer_domain::state::LiveLossReason;
 use thiserror::Error;
 
 /// Errors raised by the media multiplexer adapter.
@@ -35,6 +36,12 @@ pub enum MediaError {
         /// Configured deadline that elapsed.
         timeout_secs: u64,
     },
+
+    /// A live-loss detector fired before the first inbound RTP packet
+    /// (ICE failed, the pipeline errored): the attach fails with the
+    /// detector's reason instead of waiting out the first-RTP timeout.
+    #[error("live source lost during setup: {}", .0.as_label())]
+    LostDuringSetup(LiveLossReason),
 
     /// RTSP server (mount-point installation, port binding, etc.) failure.
     #[error("RTSP server error: {0}")]
@@ -86,6 +93,17 @@ mod tests {
     fn splice_timeout_includes_seconds_in_message() {
         let err = MediaError::SpliceTimeout { timeout_secs: 7 };
         assert!(err.to_string().contains("7s"));
+    }
+
+    #[test]
+    fn lost_during_setup_names_the_reason_and_maps_to_adapter_transport() {
+        let err = MediaError::LostDuringSetup(LiveLossReason::PeerDisconnected);
+        assert!(err.to_string().contains("peer-disconnected"));
+        let domain: DomainError = err.into();
+        match domain {
+            DomainError::AdapterTransport(msg) => assert!(msg.contains("peer-disconnected")),
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]

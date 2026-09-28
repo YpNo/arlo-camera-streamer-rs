@@ -77,6 +77,8 @@ const OPUS_PT: i32 = 111;
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(3);
 /// Max wait from `set-remote-description` to the first inbound RTP.
 const FIRST_RTP_TIMEOUT_SECS: u64 = 20;
+/// Max wait for ICE gathering to complete the local offer.
+const OFFER_TIMEOUT: Duration = Duration::from_secs(20);
 /// Name of the application message [`WebrtcLive::shutdown`] posts so the
 /// bus-watch thread returns instead of blocking on a bus that will never
 /// carry another message.
@@ -96,10 +98,13 @@ pub(crate) struct WebrtcLive {
 }
 
 impl WebrtcLive {
-    fn running(pipeline: gst::Pipeline, tasks: Vec<tokio::task::JoinHandle<()>>) -> Self {
+    /// Take ownership of `pipeline` before anything can fail, so every
+    /// exit from [`start`](Self::start), cancellation included, shuts it
+    /// down through `Drop`.
+    fn owning(pipeline: gst::Pipeline) -> Self {
         Self {
             pipeline,
-            tasks,
+            tasks: Vec::new(),
             stopped: false,
         }
     }
@@ -135,7 +140,12 @@ impl WebrtcLive {
     ///
     /// `notifier` is the adapter half of the orchestrator's
     /// `LiveSession`; the death detectors described in the module docs
-    /// fire it (first wins) once the session is up.
+    /// fire it (first wins), during setup as well as once the session is
+    /// up.
+    ///
+    /// Cancel-safe: dropping the future mid-setup (the multiplexer does
+    /// when a detector fires first) stops the pipeline and releases the
+    /// bus-watch thread.
     ///
     /// # Errors
     ///
@@ -150,6 +160,7 @@ impl WebrtcLive {
         notifier: LiveLossNotifier,
     ) -> Result<Self, MediaError> {
         let pipeline = gst::Pipeline::default();
+        let mut live = Self::owning(pipeline.clone());
         let webrtcbin = make("webrtcbin")?;
         webrtcbin.set_property_from_str("bundle-policy", "none");
         webrtcbin.set_property("latency", 0u32);
@@ -241,32 +252,13 @@ impl WebrtcLive {
             .map_err(|e| MediaError::Pipeline(format!("pipeline → Playing: {e}")))?;
         spawn_bus_watch(&pipeline, notifier.clone());
 
-        let offer_sdp = tokio::time::timeout(Duration::from_secs(20), offer_rx.recv())
-            .await
-            .map_err(|_| MediaError::Pipeline("timed out gathering local offer".into()))?
-            .ok_or_else(|| MediaError::Pipeline("offer channel closed".into()))?;
-        info!(%camera, bytes = offer_sdp.len(), "webrtcbin offer ready; negotiating with Arlo");
-
-        let answer = signaler
-            .negotiate(camera, offer_sdp)
-            .await
-            .map_err(|e| MediaError::Pipeline(format!("signaling negotiate: {e}")))?;
-
-        let msg = gst_sdp::SDPMessage::parse_buffer(answer.answer_sdp.as_bytes())
-            .map_err(|e| MediaError::Pipeline(format!("parse answer SDP: {e}")))?;
-        let answer_desc =
-            gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, msg);
-        webrtcbin.emit_by_name::<()>(
-            "set-remote-description",
-            &[&answer_desc, &gst::Promise::new()],
-        );
-        info!(%camera, session = %answer.session_id, "answer applied; awaiting first RTP");
+        exchange_sdp(camera, signaler, &webrtcbin, &mut offer_rx).await?;
 
         // Keyframe pump: periodic force-key-unit sent *upstream* into
         // the appsink sink pad (webrtcbin/rtpbin turns it into RTCP
         // PLI/FIR so Arlo emits a fresh IDR). Cheap insurance for fast
         // (re)start — and required: Arlo withholds video until PLI.
-        let mut tasks = vec![spawn_keyframe_pump(kf_pad)];
+        live.tasks.push(spawn_keyframe_pump(kf_pad));
 
         // Resolve once inbound RTP is flowing (matches the port's
         // "attach resolves when the live branch produces frames").
@@ -283,13 +275,13 @@ impl WebrtcLive {
         info!(%camera, "live webrtcbin ready; first RTP flowing");
         // Only now does silence mean anything: the watchdog counts from
         // the first packet, never from negotiation.
-        tasks.push(spawn_stall_watchdog(
+        live.tasks.push(spawn_stall_watchdog(
             activity,
             cfg.live_stall_timeout(),
             notifier,
         ));
 
-        Ok(Self::running(pipeline, tasks))
+        Ok(live)
     }
 }
 
@@ -297,6 +289,37 @@ impl Drop for WebrtcLive {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Wait for the gathered local offer, carry it to Arlo through
+/// `signaler`, and apply the answer to `webrtcbin`.
+async fn exchange_sdp(
+    camera: &CameraId,
+    signaler: &dyn WebrtcSignaler,
+    webrtcbin: &gst::Element,
+    offer_rx: &mut mpsc::UnboundedReceiver<String>,
+) -> Result<(), MediaError> {
+    let offer_sdp = tokio::time::timeout(OFFER_TIMEOUT, offer_rx.recv())
+        .await
+        .map_err(|_| MediaError::Pipeline("timed out gathering local offer".into()))?
+        .ok_or_else(|| MediaError::Pipeline("offer channel closed".into()))?;
+    info!(%camera, bytes = offer_sdp.len(), "webrtcbin offer ready; negotiating with Arlo");
+
+    let answer = signaler
+        .negotiate(camera, offer_sdp)
+        .await
+        .map_err(|e| MediaError::Pipeline(format!("signaling negotiate: {e}")))?;
+
+    let msg = gst_sdp::SDPMessage::parse_buffer(answer.answer_sdp.as_bytes())
+        .map_err(|e| MediaError::Pipeline(format!("parse answer SDP: {e}")))?;
+    let answer_desc =
+        gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, msg);
+    webrtcbin.emit_by_name::<()>(
+        "set-remote-description",
+        &[&answer_desc, &gst::Promise::new()],
+    );
+    info!(%camera, session = %answer.session_id, "answer applied; awaiting first RTP");
+    Ok(())
 }
 
 /// Make an element by factory name, mapping failure to [`MediaError`].

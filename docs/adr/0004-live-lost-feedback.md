@@ -76,9 +76,14 @@ and needs no new port method or counter.
   implementation (production and test doubles) moves together.
   **Test doubles must retain the notifier**; dropping it resolves the
   session as `adapter-dropped` and flips the orchestrator to idle.
-- A loss during the attach window is still surfaced by the existing
-  20 s first-RTP timeout as a `Failure`; racing the two is a separate,
-  GStreamer-bound change.
+- A loss during the attach window fails the attach, not the session:
+  the multiplexer races `WebrtcLive::start` against the session handle
+  (`live_watch::setup_or_loss`, added 2026-09-28), so the attach returns
+  `live source lost during setup: <reason>` and the orchestrator takes
+  its ordinary `Failure` path (backoff, teardown). Before that race the
+  same loss surfaced only as the 20 s first-RTP timeout. `start` must
+  therefore stay cancel-safe: `WebrtcLive` owns the pipeline from its
+  first line and stops it on drop.
 - One extra tokio task per live session (the watchdog wakes once per
   timeout on a healthy source).
 - The GStreamer-side detectors cannot run on a workstation without

@@ -112,9 +112,9 @@ Order agreed with the user; items 1–5 are done.
    `Idle`; detectors: stall watchdog (`webrtc.live_stall_timeout_secs`),
    bus ERROR/EOS, connection-state failed/closed. Pure logic in
    `streamer-infra-media/src/live_watch.rs`; the webrtcbin wiring is blind
-   until CI / the Frigate box runs it (see ADR §Consequences). Follow-up:
-   race the first-RTP wait against an early loss so an attach that dies
-   during ICE fails with the real reason instead of the 20 s timeout.
+   until CI / the Frigate box runs it (see ADR §Consequences). A loss
+   during setup fails the attach with its reason (`setup_or_loss`,
+   2026-09-28) instead of the 20 s first-RTP timeout.
 4. **Two event contexts** — done 2026-09-28 (ADR 0005, revised). The
    piggy-back idea was built, then refuted by three live captures: Arlo
    refuses our WebRTC leg while the app streams (error 14001) and answers

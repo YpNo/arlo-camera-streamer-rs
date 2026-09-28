@@ -2941,6 +2941,7 @@ dependencies = [
  "streamer-domain",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-test",
  "tracing",
 ]
 

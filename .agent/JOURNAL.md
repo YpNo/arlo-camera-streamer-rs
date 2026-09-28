@@ -131,3 +131,16 @@ Tests:    Owner's run: end of session → `idle snapshot fetched source="bus"`
 Changed:  WebrtcLive::shutdown runs once (explicit call + Drop used to post a
           second stop message to a flushing bus: harmless debug noise).
 Open:     Idle-still refresh during a user view: unit-tested, not seen live.
+
+## 2026-09-28 — early loss fails the attach with its reason
+Changed:  live_watch::setup_or_loss races WebrtcLive::start against the
+          LiveSession (biased: a finished setup wins and keeps the report);
+          MediaError::LostDuringSetup(reason). WebrtcLive owns the pipeline
+          from start's first line, so every error or cancellation stops it
+          (a failed attach used to leave it PLAYING with a blocked bus-watch
+          thread). SDP exchange extracted; offer timeout named.
+Why:      ICE failure or a bus error during setup reported nothing useful:
+          the attach waited out the 20 s first-RTP timeout.
+Tests:    Five setup_or_loss tests on the paused clock (red first: the two
+          loss cases hung until bounded), error mapping test.
+Open:     Not provoked live (needs an ICE failure, e.g. blocked UDP).

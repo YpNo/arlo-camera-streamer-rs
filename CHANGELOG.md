@@ -77,6 +77,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently cost a new OTP on every restart.
 - The WebRTC bus-watch thread now exits with its session instead of
   leaking one blocked thread per live session.
+- An attach whose WebRTC leg dies before the first video packet (ICE
+  failed, pipeline error) fails at once with the detector's reason
+  (`live source lost during setup: peer-disconnected`) instead of after
+  the 20 s first-RTP timeout. A failed or abandoned attach now stops its
+  `webrtcbin` pipeline; it used to stay in `PLAYING` with its bus-watch
+  thread blocked.
 - A motion pulse during battery-protect or a failure backoff no longer
   primes a stale hard-cap deadline that cut the next session short.
 - The battery-protect wake-up is rounded up to the reset boundary.
