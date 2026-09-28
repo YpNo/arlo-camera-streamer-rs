@@ -168,3 +168,12 @@ Tests:    Owner capture, 2 min of motion: Arlo repeats fullFrameSnapshot →
 Changed:  Live is a unit variant (since_secs never updated); motion/audio
           pulses logged at debug in the events adapter and the orchestrator
           (outcome + session_ends_in_ms). Hard cap kept at 300 s (owner).
+
+## 2026-09-28 — pulse logging validated live
+Tests:    Owner run, 69f679c: 12 pulses 20:59:59 → 21:02:12, each `camera trigger
+          pulse` + `trigger pulse outcome=absorbed session_ends_in_ms=119999`
+          (cooldown restarts, owner's debounce 120 s); session ended exactly
+          120 s after the last pulse (21:04:12.52, CooldownExpired), under the
+          300 s cap. Each pulse cycle also brings SnapshotAvailable and an
+          `activityState: idle` report (logged "camera idle report without a
+          known user view"): harmless while no user view is tracked.

@@ -141,7 +141,7 @@ never produced; removed 2026-09-28, along with `Live::since_secs`
 Arlo repeats a motion pulse (`true`, then `false` ~5 s later) about
 every 10 s while motion lasts, so the existing "`debounce_secs` after the
 last pulse" rule already gives one long capture plus a cooldown; `false`
-ends a pulse, not the motion. The hard cap stays at 300 s (owner's call). The two-step `ice_servers` + `negotiate` protocol hides a
+ends a pulse, not the motion. The hard cap stays at 300 s (owner's call). Pulse logging validated live the same day: the session ended exactly `debounce_secs` after the last pulse. The two-step `ice_servers` + `negotiate` protocol hides a
 per-camera cache in the adapter — fold the coordinates into one call if
 item 3 touches the port anyway.
 
