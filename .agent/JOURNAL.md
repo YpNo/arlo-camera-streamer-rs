@@ -122,3 +122,12 @@ Why:      Newer idle image (motion snapshot), fewer get_devices calls, and
           a still that stays current while motion is suppressed.
 Tests:    Workspace 361 green; clippy/doc clean. Live check pending.
 Open:     Live check (snapshot line + refreshed still while idle).
+
+## 2026-09-28 — snapshot path validated live; WebrtcLive shutdown made idempotent
+Tests:    Owner's run: end of session → `idle snapshot fetched source="bus"`
+          then `thumbnail applied to idle overlay` (no device-list call);
+          mid-session reconnect: one "push refused" per pump, new media armed
+          and flipped to live 1.2 s later; `webrtcbin bus watch exited`.
+Changed:  WebrtcLive::shutdown runs once (explicit call + Drop used to post a
+          second stop message to a flushing bus: harmless debug noise).
+Open:     Idle-still refresh during a user view: unit-tested, not seen live.

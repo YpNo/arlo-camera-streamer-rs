@@ -91,12 +91,26 @@ pub(crate) struct WebrtcLive {
     pipeline: gst::Pipeline,
     /// `Notify`-gated tasks (PLI keyframe pump) abort on drop.
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Set by the first [`shutdown`](Self::shutdown).
+    stopped: bool,
 }
 
 impl WebrtcLive {
-    /// Stop the pipeline. Idempotent-ish (safe to call once; `Drop`
-    /// also runs it).
+    fn running(pipeline: gst::Pipeline, tasks: Vec<tokio::task::JoinHandle<()>>) -> Self {
+        Self {
+            pipeline,
+            tasks,
+            stopped: false,
+        }
+    }
+
+    /// Stop the pipeline. Idempotent: the multiplexer calls it and `Drop`
+    /// runs it again, when the bus is already flushing and would refuse
+    /// the stop message.
     pub(crate) fn shutdown(&mut self) {
+        if std::mem::replace(&mut self.stopped, true) {
+            return;
+        }
         for t in self.tasks.drain(..) {
             t.abort();
         }
@@ -275,7 +289,7 @@ impl WebrtcLive {
             notifier,
         ));
 
-        Ok(Self { pipeline, tasks })
+        Ok(Self::running(pipeline, tasks))
     }
 }
 
