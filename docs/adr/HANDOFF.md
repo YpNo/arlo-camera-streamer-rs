@@ -67,7 +67,7 @@ of each event is unchanged, which is why `event_mapper.rs` still works.
 - `0002-rtsp-only-output-v1` — superseded by 0006 for HLS.
 - `0003-seamless-input-selector-splice` — accepted; production splice.
 - `0004-live-lost-feedback` — accepted; `LiveSession` handle + `LiveLost` transition.
-- `0005-manual-stream-piggyback` — accepted (revised): observe user views, never compete.
+- `0005-manual-stream-piggyback` — accepted (revised): observe user views, never compete. Re-examined 2026-09-29: all four routes to the app's stream fail (14001, 502, 502, `NO_ROUTE_DESTINATION`); it cannot be relayed.
 - `0006-hls-output-via-loopback-segmenter` — accepted; HLS from a loopback RTSP client of each camera, no re-encode; DASH unsupported (stock dashsink writes only TS, never prunes).
 
 ---

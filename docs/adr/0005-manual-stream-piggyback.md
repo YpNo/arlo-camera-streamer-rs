@@ -3,7 +3,7 @@
 - **Status:** Accepted (revised 2026-09-28 after three live captures; the
   first version, a piggy-backed "manual" session, was built, captured
   against, and removed)
-- **Date:** 2026-09-27, revised 2026-09-28
+- **Date:** 2026-09-27, revised 2026-09-28, re-examined 2026-09-29
 - **Deciders:** Senior architect, project owner
 - **Supersedes:** —
 - **Superseded by:** —
@@ -79,3 +79,30 @@ because of one.
   Not pursued.
 - **Keep attaching and let `Failed` absorb the refusals.** Wastes an API
   call per motion pulse and hides real failures in the backoff metrics.
+
+## Re-examined 2026-09-29: the app's view cannot be relayed
+
+The owner asked again whether the NVR can show a live view started in the
+app when no motion session runs. Every route to that stream was tried,
+during an app view, with the app's own view unaffected each time:
+
+| Route | Result |
+|---|---|
+| WebRTC with `sipInfo/v2` (our normal leg) | Refused: 14001, "RTSP Streaming in progress" |
+| `get_stream_url` watch-along DASH URL | 502 from Arlo's load balancer, three client variants |
+| `startUserStream` (the RTSP start pyaarlo uses) | Accepted. Its reply (not the bus) carries a watch-along DASH URL, 502 again, plus `sipCallInfo` + `iceServers` |
+| WebRTC with `startUserStream`'s `sipCallInfo` | Signaling connects; the gateway answers `code 3, NO_ROUTE_DESTINATION`, empty SDP |
+
+The coordinates `startUserStream` hands out describe a call the camera
+is not in (`callId` and `conferenceId` are null): the camera streams once,
+over RTSP to the app, and Arlo exposes that stream to no client we can
+act as. Impersonating the mobile app to obtain its RTSP URL remains the
+only untried idea and stays rejected (unknown client identity, and a step
+the owner did not ask for). The decision above stands.
+
+The probes are kept, unpushed: arlo-rs branch `probe/force-start-during-view`
+(`probe_force_start_during_view`, `start_user_stream`) and streamer
+branch `probe/join-user-view` (`examples/join_user_view.rs`). They also
+found that current Arlo answers `startUserStream` in the POST reply, which
+arlo-rs's `force_start_stream` ignored (fixed on its own branch).
+

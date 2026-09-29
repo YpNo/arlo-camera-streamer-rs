@@ -189,3 +189,14 @@ Changed:  Phase-4 builders deleted; PT constants shared. mockall 0.15 / rstest 0
 Tests:    Integration suite 6/6 (refused attach then attach; HLS live segment
           luma > 180, retention, cleanup), stable ×3 (~28 s).
 Open:     HLS not yet run on the Frigate box.
+
+## 2026-09-29 — app live view: every route closed
+Tests:    Owner runs, app view open each time, app never affected:
+          startUserStream accepted, URL in the POST reply (not the bus) =
+          watch-along DASH → 502; its sipCallInfo used for our WebRTC leg →
+          gateway `NO_ROUTE_DESTINATION`. With 14001 (sipInfo) and 502
+          (get_stream_url) that closes all four routes. ADR 0005 addendum.
+Found:    arlo-rs force_start_stream ignored the POST reply's URL (always
+          timed out); fixed on its own branch.
+Kept:     local probe branches arlo-rs probe/force-start-during-view,
+          streamer probe/join-user-view (never push: [patch.crates-io]).
