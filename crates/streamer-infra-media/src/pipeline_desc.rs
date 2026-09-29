@@ -59,6 +59,11 @@ pub(crate) const UNIFIED_ENCODER_NAME: &str = "video_enc";
 /// units for both `x264enc` and `vaapih264enc`.
 pub(crate) const VIDEO_BITRATE_KBPS: u32 = 2048;
 
+/// Name of the `textoverlay` carrying the synthetic idle frame's caption.
+/// [`crate::gst_pipeline`] captures it at `media-configure` to switch the
+/// caption (standby / live in the Arlo app) without rebuilding the media.
+pub(crate) const IDLE_CAPTION_NAME: &str = "idle_caption";
+
 /// Name of the `gdkpixbufoverlay` in the synthetic idle branch
 /// (Phase 5). [`crate::gst_pipeline`] captures it at `media-configure`
 /// and sets its `location` to the latest camera snapshot so the
@@ -318,8 +323,8 @@ width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1"
                 "videotestsrc pattern=black is-live=true \
                  ! video/x-raw,\
 width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1 \
-                 ! textoverlay text=\"{escaped}\" valignment=bottom halignment=center \
-                              font-desc=\"Sans 24\" \
+                 ! textoverlay name={IDLE_CAPTION_NAME} text=\"{escaped}\" valignment=bottom \
+                              halignment=center font-desc=\"Sans 24\" \
                  ! gdkpixbufoverlay name={IDLE_OVERLAY_NAME} \
                  ! videoconvert \
                  ! video/x-raw,format=I420,\

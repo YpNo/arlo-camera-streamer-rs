@@ -51,6 +51,12 @@ because of one.
   `StateTransition::CameraBusy` (`Activating → Idle`, no `Failed`
   backoff), releases the signaling, and sets the user-view flag.
 - The admin snapshot gains `user_view` (omitted when false).
+- **The idle frame says where the live picture is** (added 2026-09-29):
+  while the flag is set, its caption reads `LIVE IN ARLO APP · <stream>`
+  instead of `STANDBY · …` (`MediaMultiplexer::set_user_view_notice`).
+  The orchestrator syncs it on every flag change, including a
+  `CameraBusy` refusal and the hold running out; the caption is kept per
+  camera, so a media built later shows it too.
 
 ## Consequences
 

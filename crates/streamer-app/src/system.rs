@@ -271,6 +271,13 @@ mod tests {
     }
     #[async_trait]
     impl MediaMultiplexer for StubMedia {
+        async fn set_user_view_notice(
+            &self,
+            _camera: &CameraId,
+            _shown: bool,
+        ) -> Result<(), DomainError> {
+            Ok(())
+        }
         async fn register(&self, _camera: &CameraId) -> Result<(), DomainError> {
             Ok(())
         }

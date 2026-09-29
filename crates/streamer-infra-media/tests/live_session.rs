@@ -280,6 +280,39 @@ async fn hls_output_segments_the_splice_bounds_disk_and_cleans_up() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_view_notice_switches_the_caption_without_interrupting_the_client() {
+    let _serial = SERIAL.lock().await;
+    if !gstreamer_ready() {
+        return;
+    }
+    let stack = Stack::new(WebrtcConfig::default());
+    stack.media.register(&stack.camera).await.expect("register");
+    let probe = RtspProbe::connect(&stack.url());
+    assert!(
+        eventually(PICTURE_TIMEOUT, || shows_idle(&probe)).await,
+        "client never showed the idle screen"
+    );
+
+    for shown in [true, false, true] {
+        stack
+            .media
+            .set_user_view_notice(&stack.camera, shown)
+            .await
+            .expect("set_user_view_notice");
+        let frames = probe.frames();
+        assert!(
+            eventually(PICTURE_TIMEOUT, || probe.frames() > frames + 2).await,
+            "frames stopped after the caption changed"
+        );
+    }
+    assert!(shows_idle(&probe), "the caption stays on the idle screen");
+    assert!(
+        !probe.interrupted(),
+        "a caption change interrupted the client"
+    );
+}
+
 /// Segment files in `dir`, oldest first (names are zero-padded).
 fn segments(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut found: Vec<_> = std::fs::read_dir(dir)

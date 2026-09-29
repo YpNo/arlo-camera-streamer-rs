@@ -58,6 +58,10 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   report), `ManualStreamEnded` clears it. Motion during a view is counted as
   `MotionOutcome::SuppressedUserView` and starts nothing; a running session is left alone.
   An unreported view shows up as `DomainError::CameraBusy` (Arlo 14001) from `attach_live`.
+  The app's view can never be relayed (ADR 0005 addendum: four routes tried).
+- **User-view notice**: `sync_user_view_notice()` keeps `media.set_user_view_notice` in
+  step with `user_view_active()`. Call it after every change of `user_view_until`
+  (report, `idle`, `CameraBusy`); a select arm fires it when the hold runs out.
 - **Debouncer priming** only in `Idle|Live` (`motion_signal()`); priming in
   `Failed`/`BatteryProtect` left a stale hard-cap deadline that cut the next session short.
 - **Snapshots** (`CameraEvent::SnapshotAvailable`, no URL in the domain) refresh the idle

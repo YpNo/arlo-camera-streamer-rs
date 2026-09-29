@@ -33,7 +33,7 @@ use streamer_domain::stream::{Codec, LiveSession};
 
 use crate::codec_cache::CodecCache;
 use crate::error::MediaError;
-use crate::idle_source::{IdleKind, select_idle_source};
+use crate::idle_source::{IdleKind, select_idle_source, standby_caption, user_view_caption};
 use crate::live_rtp_sink::LiveSinks;
 use crate::live_watch::setup_or_loss;
 use crate::pipeline_desc::{OutputBranches, build_output_branches};
@@ -82,6 +82,10 @@ pub trait PipelineRegistry: Send + Sync {
 
     /// Replace the idle still frame for the camera (best-effort).
     async fn refresh_thumbnail(&self, camera: &CameraId, jpeg: Bytes) -> Result<(), MediaError>;
+
+    /// Replace the caption of the camera's idle frame, now and for any
+    /// media built later.
+    async fn set_idle_caption(&self, camera: &CameraId, caption: String) -> Result<(), MediaError>;
 }
 
 /// `MediaMultiplexer` implementation generic over a [`PipelineRegistry`].
@@ -258,6 +262,28 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
             .await
             .map_err(Into::into)
     }
+
+    #[instrument(skip(self), fields(camera = %camera))]
+    async fn set_user_view_notice(
+        &self,
+        camera: &CameraId,
+        shown: bool,
+    ) -> Result<(), DomainError> {
+        self.ensure_registered(camera).await?;
+        let stream = self.stream_name(camera)?;
+        let caption = if shown {
+            user_view_caption(stream)
+        } else {
+            standby_caption(
+                stream,
+                &Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            )
+        };
+        self.registry
+            .set_idle_caption(camera, caption)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +322,7 @@ mod tests {
         attached: Mutex<Vec<CameraId>>,
         detached: Mutex<Vec<CameraId>>,
         thumbs: Mutex<Vec<(CameraId, Bytes)>>,
+        captions: Mutex<Vec<(CameraId, String)>>,
         register_returns: Mutex<Option<MediaError>>,
     }
 
@@ -340,6 +367,18 @@ mod tests {
             jpeg: Bytes,
         ) -> Result<(), MediaError> {
             self.thumbs.lock().unwrap().push((camera.clone(), jpeg));
+            Ok(())
+        }
+
+        async fn set_idle_caption(
+            &self,
+            camera: &CameraId,
+            caption: String,
+        ) -> Result<(), MediaError> {
+            self.captions
+                .lock()
+                .unwrap()
+                .push((camera.clone(), caption));
             Ok(())
         }
     }
@@ -476,6 +515,35 @@ mod tests {
         let detached = reg.detached.lock().unwrap();
         assert_eq!(detached.len(), 1);
         assert_eq!(detached[0], cam("CAM_A"));
+    }
+
+    #[tokio::test]
+    async fn set_user_view_notice_switches_between_app_and_standby_captions() {
+        let reg = Arc::new(FakeRegistry::default());
+        let m = mux(reg.clone());
+        m.register(&cam("CAM_A")).await.unwrap();
+        m.set_user_view_notice(&cam("CAM_A"), true).await.unwrap();
+        m.set_user_view_notice(&cam("CAM_A"), false).await.unwrap();
+        let captions = reg.captions.lock().unwrap();
+        assert_eq!(
+            captions[0],
+            (cam("CAM_A"), "LIVE IN ARLO APP · front_door".to_string())
+        );
+        assert!(
+            captions[1].1.starts_with("STANDBY · front_door · "),
+            "{:?}",
+            captions[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_user_view_notice_before_register_returns_unknown_camera() {
+        let m = mux(Arc::new(FakeRegistry::default()));
+        let err = m
+            .set_user_view_notice(&cam("CAM_A"), true)
+            .await
+            .expect_err("must fail");
+        assert!(matches!(err, DomainError::UnknownCamera(_)));
     }
 
     #[tokio::test]

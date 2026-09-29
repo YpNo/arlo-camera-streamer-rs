@@ -87,11 +87,11 @@ use streamer_domain::config::VideoEncoder;
 
 use crate::error::MediaError;
 use crate::hls::{HlsSegmenter, prepare_dir};
-use crate::idle_source::{IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH};
+use crate::idle_source::{IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH, standby_caption};
 use crate::live_rtp_sink::{LiveSinkReceivers, LiveSinks};
 use crate::multiplexer::PipelineRegistry;
 use crate::pipeline_desc::{
-    HlsBranchConfig, IDLE_OVERLAY_NAME, OutputBranches, UNIFIED_ENCODER_NAME,
+    HlsBranchConfig, IDLE_CAPTION_NAME, IDLE_OVERLAY_NAME, OutputBranches, UNIFIED_ENCODER_NAME,
     combined_launch_string,
 };
 use crate::rtsp::RtspServer;
@@ -123,6 +123,9 @@ struct LiveWiring {
     /// shows the last thumbnail. Present only for the synthetic idle
     /// variant; the JPEG-still idle already shows an image.
     idle_overlay: Option<gst::Element>,
+    /// The synthetic idle branch's caption `textoverlay`; its `text` is
+    /// switched by [`GstPipelineRegistry::set_idle_caption`].
+    idle_caption: Option<gst::Element>,
     /// The live audio `appsrc` (`live_audio_rtp_src`, Phase 8b) — Opus
     /// RTP pushed here is decoded and mixed onto the silent bed by the
     /// `audiomixer`. No selector flip needed: the mixer reverts to
@@ -156,10 +159,18 @@ struct CameraEntry {
     live_active: Arc<AtomicBool>,
     /// Active live ingestion if any.
     session: Option<LiveSession>,
+    /// Caption the idle frame should show, when it differs from the one
+    /// in the launch string (`None`). Read by the `media-configure` hook
+    /// so a media built later shows it too.
+    caption: CaptionSlot,
     /// HLS segmenter when `[output.hls]` is set (ADR 0006). Held for its
     /// lifetime: dropping it stops the segmenter.
     _hls: Option<HlsSegmenter>,
 }
+
+/// The idle caption requested for a camera, shared with its
+/// `media-configure` hook.
+type CaptionSlot = Arc<StdMutex<Option<String>>>;
 
 /// The wiring of the media currently serving this camera's clients, or
 /// `None` while no client is connected. Shared by the `GLib` media hooks,
@@ -219,7 +230,7 @@ impl GstPipelineRegistry {
                 let ts = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
                 IdleKind::Synthetic {
                     stream_name: stream_name.clone(),
-                    overlay: format!("STANDBY · {stream_name} · {ts}"),
+                    overlay: standby_caption(stream_name, &ts),
                 }
             }
             // JPEG-still keeps its bytes; overlay is N/A.
@@ -269,6 +280,8 @@ impl PipelineRegistry for GstPipelineRegistry {
 
         let wiring: WiringSlot = Arc::new(StdMutex::new(None));
         let live_active = Arc::new(AtomicBool::new(false));
+        let caption: CaptionSlot = Arc::new(StdMutex::new(None));
+        let caption_for_cb = caption.clone();
         let wiring_for_cb = wiring.clone();
         let live_for_cb = live_active.clone();
         let cam_for_cb = camera.clone();
@@ -287,6 +300,11 @@ impl PipelineRegistry for GstPipelineRegistry {
                             if path.exists() {
                                 apply_thumbnail_overlay(overlay, &path);
                             }
+                        }
+                        if let (Some(text), Some(el)) =
+                            (lock(&caption_for_cb).as_deref(), &w.idle_caption)
+                        {
+                            el.set_property("text", text);
                         }
                         // A client connected in the middle of a live
                         // session: splice the live video into this new
@@ -333,6 +351,7 @@ impl PipelineRegistry for GstPipelineRegistry {
                 wiring,
                 live_active,
                 session: None,
+                caption,
                 _hls: hls,
             },
         );
@@ -452,6 +471,22 @@ impl PipelineRegistry for GstPipelineRegistry {
         }
         Ok(())
     }
+
+    async fn set_idle_caption(&self, camera: &CameraId, caption: String) -> Result<(), MediaError> {
+        let guard = self.state.read().await;
+        let entry = guard
+            .get(camera)
+            .ok_or_else(|| MediaError::UnknownCamera(camera.to_string()))?;
+        if let Some(el) = lock(&entry.wiring)
+            .as_ref()
+            .and_then(|w| w.idle_caption.clone())
+        {
+            el.set_property("text", &caption);
+        }
+        debug!(camera = %camera, %caption, "idle caption set");
+        *lock(&entry.caption) = Some(caption);
+        Ok(())
+    }
 }
 
 /// Connect diagnostic signals on the freshly-constructed `RTSPMedia`
@@ -519,8 +554,9 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
     let encoder = bin.by_name(UNIFIED_ENCODER_NAME).ok_or_else(|| {
         MediaError::Pipeline(format!("encoder '{UNIFIED_ENCODER_NAME}' not found"))
     })?;
-    // Optional: only the synthetic idle branch carries the overlay.
+    // Optional: only the synthetic idle branch carries the overlays.
     let idle_overlay = bin.by_name(IDLE_OVERLAY_NAME);
+    let idle_caption = bin.by_name(IDLE_CAPTION_NAME);
 
     // Optional: live audio appsrc (Phase 8b). Non-blocking push like
     // the video appsrc so a full queue drops instead of stalling.
@@ -539,6 +575,7 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
         sink_live,
         encoder,
         idle_overlay,
+        idle_caption,
         audio_appsrc,
     })
 }

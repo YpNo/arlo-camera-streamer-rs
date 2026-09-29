@@ -54,6 +54,19 @@ impl IdleKind {
     }
 }
 
+/// Caption of the synthetic idle frame: `STANDBY · <stream> · <timestamp>`.
+#[must_use]
+pub fn standby_caption(stream_name: &StreamName, timestamp: &str) -> String {
+    format!("STANDBY · {stream_name} · {timestamp}")
+}
+
+/// Caption shown while the user watches the camera in the Arlo app,
+/// which is the one live view the daemon cannot relay (ADR 0005).
+#[must_use]
+pub fn user_view_caption(stream_name: &StreamName) -> String {
+    format!("LIVE IN ARLO APP · {stream_name}")
+}
+
 /// Pure selection: prefer the thumbnail when present and non-empty,
 /// otherwise fall back to a synthetic standby frame with overlay.
 ///
@@ -69,7 +82,7 @@ pub fn select_idle_source(
         Some(jpeg) if !jpeg.is_empty() => IdleKind::JpegStill { jpeg },
         _ => IdleKind::Synthetic {
             stream_name: stream_name.clone(),
-            overlay: format!("STANDBY · {stream_name} · {timestamp}"),
+            overlay: standby_caption(stream_name, timestamp),
         },
     }
 }
@@ -126,5 +139,15 @@ mod tests {
             overlay: String::new(),
         };
         assert_eq!(synthetic.kind_label(), "synthetic");
+    }
+
+    #[test]
+    fn captions_name_the_stream_and_say_where_the_live_view_is() {
+        let name = StreamName::parse("front_door").unwrap();
+        assert_eq!(
+            standby_caption(&name, "2026-09-29T21:00:00"),
+            "STANDBY · front_door · 2026-09-29T21:00:00"
+        );
+        assert_eq!(user_view_caption(&name), "LIVE IN ARLO APP · front_door");
     }
 }

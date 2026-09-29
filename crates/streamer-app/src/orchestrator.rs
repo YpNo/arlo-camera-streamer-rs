@@ -115,6 +115,10 @@ pub struct CameraOrchestrator {
     /// Until when the user is considered to be watching the camera in
     /// the Arlo app (ADR 0005); `None` when no view is known.
     user_view_until: Option<Instant>,
+    /// Whether the idle frame currently shows the "live in the Arlo app"
+    /// notice; kept in step with [`Self::user_view_active`] by
+    /// [`Self::sync_user_view_notice`].
+    user_view_notice: bool,
     signaler: Arc<dyn WebrtcSignaler>,
     thumbnails: Arc<dyn ArloThumbnailSource>,
     media: Arc<dyn MediaMultiplexer>,
@@ -167,6 +171,7 @@ impl CameraOrchestrator {
             failed_deadline: None,
             live: None,
             user_view_until: None,
+            user_view_notice: false,
             signaler,
             thumbnails,
             media,
@@ -228,6 +233,7 @@ impl CameraOrchestrator {
 
         loop {
             let deadline = self.next_deadline();
+            let notice_expiry = self.user_view_notice_expiry();
 
             select! {
                 biased;
@@ -268,6 +274,11 @@ impl CameraOrchestrator {
                     if let Err(e) = self.handle_deadline().await {
                         warn!(error = %e, "deadline handling failed");
                     }
+                }
+                // A user view whose `idle` report never came: its hold
+                // runs out, so the notice must go.
+                () = maybe_sleep_until(notice_expiry) => {
+                    self.sync_user_view_notice().await;
                 }
             }
         }
@@ -394,10 +405,12 @@ impl CameraOrchestrator {
             }
             CameraEvent::ManualStream { .. } => {
                 self.on_user_view_started();
+                self.sync_user_view_notice().await;
                 return Ok(());
             }
             CameraEvent::ManualStreamEnded { .. } => {
                 self.on_user_view_ended();
+                self.sync_user_view_notice().await;
                 return Ok(());
             }
             CameraEvent::SnapshotAvailable { .. } => {
@@ -475,6 +488,30 @@ impl CameraOrchestrator {
 
     fn user_view_active(&self) -> bool {
         self.user_view_until.is_some_and(|until| now() < until)
+    }
+
+    /// When the shown notice must be re-checked: the end of the hold.
+    fn user_view_notice_expiry(&self) -> Option<Instant> {
+        self.user_view_notice
+            .then_some(self.user_view_until)
+            .flatten()
+    }
+
+    /// Make the idle frame's notice match the user-view flag. Best-effort:
+    /// a failure is logged and retried at the next change.
+    async fn sync_user_view_notice(&mut self) {
+        let wanted = self.user_view_active();
+        if wanted == self.user_view_notice {
+            return;
+        }
+        match self
+            .media
+            .set_user_view_notice(&self.camera_id, wanted)
+            .await
+        {
+            Ok(()) => self.user_view_notice = wanted,
+            Err(e) => warn!(error = %e, shown = wanted, "user-view notice not updated"),
+        }
     }
 
     /// Mark the camera as viewed in the Arlo app, or refresh the mark.
@@ -657,6 +694,7 @@ impl CameraOrchestrator {
             Err(DomainError::CameraBusy(reason)) => {
                 info!(%reason, "camera busy with a user view in the Arlo app; not activating");
                 self.user_view_until = Some(now() + USER_VIEW_HOLD);
+                self.sync_user_view_notice().await;
                 vec![StateTransition::CameraBusy]
             }
             Err(e) => {
@@ -930,6 +968,8 @@ mod tests {
         /// When `false`, notifiers are dropped immediately — simulates an
         /// adapter that vanishes under a live session.
         retain_notifiers: std::sync::atomic::AtomicBool,
+        /// `set_user_view_notice` calls, in order.
+        notices: Mutex<Vec<bool>>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -952,6 +992,9 @@ mod tests {
         }
         async fn calls(&self) -> Vec<MediaCall> {
             std::mem::take(&mut *self.events.lock().await)
+        }
+        async fn notices(&self) -> Vec<bool> {
+            self.notices.lock().await.clone()
         }
         /// Report the `idx`-th session (0-based, in attach order) lost.
         /// Returns what the notifier returned (`false` = unobservable).
@@ -1002,6 +1045,14 @@ mod tests {
             _jpeg: Bytes,
         ) -> Result<(), DomainError> {
             self.events.lock().await.push(MediaCall::RefreshThumbnail);
+            Ok(())
+        }
+        async fn set_user_view_notice(
+            &self,
+            _camera: &CameraId,
+            shown: bool,
+        ) -> Result<(), DomainError> {
+            self.notices.lock().await.push(shown);
             Ok(())
         }
     }
@@ -1457,6 +1508,61 @@ mod tests {
             1,
             "a lost idle report must not pause motion for good"
         );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_view_notice_follows_the_app_view() {
+        let cfg = camera_cfg(60, 300);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, StubSignaler::with_responses(vec![]), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        send(&tx, manual()).await; // a repeated report changes nothing
+        assert_eq!(media.notices().await, vec![true]);
+        send(&tx, manual_ended()).await;
+        assert_eq!(media.notices().await, vec![true, false]);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_view_notice_clears_when_the_hold_expires() {
+        let cfg = camera_cfg(60, 300);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, StubSignaler::with_responses(vec![]), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        tokio::time::advance(USER_VIEW_HOLD.saturating_sub(Duration::from_secs(1))).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(media.notices().await, vec![true], "still inside the hold");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            media.notices().await,
+            vec![true, false],
+            "a lost idle report must not leave the notice up"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_view_notice_is_shown_when_an_attach_is_refused_as_busy() {
+        let cfg = camera_cfg(60, 300);
+        let media = RecordingMedia::new();
+        let sr = StubSignaler::with_responses(vec![Err(busy())]);
+        let (orch, tx, token) = build(&cfg, sr, media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        assert_eq!(media.notices().await, vec![true]);
 
         token.cancel();
         handle.await.unwrap();

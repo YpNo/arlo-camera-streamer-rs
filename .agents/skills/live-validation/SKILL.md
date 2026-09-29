@@ -41,7 +41,7 @@ A stale binary has already cost a validation round.
 | Motion session | `state transition … to=Activating` → `webrtcbin offer ready` → `answer applied; awaiting first RTP` → `live webrtcbin ready; first RTP flowing` → `to=Live` → (cooldown) `to=Idle` → `webrtcbin bus watch exited` |
 | Stall (kill the source, e.g. cut the camera's network) | `no inbound video RTP; live source stalled` about `live_stall_timeout_secs` after the last packet → `signal=LiveLost(RtpStalled)` → `to=Idle` |
 | Loss during setup (block outbound UDP to Arlo TURN) | `attach_live failed … live source lost during setup: peer-disconnected` quickly, not after 20 s |
-| User view in the Arlo app | `user is watching in the Arlo app; motion activations paused`; motion then logs `not activating` (metric `suppressed-user-view`); `user view … ended; motion activations resumed` |
+| User view in the Arlo app | VLC's idle frame reads `LIVE IN ARLO APP`; `user is watching in the Arlo app; motion activations paused`; motion then logs `not activating` (metric `suppressed-user-view`); `user view … ended; motion activations resumed` |
 | View the bus did not report | `camera busy with a user view in the Arlo app; not activating` (Arlo 14001), back to `Idle` without backoff |
 | VLC reconnect mid-session | one `live push refused` per pump, then `media built during a live session; live switch armed`, live video within ~1 keyframe interval |
 | Idle still | `idle snapshot fetched source="bus"` (or `"device-list"` fallback) → `thumbnail applied to idle overlay` |

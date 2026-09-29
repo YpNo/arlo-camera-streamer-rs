@@ -19,7 +19,7 @@ Frigate's pull from Arlo's push**:
 | Activating | Frame freezes briefly | `start_stream` in flight |
 | Live  | Real H.264/H.265 from the camera, until `debounce_secs` after the last motion | Awake |
 | Battery-protect | Idle frame returns | Sleeping (quota exhausted) |
-| Viewed in app | You watch the camera in the Arlo app: Arlo allows one stream per camera, so the daemon does not start one; motion resumes when you close the app | Awake (because of you) |
+| Viewed in app | You watch the camera in the Arlo app: Arlo allows one stream per camera and exposes the app's to no one else, so the idle frame reads `LIVE IN ARLO APP`; motion resumes when you close the app | Awake (because of you) |
 
 The transition is driven by Arlo's **MQTT event bus**: when the camera
 fires a motion event, the daemon negotiates a WebRTC session with Arlo's

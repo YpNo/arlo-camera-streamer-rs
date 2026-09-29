@@ -193,6 +193,19 @@ pub trait MediaMultiplexer: Send + Sync {
     /// Returns [`DomainError::AdapterTransport`] if the JPEG cannot
     /// be decoded or pushed to the idle source.
     async fn refresh_thumbnail(&self, camera: &CameraId, jpeg: Bytes) -> Result<(), DomainError>;
+
+    /// Show (`true`) or clear (`false`) the notice that the user is
+    /// watching the camera in the Arlo app, on the idle frame: that view
+    /// cannot be relayed (ADR 0005), so viewers are told where the live
+    /// picture is instead of seeing a plain standby still. Also applies
+    /// to any media built later.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::UnknownCamera`] before [`Self::register`];
+    /// [`DomainError::AdapterTransport`] if the caption cannot be set.
+    async fn set_user_view_notice(&self, camera: &CameraId, shown: bool)
+    -> Result<(), DomainError>;
 }
 
 /// Application-layer instrumentation sink.
