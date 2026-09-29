@@ -174,6 +174,9 @@ Verified in production; do not rediscover:
   1.26 dev packages, so the media crate builds and unit-tests locally; the
   pipeline itself still needs a camera.
 - **`gupnp … 1900: Address already in use` at live start is harmless.**
+- **`Sticky event misordering, got 'segment' before 'caps'` is harmless.**
+  gst-rtsp-server logs it (a GLib warning, one per pad) when a UDP client
+  joins a media already playing, e.g. VLC after the HLS segmenter.
 - **VAAPI needs `/dev/dri`** in Docker (`--device /dev/dri`).
 - **Arlo's TCP TURN is unusable**; the signaler adapter drops it and keeps
   UDP only (proven live).

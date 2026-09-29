@@ -104,4 +104,10 @@ so a session can start with no media or outlive it.
   that exits on EOS or `BUS_WATCH_STOP`.
 - Signal closures hold `WeakRef`s to the pipeline/pads, never strong refs.
 - `gupnp … 1900: Address already in use` at live start is harmless.
+- `GStreamer-WARNING … Sticky event misordering, got 'segment' before 'caps'` on
+  `funnelN:src` / `rtpbin0:recv_rtcp_sink_N` is harmless: gst-rtsp-server logs it when a
+  **UDP** client joins a media already playing for another client (with HLS on, the
+  segmenter is always that first client). It is a GLib `g_warning`, not silenced by
+  `GST_DEBUG`; reproduced 2026-09-29 (TCP client, then UDP client). Only TCP-only RTSP
+  would avoid it, at the cost of UDP-only clients.
 - VAAPI needs `/dev/dri` in the container.

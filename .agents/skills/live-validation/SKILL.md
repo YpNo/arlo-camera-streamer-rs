@@ -46,7 +46,9 @@ A stale binary has already cost a validation round.
 | VLC reconnect mid-session | one `live push refused` per pump, then `media built during a live session; live switch armed`, live video within ~1 keyframe interval |
 | Idle still | `idle snapshot fetched source="bus"` (or `"device-list"` fallback) → `thumbnail applied to idle overlay` |
 
-Harmless: `gupnp … 1900: Address already in use` at live start.
+Harmless: `gupnp … 1900: Address already in use` at live start, and
+`Sticky event misordering, got 'segment' before 'caps'` when a UDP client (VLC) joins a
+media already playing (for instance after the HLS segmenter).
 
 ## Rules for live probes
 
