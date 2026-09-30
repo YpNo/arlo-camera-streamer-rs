@@ -313,6 +313,32 @@ async fn user_view_notice_switches_the_caption_without_interrupting_the_client()
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_client_over_udp_joins_a_playing_media() {
+    // With HLS on, the segmenter is always the first client, so every
+    // viewer joins a media that is already playing (VLC over UDP).
+    let _serial = SERIAL.lock().await;
+    if !gstreamer_ready() {
+        return;
+    }
+    let stack = Stack::new(WebrtcConfig::default());
+    stack.media.register(&stack.camera).await.expect("register");
+    let first = RtspProbe::connect(&stack.url());
+    assert!(
+        eventually(PICTURE_TIMEOUT, || shows_idle(&first)).await,
+        "first client never showed the idle screen"
+    );
+
+    let second = RtspProbe::connect_over(&stack.url(), "udp");
+    assert!(
+        eventually(PICTURE_TIMEOUT, || shows_idle(&second)).await,
+        "a UDP client joining a playing media got no picture (frames={})",
+        second.frames()
+    );
+    assert!(!second.interrupted(), "the joining client saw an error");
+    assert!(!first.interrupted(), "the first client was disturbed");
+}
+
 /// Segment files in `dir`, oldest first (names are zero-padded).
 fn segments(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut found: Vec<_> = std::fs::read_dir(dir)

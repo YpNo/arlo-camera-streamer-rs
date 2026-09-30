@@ -32,10 +32,16 @@ pub struct RtspProbe {
 }
 
 impl RtspProbe {
-    /// Connect to `url` and start playing.
+    /// Connect to `url` over TCP (interleaved) and start playing.
     pub fn connect(url: &str) -> Self {
+        Self::connect_over(url, "tcp")
+    }
+
+    /// Connect to `url` with the given `rtspsrc` `protocols` (`tcp`,
+    /// `udp`) and start playing. VLC and many cameras default to UDP.
+    pub fn connect_over(url: &str, protocols: &str) -> Self {
         let launch = format!(
-            "rtspsrc location={url} protocols=tcp latency=0 \
+            "rtspsrc location={url} protocols={protocols} latency=0 \
              ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert \
              ! video/x-raw,format=GRAY8 \
              ! appsink name=frames sync=false max-buffers=1 drop=true"
