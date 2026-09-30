@@ -12,7 +12,10 @@
 //! - a client that connects in the middle of a session gets live video;
 //! - a source that goes silent is reported as `RtpStalled` (ADR 0004);
 //! - a call that dies during setup fails the attach with the detector's
-//!   reason, well before the 20 s first-RTP timeout.
+//!   reason, well before the 20 s first-RTP timeout;
+//! - the user's app view, relayed from an RTSP stream (a white source
+//!   served by the same test server), reaches the camera's clients and
+//!   its end is reported (ADR 0007).
 //!
 //! Skipped when a GStreamer element is missing, unless
 //! `STREAMER_REQUIRE_GST_IT=1` (set in CI). The tests share the default
@@ -26,6 +29,7 @@ use streamer_domain::config::{HlsOutput, WebrtcConfig};
 use streamer_domain::error::DomainError;
 use streamer_domain::port::{MediaMultiplexer, WebrtcSignaler};
 use streamer_domain::state::LiveLossReason;
+use streamer_domain::stream::WatchAlongUrl;
 
 use streamer_infra_media::pipeline_desc::HLS_SEGMENTS_BEYOND_PLAYLIST;
 use support::gateway::FakeGateway;
@@ -337,6 +341,96 @@ async fn second_client_over_udp_joins_a_playing_media() {
     );
     assert!(!second.interrupted(), "the joining client saw an error");
     assert!(!first.interrupted(), "the first client was disturbed");
+}
+
+/// A live white H.264 source, standing in for the app's watch-along
+/// stream; `num_buffers` bounds the finite variant.
+fn white_source(num_buffers: Option<u32>) -> String {
+    let bound = num_buffers.map_or(String::new(), |n| format!(" num-buffers={n}"));
+    format!(
+        "( videotestsrc is-live=true pattern=white{bound} \
+           ! video/x-raw,width=320,height=240,framerate=15/1 \
+           ! x264enc tune=zerolatency speed-preset=ultrafast key-int-max=15 \
+           ! rtph264pay name=pay0 pt=96 config-interval=1 )"
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_view_relay_shows_the_source_on_the_camera_mount() {
+    let _serial = SERIAL.lock().await;
+    if !gstreamer_ready() {
+        return;
+    }
+    let stack = Stack::new(WebrtcConfig::default());
+    stack.media.register(&stack.camera).await.expect("register");
+    let probe = RtspProbe::connect(&stack.url());
+    assert!(
+        eventually(PICTURE_TIMEOUT, || shows_idle(&probe)).await,
+        "client never showed the idle screen"
+    );
+
+    let source = stack.install_source("/app_view", &white_source(None));
+    let url = WatchAlongUrl::parse(source).expect("source url");
+    let session = stack
+        .media
+        .attach_user_view(&stack.camera, &url)
+        .await
+        .expect("attach_user_view");
+    assert!(
+        eventually(PICTURE_TIMEOUT, || shows_live(&probe)).await,
+        "the relayed view never reached the client (luma={})",
+        probe.mean_luma()
+    );
+
+    stack
+        .media
+        .detach_live(&stack.camera)
+        .await
+        .expect("detach_live");
+    drop(session);
+    assert!(
+        eventually(PICTURE_TIMEOUT, || shows_idle(&probe)).await,
+        "client never returned to idle"
+    );
+    assert!(!probe.interrupted(), "the relay interrupted the client");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_view_relay_reports_the_loss_when_the_source_ends() {
+    let _serial = SERIAL.lock().await;
+    if !gstreamer_ready() {
+        return;
+    }
+    let config = fast_stall();
+    let stall_timeout = config.live_stall_timeout();
+    let stack = Stack::new(config);
+    stack.media.register(&stack.camera).await.expect("register");
+    // Two seconds of video, then the source ends.
+    let source = stack.install_source("/short_view", &white_source(Some(30)));
+    let url = WatchAlongUrl::parse(source).expect("source url");
+    let mut session = stack
+        .media
+        .attach_user_view(&stack.camera, &url)
+        .await
+        .expect("attach_user_view");
+
+    let reason = tokio::time::timeout(stall_timeout * 3, session.lost())
+        .await
+        .expect("no loss reported after the source ended");
+    assert!(
+        matches!(
+            reason,
+            LiveLossReason::EndOfStream
+                | LiveLossReason::RtpStalled
+                | LiveLossReason::PeerDisconnected
+        ),
+        "unexpected reason {reason:?}"
+    );
+    stack
+        .media
+        .detach_live(&stack.camera)
+        .await
+        .expect("detach_live");
 }
 
 /// Segment files in `dir`, oldest first (names are zero-padded).

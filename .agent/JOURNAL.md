@@ -200,3 +200,25 @@ Found:    arlo-rs force_start_stream ignored the POST reply's URL (always
           timed out); fixed on its own branch.
 Kept:     local probe branches arlo-rs probe/force-start-during-view,
           streamer probe/join-user-view (never push: [patch.crates-io]).
+
+## 2026-09-30 — the app's live view is reachable; relay module (ADR 0007 step 1)
+Found:    Arlo answers the `get` stream query per User-Agent (pyaarlo's
+          `user_agent` option; owner's pyaarlo PR #166). As the iOS app
+          identity, during an app view, it returns the view's own
+          `rtsps://<ip>:443/vzmodulelive/…?egressToken=…&watchalong=true`.
+          A raw RTSP client plays it (OPTIONS/DESCRIBE/SETUP/PLAY 200, RTP
+          flowing, app unaffected); rtspsrc gets 403 at SETUP for a reason
+          not identified (not the token: SETUP without it is accepted).
+          TLS: raw IP, certificate cannot match → validation off.
+Changed:  arlo-rs branch fix/force-start-stream-reply-url: force_start_stream
+          reply URL fix + get_stream_url_as / ios_app_user_agent + probe
+          (PR-ready, 349 tests). Streamer: WatchAlongUrl (redacted),
+          UserViewSource port, MediaMultiplexer::attach_user_view,
+          rtsp_relay.rs (own RTSP client → LiveSinks.video, PT rewritten to
+          103, keep-alive, RTCP RR, shared stall watchdog), LiveLeg enum,
+          arm_live shared by both legs; tokio net/io-util made explicit.
+Tests:    Relay pure pieces unit-tested; integration: relayed white source
+          reaches the client, source end reported; 10/10 ×3.
+Open:     Orchestrator wiring + Arlo adapter (UserViewSource) + ADR 0007;
+          Arlo's H.264 may lack in-band SPS/PPS (SDP carries sprop) —
+          check at the live gate, inject via appsrc caps if black.

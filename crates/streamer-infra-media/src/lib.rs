@@ -36,6 +36,7 @@
 //! | [`gst_pipeline`]|      | Production [`PipelineRegistry`] (integration-tested).|
 //! | [`live_rtp_sink`]|  ✓  | Per-camera RTP byte sink (`appsink` → consumer).   |
 //! | [`live_watch`]  |  ✓   | Live-loss detector logic: RTP activity clock + stall rule (ADR 0004). |
+//! | `rtsp_relay`    |  ✓*  | RTSP client relaying the user's app view into the live sinks (ADR 0007); pure parts unit-tested, the connection integration-tested. |
 //! | [`webrtc_pipeline`]| | Per-camera `webrtcbin` live leg (integration-tested).|
 //!
 //! [`MediaMultiplexer`]: streamer_domain::port::MediaMultiplexer
@@ -53,6 +54,7 @@ pub mod live_watch;
 pub mod multiplexer;
 pub mod pipeline_desc;
 pub mod rtsp;
+mod rtsp_relay;
 pub mod splice;
 pub mod webrtc_pipeline;
 

@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use futures::channel::oneshot;
 use serde::{Deserialize, Serialize};
 
+use crate::error::DomainError;
 use crate::state::LiveLossReason;
 
 /// One ICE (STUN/TURN) server the media adapter must configure on its
@@ -74,6 +75,74 @@ pub enum IceAddressFamily {
     /// Gather only IPv4 candidates. Recommended when IPv6 to the Arlo
     /// gateway is broken or slow to fail over.
     Ipv4,
+}
+
+/// The RTSP(S) URL of a live view the user started in the Arlo app,
+/// obtained as the app identity (ADR 0007). Its path and query carry the
+/// stream's egress token, so `Debug` and `Display` show only
+/// `scheme://host[:port]/…`; [`as_str`](Self::as_str) is for the client
+/// that dials it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WatchAlongUrl(String);
+
+impl WatchAlongUrl {
+    /// Accept an `rtsp://` or `rtsps://` URL with a host.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::InvalidConfig`] for any other scheme or a missing
+    /// host; the message never includes the URL.
+    pub fn parse(raw: impl Into<String>) -> Result<Self, DomainError> {
+        let raw = raw.into();
+        let (scheme, rest) = raw
+            .split_once("://")
+            .ok_or_else(|| DomainError::InvalidConfig("watch-along URL has no scheme".into()))?;
+        if !matches!(scheme, "rtsp" | "rtsps") {
+            return Err(DomainError::InvalidConfig(format!(
+                "watch-along URL scheme '{scheme}' is not rtsp or rtsps"
+            )));
+        }
+        if host_port(rest).is_empty() {
+            return Err(DomainError::InvalidConfig(
+                "watch-along URL has no host".into(),
+            ));
+        }
+        Ok(Self(raw))
+    }
+
+    /// The full URL, token included: for dialing only, never for logs.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// `scheme://host[:port]/…`, safe to log.
+    #[must_use]
+    pub fn redacted(&self) -> String {
+        match self.0.split_once("://") {
+            Some((scheme, rest)) => format!("{scheme}://{}/…", host_port(rest)),
+            None => "<watch-along url>".to_string(),
+        }
+    }
+}
+
+/// `host[:port]` of what follows `scheme://`.
+fn host_port(rest: &str) -> &str {
+    rest.split(['/', '?', '#']).next().unwrap_or_default()
+}
+
+impl std::fmt::Debug for WatchAlongUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("WatchAlongUrl")
+            .field(&self.redacted())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for WatchAlongUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.redacted())
+    }
 }
 
 /// Handle to one attached live session, returned by
@@ -166,6 +235,36 @@ impl std::fmt::Debug for LiveLossNotifier {
 mod tests {
     use super::*;
     use futures::executor::block_on;
+
+    #[test]
+    fn watch_along_url_accepts_rtsp_and_rtsps_and_redacts_the_rest() {
+        let u = WatchAlongUrl::parse(
+            "rtsps://1.2.3.4:443/live/CAM_1?egressToken=SECRET&watchalong=true",
+        )
+        .unwrap();
+        assert_eq!(u.redacted(), "rtsps://1.2.3.4:443/…");
+        assert_eq!(format!("{u}"), "rtsps://1.2.3.4:443/…");
+        assert!(!format!("{u:?}").contains("SECRET"));
+        assert!(u.as_str().contains("SECRET"));
+        assert!(WatchAlongUrl::parse("rtsp://127.0.0.1:8554/white").is_ok());
+    }
+
+    #[test]
+    fn watch_along_url_rejects_other_schemes_and_hostless_urls() {
+        for bad in [
+            "https://h/x.mpd",
+            "file:///etc/passwd",
+            "rtsps:///nohost",
+            "nonsense",
+        ] {
+            let err = WatchAlongUrl::parse(bad).unwrap_err();
+            assert!(matches!(err, DomainError::InvalidConfig(_)), "{bad}");
+            assert!(
+                !err.to_string().contains("passwd"),
+                "message must not echo the URL"
+            );
+        }
+    }
 
     #[test]
     fn live_session_notify_resolves_lost_with_reason() {

@@ -106,6 +106,16 @@ impl Stack {
         }
     }
 
+    /// Serve `launch` at `mount` on the test server, standing in for the
+    /// app's watch-along stream; returns its URL.
+    pub fn install_source(&self, mount: &str, launch: &str) -> String {
+        self.server
+            .install_factory(mount, launch)
+            .expect("install source factory");
+        let port = self.server.bound_port().expect("rtsp server bound");
+        format!("rtsp://127.0.0.1:{port}{mount}")
+    }
+
     /// The camera's RTSP URL on the bound port.
     pub fn url(&self) -> String {
         let port = self.server.bound_port().expect("rtsp server bound");

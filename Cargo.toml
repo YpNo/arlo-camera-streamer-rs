@@ -41,9 +41,12 @@ streamer-infra-ops   = { path = "crates/streamer-infra-ops" }
 arlo-rs = "0.2.1"
 
 # ---- Async runtime ----
-tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs"] }
+tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util   = "0.7"
+tokio-rustls = "0.26"
+rustls       = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+url          = "2"
 futures      = "0.3"
 async-trait  = "0.1"
 serde_json   = "1"

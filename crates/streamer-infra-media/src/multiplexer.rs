@@ -29,7 +29,7 @@ use streamer_domain::camera::{CameraId, StreamName};
 use streamer_domain::config::{CameraConfig, OutputConfig, WebrtcConfig};
 use streamer_domain::error::DomainError;
 use streamer_domain::port::{MediaMultiplexer, WebrtcSignaler};
-use streamer_domain::stream::{Codec, LiveSession};
+use streamer_domain::stream::{Codec, LiveLossNotifier, LiveSession, WatchAlongUrl};
 
 use crate::codec_cache::CodecCache;
 use crate::error::MediaError;
@@ -37,6 +37,7 @@ use crate::idle_source::{IdleKind, select_idle_source, standby_caption, user_vie
 use crate::live_rtp_sink::LiveSinks;
 use crate::live_watch::setup_or_loss;
 use crate::pipeline_desc::{OutputBranches, build_output_branches};
+use crate::rtsp_relay::RtspRelay;
 use crate::webrtc_pipeline::WebrtcLive;
 
 /// Trait that the GStreamer-backed registry implements. The seam keeps
@@ -103,11 +104,26 @@ pub struct GstMediaMultiplexer<R: PipelineRegistry> {
     /// Codec hint cache (seeded from config, updated by the registry
     /// after first parsebin emission).
     codec_cache: Arc<CodecCache>,
-    /// Active per-camera webrtcbin live pipeline. Present only between
-    /// `attach_live` and `detach_live`. The live RTP byte sink is
-    /// owned by the registry now (Phase 6.3); the multiplexer just
-    /// keeps the WebRTC ingestion pipeline alive for the session.
-    live: tokio::sync::Mutex<HashMap<CameraId, WebrtcLive>>,
+    /// Active per-camera live leg (the webrtcbin pipeline or the
+    /// watch-along relay). Present only between an attach and
+    /// `detach_live`. The live RTP byte sinks are owned by the registry;
+    /// the multiplexer keeps the ingestion leg alive for the session.
+    live: tokio::sync::Mutex<HashMap<CameraId, LiveLeg>>,
+}
+
+/// The ingestion side of a live session.
+enum LiveLeg {
+    Webrtc(WebrtcLive),
+    Relay(RtspRelay),
+}
+
+impl LiveLeg {
+    fn shutdown(&mut self) {
+        match self {
+            Self::Webrtc(leg) => leg.shutdown(),
+            Self::Relay(leg) => leg.shutdown(),
+        }
+    }
 }
 
 impl<R: PipelineRegistry> GstMediaMultiplexer<R> {
@@ -161,6 +177,39 @@ impl<R: PipelineRegistry> GstMediaMultiplexer<R> {
     }
 }
 
+impl<R: PipelineRegistry> GstMediaMultiplexer<R> {
+    /// The attach shared by both live legs: take the registry's live
+    /// sinks, mint the session, race `setup` against its loss signal
+    /// (ADR 0004: a detector that fires during setup fails the attach
+    /// with its reason), and keep the leg for `detach_live`. A failed
+    /// setup releases the sinks, or every later attach would be refused
+    /// with "already in live mode".
+    async fn arm_live<F, Fut>(
+        &self,
+        camera: &CameraId,
+        setup: F,
+    ) -> Result<LiveSession, DomainError>
+    where
+        F: FnOnce(LiveSinks, LiveLossNotifier) -> Fut,
+        Fut: std::future::Future<Output = Result<LiveLeg, MediaError>>,
+    {
+        self.ensure_registered(camera).await?;
+        let sinks = self.registry.attach_live_sink(camera).await?;
+        let (mut session, notifier) = LiveSession::new();
+        let leg = match setup_or_loss(setup(sinks, notifier), &mut session).await {
+            Ok(leg) => leg,
+            Err(e) => {
+                if let Err(release) = self.registry.detach_live_sink(camera).await {
+                    warn!(error = %release, "releasing the live sinks after a failed attach failed");
+                }
+                return Err(e.into());
+            }
+        };
+        self.live.lock().await.insert(camera.clone(), leg);
+        Ok(session)
+    }
+}
+
 #[async_trait]
 impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
     #[instrument(skip(self), fields(camera = %camera))]
@@ -200,7 +249,6 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         camera: &CameraId,
         signaler: &dyn WebrtcSignaler,
     ) -> Result<LiveSession, DomainError> {
-        self.ensure_registered(camera).await?;
         // 1. The registry hands back the live RTP byte sinks for the
         // camera's persistent pipeline and arms its `input-selector`
         // flip → 2. `WebrtcLive::start` runs one `negotiate`: the
@@ -209,29 +257,32 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         // 3. answer applied, inbound RTP flows into the sinks. Connected
         // RTSP clients see a seamless switch idle → live at the next
         // live keyframe.
-        let sinks = self.registry.attach_live_sink(camera).await?;
-        // The session handle goes back to the orchestrator; the
-        // notifier is shared by the webrtcbin leg's death detectors
-        // (stall watchdog, bus watch, connection-state) — ADR 0004.
-        // A detector that fires during setup fails the attach with its
-        // reason instead of the first-RTP timeout.
-        let (mut session, notifier) = LiveSession::new();
-        let setup = WebrtcLive::start(camera, signaler, sinks, &self.webrtc, notifier);
-        let webrtc = match setup_or_loss(setup, &mut session).await {
-            Ok(webrtc) => webrtc,
-            Err(e) => {
-                // Release the registry's live side exactly as a detach
-                // would: left armed, it refuses every later attach with
-                // "already in live mode". The orchestrator pairs the
-                // failure exit with `WebrtcSignaler::teardown`.
-                if let Err(release) = self.registry.detach_live_sink(camera).await {
-                    warn!(error = %release, "releasing the live sinks after a failed attach failed");
-                }
-                return Err(e.into());
-            }
-        };
-        self.live.lock().await.insert(camera.clone(), webrtc);
-        Ok(session)
+        let webrtc = &self.webrtc;
+        self.arm_live(camera, |sinks, notifier| async move {
+            WebrtcLive::start(camera, signaler, sinks, webrtc, notifier)
+                .await
+                .map(LiveLeg::Webrtc)
+        })
+        .await
+    }
+
+    #[instrument(skip(self), fields(camera = %camera, url = %url))]
+    async fn attach_user_view(
+        &self,
+        camera: &CameraId,
+        url: &WatchAlongUrl,
+    ) -> Result<LiveSession, DomainError> {
+        // Same splice as a WebRTC session; the source is the RTSP relay
+        // of the view the user watches in the app (ADR 0007). Video
+        // only: the app's audio is AAC, the live audio path is Opus, and
+        // the silent bed covers it.
+        let stall = self.webrtc.live_stall_timeout();
+        self.arm_live(camera, |sinks, notifier| async move {
+            RtspRelay::start(url, sinks.video, stall, notifier)
+                .await
+                .map(LiveLeg::Relay)
+        })
+        .await
     }
 
     #[instrument(skip(self), fields(camera = %camera))]
@@ -245,8 +296,8 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         // session is released by the orchestrator
         // (`WebrtcSignaler::teardown`, paired with this).
         let res = self.registry.detach_live_sink(camera).await;
-        if let Some(mut webrtc) = self.live.lock().await.remove(camera) {
-            webrtc.shutdown();
+        if let Some(mut leg) = self.live.lock().await.remove(camera) {
+            leg.shutdown();
         }
         res.map_err(Into::into)
     }
@@ -515,6 +566,34 @@ mod tests {
         let detached = reg.detached.lock().unwrap();
         assert_eq!(detached.len(), 1);
         assert_eq!(detached[0], cam("CAM_A"));
+    }
+
+    #[tokio::test]
+    async fn attach_user_view_before_register_returns_unknown_camera() {
+        let m = mux(Arc::new(FakeRegistry::default()));
+        let url = WatchAlongUrl::parse("rtsp://127.0.0.1:1/x").unwrap();
+        let err = m.attach_user_view(&cam("CAM_A"), &url).await.unwrap_err();
+        assert!(matches!(err, DomainError::UnknownCamera(_)));
+    }
+
+    #[tokio::test]
+    async fn attach_user_view_unreachable_stream_fails_and_releases_the_sinks() {
+        let reg = Arc::new(FakeRegistry::default());
+        let m = mux(reg.clone());
+        m.register(&cam("CAM_A")).await.unwrap();
+        // Port 1 on loopback: nothing listens, the connect is refused.
+        let url = WatchAlongUrl::parse("rtsp://127.0.0.1:1/x").unwrap();
+        let err = m.attach_user_view(&cam("CAM_A"), &url).await.unwrap_err();
+        assert!(
+            matches!(err, DomainError::AdapterTransport(ref msg) if msg.contains("rtsp relay")),
+            "{err:?}"
+        );
+        assert_eq!(reg.attached.lock().unwrap().len(), 1);
+        assert_eq!(
+            reg.detached.lock().unwrap().len(),
+            1,
+            "sinks released after the failure"
+        );
     }
 
     #[tokio::test]

@@ -1055,6 +1055,15 @@ mod tests {
             self.notices.lock().await.push(shown);
             Ok(())
         }
+        async fn attach_user_view(
+            &self,
+            _camera: &CameraId,
+            _url: &streamer_domain::stream::WatchAlongUrl,
+        ) -> Result<LiveSession, DomainError> {
+            Err(DomainError::AdapterTransport(
+                "user-view relay not driven yet".into(),
+            ))
+        }
     }
 
     /// Unused but required by some test scaffolding.

@@ -24,9 +24,12 @@ gstreamer-rtsp        = { workspace = true }
 gstreamer-rtsp-server = { workspace = true }
 gstreamer-sdp         = { workspace = true }
 gstreamer-webrtc      = { workspace = true }
+rustls                = { workspace = true }
 thiserror             = { workspace = true }
 tokio                 = { workspace = true }
+tokio-rustls          = { workspace = true }
 tracing               = { workspace = true }
+url                   = { workspace = true }
 
 [dev-dependencies]
 # Enables tokio's `test-util` (paused clock) for the setup-race tests.

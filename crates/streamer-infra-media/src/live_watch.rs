@@ -12,16 +12,22 @@
 //! - [`setup_or_loss`] races the attach setup against the session's
 //!   loss signal, so a detector that fires before the first packet
 //!   fails the attach with its reason.
+//! - `spawn_stall_watchdog` and `report_loss` are the detector task
+//!   and the delivery shared by both live legs (WebRTC and the
+//!   watch-along relay).
 //!
 //! Reporting goes straight through the domain's
-//! [`LiveLossNotifier`](streamer_domain::stream::LiveLossNotifier), which
+//! [`LiveLossNotifier`], which
 //! is already cloneable and first-wins; no adapter-side wrapper.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use tracing::{debug, warn};
+
 use streamer_domain::state::LiveLossReason;
-use streamer_domain::stream::LiveSession;
+use streamer_domain::stream::{LiveLossNotifier, LiveSession};
 
 use crate::error::MediaError;
 
@@ -98,6 +104,43 @@ pub async fn setup_or_loss<T>(
         biased;
         outcome = setup => outcome,
         reason = session.lost() => Err(MediaError::LostDuringSetup(reason)),
+    }
+}
+
+/// Stall watchdog: declares the source lost once no video RTP has
+/// arrived for `timeout`. Sleeps exactly until the earliest instant the
+/// verdict could change, so a healthy 30 fps source costs one wake-up
+/// per `timeout`. Aborted by the leg's shutdown.
+pub(crate) fn spawn_stall_watchdog(
+    activity: Arc<RtpActivity>,
+    timeout: Duration,
+    notifier: LiveLossNotifier,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let silent = activity.silent_for(Instant::now());
+            if let Some(reason) = stall_verdict(silent, timeout) {
+                warn!(
+                    silent_ms = silent.as_millis(),
+                    "no inbound video RTP; live source stalled"
+                );
+                report_loss(&notifier, reason);
+                break;
+            }
+            tokio::time::sleep(timeout.saturating_sub(silent)).await;
+        }
+    })
+}
+
+/// Deliver a loss report; a `false` return means another detector won
+/// or the orchestrator already left live — worth a debug line on the
+/// Frigate box to see which detectors agree, nothing more.
+pub(crate) fn report_loss(notifier: &LiveLossNotifier, reason: LiveLossReason) {
+    if !notifier.notify(reason) {
+        debug!(
+            reason = reason.as_label(),
+            "live-loss report not delivered (already reported or session over)"
+        );
     }
 }
 

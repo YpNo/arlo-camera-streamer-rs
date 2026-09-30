@@ -44,9 +44,10 @@ pub use event::{CameraEvent, ConnectionStatus};
 pub use metrics::{BudgetDecision, MotionOutcome, SpliceOutcome};
 pub use port::{
     AdminControl, ArloEventSource, ArloThumbnailSource, MediaMultiplexer, MetricsRecorder,
-    WebrtcSignaler,
+    UserViewSource, WebrtcSignaler,
 };
 pub use state::{CameraState, LiveLossReason, StateTransition};
 pub use stream::{
     Codec, IceAddressFamily, IceServer, LiveLossNotifier, LiveSession, SignalingAnswer,
+    WatchAlongUrl,
 };

@@ -271,6 +271,13 @@ mod tests {
     }
     #[async_trait]
     impl MediaMultiplexer for StubMedia {
+        async fn attach_user_view(
+            &self,
+            _camera: &CameraId,
+            _url: &streamer_domain::stream::WatchAlongUrl,
+        ) -> Result<streamer_domain::stream::LiveSession, DomainError> {
+            Err(DomainError::AdapterTransport("not in this stub".into()))
+        }
         async fn set_user_view_notice(
             &self,
             _camera: &CameraId,

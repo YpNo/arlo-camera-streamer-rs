@@ -24,7 +24,7 @@ use crate::error::DomainError;
 use crate::event::{CameraEvent, ConnectionStatus};
 use crate::metrics::{BudgetDecision, MotionOutcome, SpliceOutcome};
 use crate::state::CameraState;
-use crate::stream::{IceServer, LiveSession, SignalingAnswer};
+use crate::stream::{IceServer, LiveSession, SignalingAnswer, WatchAlongUrl};
 
 /// Subscription to the inbound event bus from Arlo cloud / local hub.
 #[async_trait]
@@ -118,6 +118,22 @@ pub trait OfferBuilder: Send {
     async fn build_offer(&mut self, ice_servers: &[IceServer]) -> Result<String, DomainError>;
 }
 
+/// Where the live view the user started in the Arlo app can be watched
+/// along (ADR 0007). Implemented by the Arlo adapter: one stream query
+/// under the app identity, only while the bus reports the view.
+#[async_trait]
+pub trait UserViewSource: Send + Sync {
+    /// The watch-along URL of the view currently running for `camera`.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::AdapterTransport`] on network or protocol failure,
+    /// or when Arlo returns no RTSP stream (no view running, or a
+    /// format we cannot relay); [`DomainError::UnknownCamera`] if the
+    /// device id is not recognized.
+    async fn watch_along_url(&self, camera: &CameraId) -> Result<WatchAlongUrl, DomainError>;
+}
+
 /// Per-camera last-known thumbnail (used as the idle still frame).
 #[async_trait]
 pub trait ArloThumbnailSource: Send + Sync {
@@ -174,6 +190,23 @@ pub trait MediaMultiplexer: Send + Sync {
         &self,
         camera: &CameraId,
         signaler: &dyn WebrtcSignaler,
+    ) -> Result<LiveSession, DomainError>;
+
+    /// Attach the live view the user started in the Arlo app, relayed
+    /// from its watch-along RTSPS stream (ADR 0007), as the camera's live
+    /// source. Resolves once the first video packet reached the output,
+    /// with the same [`LiveSession`] contract as [`Self::attach_live`];
+    /// [`Self::detach_live`] ends it. There is no Arlo signaling session
+    /// to tear down: the camera streams for the app, not for us.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::AdapterTransport`] if the stream cannot be
+    /// reached, refuses us, or sends no video in time.
+    async fn attach_user_view(
+        &self,
+        camera: &CameraId,
+        url: &WatchAlongUrl,
     ) -> Result<LiveSession, DomainError>;
 
     /// Detach the live source and revert to the idle frame.

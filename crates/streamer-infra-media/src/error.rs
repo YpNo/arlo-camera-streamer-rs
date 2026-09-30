@@ -48,6 +48,11 @@ pub enum MediaError {
     #[error("{0}")]
     Signaling(DomainError),
 
+    /// The watch-along RTSP relay could not reach, negotiate with, or
+    /// keep the user's view stream (ADR 0007).
+    #[error("rtsp relay: {0}")]
+    Relay(String),
+
     /// RTSP server (mount-point installation, port binding, etc.) failure.
     #[error("RTSP server error: {0}")]
     Rtsp(String),
@@ -117,6 +122,13 @@ mod tests {
         let err = MediaError::Signaling(DomainError::CameraBusy("14001".to_string()));
         let domain: DomainError = err.into();
         assert!(matches!(domain, DomainError::CameraBusy(r) if r == "14001"));
+    }
+
+    #[test]
+    fn relay_error_maps_to_adapter_transport() {
+        let err = MediaError::Relay("SETUP answered 403".to_string());
+        let domain: DomainError = err.into();
+        assert!(matches!(domain, DomainError::AdapterTransport(m) if m.contains("rtsp relay")));
     }
 
     #[test]

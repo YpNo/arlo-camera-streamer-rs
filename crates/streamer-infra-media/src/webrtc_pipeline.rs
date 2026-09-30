@@ -69,7 +69,7 @@ use streamer_domain::stream::{IceAddressFamily, IceServer, LiveLossNotifier, Sig
 
 use crate::error::MediaError;
 use crate::live_rtp_sink::{LiveRtpSink, LiveSinks};
-use crate::live_watch::{RtpActivity, stall_verdict};
+use crate::live_watch::{RtpActivity, report_loss, spawn_stall_watchdog};
 use crate::pipeline_desc::{LIVE_RTP_H264_PT as H264_PT, LIVE_RTP_OPUS_PT as OPUS_PT};
 
 /// RTP clock rates fixed by the codecs (RFC 6184, RFC 7587).
@@ -689,43 +689,6 @@ fn install_connection_watch(webrtcbin: &gst::Element, notifier: LiveLossNotifier
             _ => {}
         }
     });
-}
-
-/// Stall watchdog: declares the source lost once no video RTP has
-/// arrived for `timeout`. Sleeps exactly until the earliest instant the
-/// verdict could change, so a healthy 30 fps source costs one wake-up
-/// per `timeout`. Aborted by `WebrtcLive::shutdown`.
-fn spawn_stall_watchdog(
-    activity: Arc<RtpActivity>,
-    timeout: Duration,
-    notifier: LiveLossNotifier,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let silent = activity.silent_for(Instant::now());
-            if let Some(reason) = stall_verdict(silent, timeout) {
-                warn!(
-                    silent_ms = silent.as_millis(),
-                    "no inbound video RTP; live source stalled"
-                );
-                report_loss(&notifier, reason);
-                break;
-            }
-            tokio::time::sleep(timeout.saturating_sub(silent)).await;
-        }
-    })
-}
-
-/// Deliver a loss report; a `false` return means another detector won
-/// or the orchestrator already left live — worth a debug line on the
-/// Frigate box to see which detectors agree, nothing more.
-fn report_loss(notifier: &LiveLossNotifier, reason: LiveLossReason) {
-    if !notifier.notify(reason) {
-        debug!(
-            reason = reason.as_label(),
-            "live-loss report not delivered (already reported or session over)"
-        );
-    }
 }
 
 #[cfg(test)]

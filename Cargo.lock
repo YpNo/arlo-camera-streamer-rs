@@ -2938,11 +2938,14 @@ dependencies = [
  "gstreamer-rtsp-server",
  "gstreamer-sdp",
  "gstreamer-webrtc",
+ "rustls",
  "streamer-domain",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-test",
  "tracing",
+ "url",
 ]
 
 [[package]]
