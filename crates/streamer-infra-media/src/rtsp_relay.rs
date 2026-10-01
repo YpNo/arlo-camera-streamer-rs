@@ -78,6 +78,15 @@ const RTCP_PT_FIRST: u8 = 200;
 const RTCP_PT_LAST: u8 = 204;
 /// An RTCP header: V/P/count, PT, 16-bit length in words minus one.
 const RTCP_HEADER_LEN: usize = 4;
+/// A fixed RTP header.
+const RTP_HEADER_LEN: usize = 12;
+/// `$`, channel, 16-bit length.
+const INTERLEAVED_HEADER_LEN: usize = 4;
+/// Bytes a resync looks at before trusting a `$` header: the framing
+/// plus the packet's version and payload-type bytes.
+const FRAME_PROBE_LEN: usize = INTERLEAVED_HEADER_LEN + 2;
+/// Unframed bytes a resync skips before giving the stream up.
+const RESYNC_LIMIT: usize = 64 * 1024;
 /// Interleaved channels asked for in `SETUP`.
 const RTP_CHANNEL: u8 = 0;
 const RTCP_CHANNEL: u8 = 1;
@@ -355,15 +364,8 @@ async fn run(
 ) {
     let Client { reader, mut link } = client;
     let (acks, mut pending_acks) = mpsc::channel(ACK_QUEUE);
-    let rtp_channel = link.channels.0;
-    let mut reading = tokio::spawn(read_loop(
-        reader,
-        rtp_channel,
-        sink,
-        activity,
-        first_rtp,
-        acks,
-    ));
+    let channels = link.channels;
+    let mut reading = tokio::spawn(read_loop(reader, channels, sink, activity, first_rtp, acks));
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     let mut rtcp = tokio::time::interval(RTCP_INTERVAL);
     keepalive.tick().await;
@@ -420,7 +422,7 @@ async fn teardown(link: &mut Link, aggregate: &str) {
 /// server's requests over for an ack, and ends with the loss to report.
 async fn read_loop(
     mut reader: Reader,
-    rtp_channel: u8,
+    channels: (u8, u8),
     sink: LiveRtpSink,
     activity: Arc<RtpActivity>,
     first_rtp: Arc<Notify>,
@@ -429,7 +431,7 @@ async fn read_loop(
     let mut stats = FrameStats::default();
     let mut got_first = false;
     loop {
-        match read_next(&mut reader, rtp_channel, &mut stats).await {
+        match read_next(&mut reader, channels, &mut stats).await {
             Ok(Incoming::Rtp(packet)) => {
                 activity.touch(Instant::now());
                 if !got_first {
@@ -467,16 +469,36 @@ enum Incoming {
     Closed,
 }
 
-/// What the read loop has seen so far: the first frames are logged, and
-/// a desync report says what came before the unexpected bytes.
+/// What the read loop has seen so far: the first frames and resyncs are
+/// logged, and a desync report says what came before the stray bytes.
 #[derive(Default)]
 struct FrameStats {
     frames: u64,
     bare_rtcp: u64,
+    resyncs: u64,
     last: Option<(u8, usize)>,
+    /// Payload type of the stream's RTP, learnt from its first packet;
+    /// a resync trusts no `$` header whose packet carries another one.
+    rtp_pt: Option<u8>,
 }
 
 impl FrameStats {
+    fn record(&mut self, channel: u8, rtp_channel: u8, payload: &[u8]) {
+        self.frames += 1;
+        self.last = Some((channel, payload.len()));
+        if channel == rtp_channel && self.rtp_pt.is_none() && is_rtp(payload) {
+            self.rtp_pt = Some(payload[1] & 0x7f);
+        }
+        if self.frames <= FIRST_FRAMES_LOGGED {
+            debug!(
+                channel,
+                len = payload.len(),
+                rtp = %rtp_summary(payload),
+                "interleaved frame"
+            );
+        }
+    }
+
     fn record_bare_rtcp(&mut self, len: usize) {
         self.bare_rtcp += 1;
         if self.bare_rtcp == 1 {
@@ -484,15 +506,13 @@ impl FrameStats {
         }
     }
 
-    fn record(&mut self, channel: u8, payload: &[u8]) {
-        self.frames += 1;
-        self.last = Some((channel, payload.len()));
-        if self.frames <= FIRST_FRAMES_LOGGED {
+    fn record_resync(&mut self, skipped: &[u8]) {
+        self.resyncs += 1;
+        if self.resyncs <= FIRST_FRAMES_LOGGED {
             debug!(
-                channel,
-                len = payload.len(),
-                rtp = %rtp_summary(payload),
-                "interleaved frame"
+                skipped = skipped.len(),
+                bytes = %hex(skipped),
+                "unframed bytes skipped; frame boundary found again"
             );
         }
     }
@@ -508,7 +528,7 @@ impl FrameStats {
 /// One interleaved frame or one RTSP message.
 async fn read_next(
     io: &mut Reader,
-    rtp_channel: u8,
+    channels: (u8, u8),
     stats: &mut FrameStats,
 ) -> Result<Incoming, String> {
     let mut first = [0u8; 1];
@@ -518,42 +538,15 @@ async fn read_next(
         Err(e) => return Err(format!("read: {e}")),
     }
     match first[0] {
-        b'$' => read_frame(io, rtp_channel, stats).await,
+        b'$' => read_frame(io, channels, stats).await,
         b if b.is_ascii_uppercase() => read_message(io, b, stats).await,
-        b => read_bare_rtcp(io, b, stats).await,
+        b => read_unframed(io, b, channels, stats).await,
     }
-}
-
-/// Arlo's server sends its periodic RTCP sender reports **without** the
-/// interleaved framing (`80 c8 00 06 …` straight after an RTP frame,
-/// seen 2026-10-01; only the first one, at `PLAY`, is framed). RTCP
-/// carries its own length, so a bare packet is skipped by it; anything
-/// else is a desync and ends the relay with a report.
-async fn read_bare_rtcp(
-    io: &mut Reader,
-    first: u8,
-    stats: &mut FrameStats,
-) -> Result<Incoming, String> {
-    let mut head = [0u8; RTCP_HEADER_LEN - 1];
-    io.read_exact(&mut head)
-        .await
-        .map_err(|e| format!("bare packet header: {e}"))?;
-    let Some(len) = bare_rtcp_len(first, head) else {
-        let mut shown = head.to_vec();
-        shown.extend_from_slice(io.fill_buf().await.map_err(|e| format!("peek: {e}"))?);
-        return Err(desync_report(first, &shown, stats));
-    };
-    let mut rest = vec![0u8; len - RTCP_HEADER_LEN];
-    io.read_exact(&mut rest)
-        .await
-        .map_err(|e| format!("bare rtcp: {e}"))?;
-    stats.record_bare_rtcp(len);
-    Ok(Incoming::Other)
 }
 
 async fn read_frame(
     io: &mut Reader,
-    rtp_channel: u8,
+    channels: (u8, u8),
     stats: &mut FrameStats,
 ) -> Result<Incoming, String> {
     let mut header = [0u8; 3];
@@ -565,11 +558,109 @@ async fn read_frame(
     io.read_exact(&mut payload)
         .await
         .map_err(|e| format!("frame payload: {e}"))?;
-    stats.record(channel, &payload);
+    Ok(classify(channel, payload, channels.0, stats))
+}
+
+/// The frame's place in the relay: video RTP goes to the sink, the rest
+/// is noted and dropped.
+fn classify(
+    channel: u8,
+    mut payload: Vec<u8>,
+    rtp_channel: u8,
+    stats: &mut FrameStats,
+) -> Incoming {
+    stats.record(channel, rtp_channel, &payload);
     if channel == rtp_channel && rewrite_payload_type(&mut payload, LIVE_RTP_H264_PT) {
-        return Ok(Incoming::Rtp(Bytes::from(payload)));
+        return Incoming::Rtp(Bytes::from(payload));
     }
+    Incoming::Other
+}
+
+/// Arlo's server sends some packets **without** the interleaved framing
+/// (seen 2026-10-01): its periodic RTCP sender reports (`80 c8 00 06 …`,
+/// only the first one at `PLAY` is framed), each followed by a bare
+/// 12-byte RTP header (`80 80 00 01 …`, payload type 0, no payload — a
+/// keep-alive, presumably). RTCP carries its own length and is skipped
+/// by it; everything else is skipped up to the next `$` header that
+/// checks out ([`resync`]).
+async fn read_unframed(
+    io: &mut Reader,
+    first: u8,
+    channels: (u8, u8),
+    stats: &mut FrameStats,
+) -> Result<Incoming, String> {
+    let mut head = [0u8; RTCP_HEADER_LEN - 1];
+    io.read_exact(&mut head)
+        .await
+        .map_err(|e| format!("bare packet header: {e}"))?;
+    let Some(len) = bare_rtcp_len(first, head) else {
+        let mut carried = vec![first];
+        carried.extend_from_slice(&head);
+        return resync(io, carried, channels, stats).await;
+    };
+    let mut rest = vec![0u8; len - RTCP_HEADER_LEN];
+    io.read_exact(&mut rest)
+        .await
+        .map_err(|e| format!("bare rtcp: {e}"))?;
+    stats.record_bare_rtcp(len);
     Ok(Incoming::Other)
+}
+
+/// Skip bytes, `carried` first, until a `$` header that
+/// [`frame_header_at`] accepts, then read that frame. Gives up with a
+/// desync report after `RESYNC_LIMIT` bytes.
+async fn resync(
+    io: &mut Reader,
+    carried: Vec<u8>,
+    channels: (u8, u8),
+    stats: &mut FrameStats,
+) -> Result<Incoming, String> {
+    let mut window = carried;
+    let mut skipped = Vec::new();
+    loop {
+        while window.len() < FRAME_PROBE_LEN {
+            let mut byte = [0u8; 1];
+            match io.read(&mut byte).await {
+                Ok(0) => return Ok(Incoming::Closed),
+                Ok(_) => window.push(byte[0]),
+                Err(e) => return Err(format!("resync read: {e}")),
+            }
+        }
+        if let Some((channel, len)) = frame_header_at(&window, channels, stats.rtp_pt) {
+            stats.record_resync(&skipped);
+            let mut payload = window.split_off(INTERLEAVED_HEADER_LEN);
+            let probed = payload.len();
+            payload.resize(len, 0);
+            io.read_exact(&mut payload[probed..])
+                .await
+                .map_err(|e| format!("frame payload after resync: {e}"))?;
+            return Ok(classify(channel, payload, channels.0, stats));
+        }
+        skipped.push(window.remove(0));
+        if skipped.len() > RESYNC_LIMIT {
+            return Err(desync_report(skipped[0], &skipped[1..], stats));
+        }
+    }
+}
+
+/// `(channel, length)` when `window` starts with a `$` header worth
+/// trusting: one of our channels, a length that holds a packet header, a
+/// version-2 packet, and on the RTP channel the stream's payload type
+/// (once known), on the RTCP channel a known RTCP type.
+fn frame_header_at(window: &[u8], channels: (u8, u8), rtp_pt: Option<u8>) -> Option<(u8, usize)> {
+    if window.len() < FRAME_PROBE_LEN || window[0] != b'$' {
+        return None;
+    }
+    let (channel, len) = interleaved_header([window[1], window[2], window[3]]);
+    let (version, pt) = (window[4] >> 6, window[5] & 0x7f);
+    let plausible = if channel == channels.0 {
+        len >= RTP_HEADER_LEN && rtp_pt.is_none_or(|known| pt == known)
+    } else if channel == channels.1 {
+        len >= RTCP_HEADER_LEN && (RTCP_PT_FIRST..=RTCP_PT_LAST).contains(&window[5])
+    } else {
+        false
+    };
+    (version == 2 && plausible).then_some((channel, len))
 }
 
 /// An RTSP message whose first byte was already read: a response to a
@@ -826,9 +917,24 @@ fn bare_rtcp_len(first: u8, head: [u8; RTCP_HEADER_LEN - 1]) -> Option<usize> {
         .then(|| (usize::from(u16::from_be_bytes([head[1], head[2]])) + 1) * RTCP_HEADER_LEN)
 }
 
+/// Long enough for a fixed header and version 2.
+fn is_rtp(packet: &[u8]) -> bool {
+    packet.len() >= RTP_HEADER_LEN && packet[0] >> 6 == 2
+}
+
+/// Up to `DESYNC_DUMP_BYTES` bytes as space-separated hex.
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(DESYNC_DUMP_BYTES)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// `v2 pt=96 seq=1234 m=1` for an RTP packet, `not-rtp` otherwise.
 fn rtp_summary(packet: &[u8]) -> String {
-    if packet.len() < 12 || packet[0] >> 6 != 2 {
+    if !is_rtp(packet) {
         return "not-rtp".to_string();
     }
     format!(
@@ -843,20 +949,16 @@ fn rtp_summary(packet: &[u8]) -> String {
 /// came before them, a bounded hex dump, and where the next `$` is.
 /// Stream bytes carry no secret; the report goes to the log as it is.
 fn desync_report(first: u8, ahead: &[u8], stats: &FrameStats) -> String {
-    let dump = ahead
-        .iter()
-        .take(DESYNC_DUMP_BYTES)
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let dump = hex(ahead);
     let marker = ahead.iter().position(|&b| b == b'$').map_or_else(
         || "none buffered".to_string(),
         |i| format!("{} bytes ahead", i + 1),
     );
     format!(
-        "unexpected byte 0x{first:02x} after {} frames and {} bare RTCP packets (last frame: {}); next bytes: {dump}; next '$' {marker}",
+        "unexpected byte 0x{first:02x} after {} frames, {} bare RTCP packets and {} resyncs (last frame: {}); next bytes: {dump}; next '$' {marker}",
         stats.frames,
         stats.bare_rtcp,
+        stats.resyncs,
         stats.last_label()
     )
 }
@@ -884,7 +986,7 @@ fn rewrite_payload_type(packet: &mut [u8], pt: i32) -> bool {
     let Ok(pt) = u8::try_from(pt) else {
         return false;
     };
-    if packet.len() < 12 || packet[0] >> 6 != 2 {
+    if !is_rtp(packet) {
         return false;
     }
     packet[1] = (packet[1] & 0x80) | (pt & 0x7f);
@@ -1001,12 +1103,12 @@ mod tests {
     #[test]
     fn desync_report_dumps_bounded_hex_and_locates_the_marker() {
         let mut stats = FrameStats::default();
-        stats.record(0, &[0x80; 12]);
+        stats.record(0, 0, &[0x80; 12]);
         let mut ahead = vec![0xABu8; 30];
         ahead[27] = b'$';
         let report = desync_report(0x01, &ahead, &stats);
         assert!(report.starts_with(
-            "unexpected byte 0x01 after 1 frames and 0 bare RTCP packets (last frame: channel 0, 12 bytes)"
+            "unexpected byte 0x01 after 1 frames, 0 bare RTCP packets and 0 resyncs (last frame: channel 0, 12 bytes)"
         ));
         assert_eq!(report.matches("ab").count(), DESYNC_DUMP_BYTES);
         assert!(report.ends_with("next '$' 28 bytes ahead"));
@@ -1034,7 +1136,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_next_handles_frames_bare_rtcp_messages_and_reports_a_desync() {
+    async fn read_next_handles_frames_bare_packets_messages_and_resyncs() {
         let rtp = [0x80, 0x60, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0xAA];
         let mut stream = interleaved_frame(0, &rtp);
         stream.extend_from_slice(&interleaved_frame(1, &rtcp_receiver_report(7)));
@@ -1043,41 +1145,101 @@ mod tests {
         stream.extend_from_slice(&[0u8; 24]);
         stream.extend_from_slice(b"GET_PARAMETER rtsp://h RTSP/1.0\r\nCSeq: 9\r\n\r\n");
         stream.extend_from_slice(b"RTSP/1.0 200 OK\r\nCSeq: 3\r\nContent-Length: 2\r\n\r\nok");
-        stream.extend_from_slice(&[0x01, 0x02, 0x03, b'$']);
+        // Arlo's bare keep-alive, then a frame again: the loop resyncs.
+        stream.extend_from_slice(&[0x80, 0x80, 0, 1, 0, 0, 0, 0, 0x24, 0x9a, 0xe6, 0x34]);
+        let mut second = rtp;
+        second[3] = 2;
+        stream.extend_from_slice(&interleaved_frame(0, &second));
+        // Junk holding a '$' on a wrong channel, then the end.
+        stream.extend_from_slice(&[0x01, 0x02, 0x03, b'$', 0x07, 0, 1, 0x80]);
         let mut reader = reader_fed_with(&stream);
         let mut stats = FrameStats::default();
+        let channels = (0, 1);
 
-        let Ok(Incoming::Rtp(packet)) = read_next(&mut reader, 0, &mut stats).await else {
+        let Ok(Incoming::Rtp(packet)) = read_next(&mut reader, channels, &mut stats).await else {
             panic!("first frame is the RTP packet");
         };
         assert_eq!(packet[1] & 0x7f, u8::try_from(LIVE_RTP_H264_PT).unwrap());
+        assert_eq!(stats.rtp_pt, Some(0x60));
         assert!(matches!(
-            read_next(&mut reader, 0, &mut stats).await,
+            read_next(&mut reader, channels, &mut stats).await,
             Ok(Incoming::Other)
         ));
         assert!(matches!(
-            read_next(&mut reader, 0, &mut stats).await,
+            read_next(&mut reader, channels, &mut stats).await,
             Ok(Incoming::Other)
         ));
         assert_eq!(stats.bare_rtcp, 1);
-        let Ok(Incoming::ServerRequest { cseq }) = read_next(&mut reader, 0, &mut stats).await
+        let Ok(Incoming::ServerRequest { cseq }) =
+            read_next(&mut reader, channels, &mut stats).await
         else {
             panic!("server request is handed over for an ack");
         };
         assert_eq!(cseq, "9");
         assert!(matches!(
-            read_next(&mut reader, 0, &mut stats).await,
+            read_next(&mut reader, channels, &mut stats).await,
             Ok(Incoming::Other)
         ));
-        let Err(why) = read_next(&mut reader, 0, &mut stats).await else {
-            panic!("stray bytes end the loop");
+        let Ok(Incoming::Rtp(packet)) = read_next(&mut reader, channels, &mut stats).await else {
+            panic!("the frame after the bare keep-alive is found again");
+        };
+        assert_eq!(packet[3], 2, "second RTP packet, seq 2");
+        assert_eq!((stats.resyncs, stats.frames), (1, 3));
+        // Junk up to EOF: the stream is reported closed, not desynced.
+        assert!(matches!(
+            read_next(&mut reader, channels, &mut stats).await,
+            Ok(Incoming::Closed)
+        ));
+    }
+
+    #[test]
+    fn frame_header_at_trusts_only_a_plausible_header() {
+        let channels = (0, 1);
+        // '$', channel 0, len 12, RTP v2 pt 96.
+        let good = [b'$', 0, 0, 12, 0x80, 0x60];
+        assert_eq!(frame_header_at(&good, channels, None), Some((0, 12)));
+        assert_eq!(frame_header_at(&good, channels, Some(0x60)), Some((0, 12)));
+        assert_eq!(frame_header_at(&good, channels, Some(0x61)), None);
+        assert_eq!(
+            frame_header_at(&[b'$', 0, 0, 11, 0x80, 0x60], channels, None),
+            None
+        );
+        assert_eq!(
+            frame_header_at(&[b'$', 2, 0, 12, 0x80, 0x60], channels, None),
+            None
+        );
+        assert_eq!(
+            frame_header_at(&[b'$', 0, 0, 12, 0x40, 0x60], channels, None),
+            None
+        );
+        assert_eq!(
+            frame_header_at(&[b'$', 1, 0, 28, 0x80, 0xc8], channels, None),
+            Some((1, 28))
+        );
+        assert_eq!(
+            frame_header_at(&[b'$', 1, 0, 28, 0x80, 0x60], channels, None),
+            None
+        );
+        assert_eq!(frame_header_at(&good[..5], channels, None), None);
+        assert_eq!(
+            frame_header_at(&[0, 0, 0, 12, 0x80, 0x60], channels, None),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn resync_gives_up_after_the_limit_with_a_report() {
+        let junk = vec![0x01u8; RESYNC_LIMIT + 16];
+        let mut reader = reader_fed_with(&junk);
+        let mut stats = FrameStats::default();
+        let Err(why) = read_next(&mut reader, (0, 1), &mut stats).await else {
+            panic!("endless junk ends the relay");
         };
         assert!(
-            why.starts_with("unexpected byte 0x01 after 2 frames and 1 bare RTCP packets"),
+            why.starts_with("unexpected byte 0x01 after 0 frames"),
             "{why}"
         );
-        assert!(why.contains("02 03 24"), "{why}");
-        assert!(why.ends_with("next '$' 3 bytes ahead"), "{why}");
+        assert!(why.ends_with("next '$' none buffered"), "{why}");
     }
 
     #[test]

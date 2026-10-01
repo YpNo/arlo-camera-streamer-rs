@@ -28,10 +28,14 @@ stream. Captures on 2026-09-30:
   identified — not the token: SETUP without it is accepted;
 - the server's certificate cannot match a raw IP, so validation must be
   off for that host;
-- (2026-10-01, first gate) the server sends its periodic RTCP sender
-  reports **without** the interleaved `$` framing, only the first one at
-  `PLAY` is framed; the client skips bare RTCP packets by their own
-  length field. This may be why `rtspsrc` fails on this server.
+- (2026-10-01, first gates) the server sends some packets **without**
+  the interleaved `$` framing: its periodic RTCP sender reports (only
+  the first one at `PLAY` is framed), each followed by a bare 12-byte
+  RTP header (payload type 0, no payload — a keep-alive, presumably).
+  The client skips bare RTCP by its own length field and resynchronises
+  on the next `$` header that checks out (our channel, a sane length, a
+  version-2 packet with the stream's payload type) for anything else.
+  This may be why `rtspsrc` fails on this server.
 
 ## Decision
 

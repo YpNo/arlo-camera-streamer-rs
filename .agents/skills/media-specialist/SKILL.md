@@ -94,9 +94,14 @@ Arlo-specific behaviour with the `live-validation` skill.
   inside a `select!` with timers: a cancelled read leaves the stream mid-frame.
 - **Arlo's server framing (captured 2026-10-01):** the SETUP answer keeps `interleaved=0-1`;
   the first RTCP SR after PLAY is framed on channel 1, the periodic ones arrive **bare**
-  (`80 c8 00 06 …`, no `$` header). `read_bare_rtcp` skips them by RTCP's own length
-  field. Anything else ends the relay with `unexpected byte 0x..` + a hex dump — read
-  that line before touching the parser.
+  (`80 c8 00 06 …`, no `$` header), each followed by a bare 12-byte RTP header
+  (`80 80 00 01 …`, PT 0, empty — a keep-alive). `read_unframed` skips bare RTCP by
+  its own length; anything else goes through `resync`, which scans to the next `$`
+  header `frame_header_at` trusts (our channel, length ≥ a packet header, version 2,
+  the stream's RTP payload type or a known RTCP type) and logs the skipped bytes
+  (`unframed bytes skipped`, first four at debug). After `RESYNC_LIMIT` (64 KiB) the
+  relay ends with `unexpected byte 0x..` + a hex dump — read that line before touching
+  the parser.
 - TLS with validation **off** (raw-IP host); the egress token is the access control.
 - Both legs (`LiveLeg::{Webrtc, Relay}`) go through `arm_live`; the stall watchdog and
   `report_loss` live in `live_watch.rs`.

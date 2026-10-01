@@ -51,9 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end of a session the refresh uses the cached snapshot and saves a cloud
   round-trip.
 - A live view you start in the Arlo app is relayed to the RTSP and HLS
-  outputs (ADR 0007; the relay's RTSP client tolerates the bare RTCP
-  packets Arlo's server sends between interleaved frames, and reports
-  any other framing surprise with a hex dump): the daemon fetches the
+  outputs (ADR 0007; the relay's RTSP client tolerates the unframed
+  RTCP and keep-alive packets Arlo's server sends between interleaved
+  frames by resynchronising on the next frame header, and reports any
+  other framing surprise with a hex dump): the daemon fetches the
   view's own RTSPS stream as
   the app identity (`arlo.app_version`) and splices it in like a motion
   session, video only, with no cooldown and no daily-budget charge. It
