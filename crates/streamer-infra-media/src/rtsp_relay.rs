@@ -3,11 +3,18 @@
 //! Arlo hands the app identity a `rtsps://` watch-along URL of the view
 //! ([`WatchAlongUrl`]). This module is the RTSP client that plays it:
 //! `OPTIONS`, `DESCRIBE`, one `SETUP` for the video track over
-//! TCP-interleaved, `PLAY`, then a read loop that forwards every video
-//! RTP packet into the camera's [`LiveRtpSink`] — the same path the
-//! WebRTC leg feeds, so the idle/live splice, HLS and the RTSP clients
-//! see it unchanged. The payload type is rewritten to the one the live
-//! `appsrc` declares.
+//! TCP-interleaved (on the channels the server assigns), `PLAY`, then
+//! two tasks: a read loop that forwards every video RTP packet into the
+//! camera's [`LiveRtpSink`] — the same path the WebRTC leg feeds, so the
+//! idle/live splice, HLS and the RTSP clients see it unchanged — and a
+//! write loop for keep-alives, receiver reports and acks. The read half
+//! is owned by its task on purpose: a frame read interrupted by a timer
+//! would leave the stream mid-frame. The payload type is rewritten to
+//! the one the live `appsrc` declares.
+//!
+//! Bytes that are neither a frame nor an RTSP message end the relay with
+//! a report of what preceded them and a bounded hex dump, so a framing
+//! the server does differently can be read off the log.
 //!
 //! A hand-written client rather than `rtspsrc`: Arlo's server refused
 //! `rtspsrc`'s `SETUP` (403) while this exchange, byte for byte as the
@@ -33,9 +40,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf,
+    WriteHalf,
+};
 use tokio::net::TcpStream;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 
@@ -57,6 +67,12 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
 const RTCP_INTERVAL: Duration = Duration::from_secs(5);
 /// Time given to `TEARDOWN` on shutdown before the task is aborted.
 const TEARDOWN_GRACE: Duration = Duration::from_secs(2);
+/// Server requests waiting for their ack from the writer.
+const ACK_QUEUE: usize = 8;
+/// Interleaved frames described in the log at debug, per relay.
+const FIRST_FRAMES_LOGGED: u64 = 4;
+/// Bytes shown in a desync report.
+const DESYNC_DUMP_BYTES: usize = 24;
 /// Interleaved channels asked for in `SETUP`.
 const RTP_CHANNEL: u8 = 0;
 const RTCP_CHANNEL: u8 = 1;
@@ -174,10 +190,50 @@ impl Response {
     }
 }
 
-struct Client {
-    io: BufReader<Box<dyn Io>>,
+/// Read half of the connection, buffered for the line-based exchange.
+type Reader = BufReader<ReadHalf<Box<dyn Io>>>;
+type Writer = WriteHalf<Box<dyn Io>>;
+
+/// The write half with the bookkeeping every request needs.
+struct Link {
+    writer: Writer,
     cseq: u32,
     session: Option<String>,
+    /// Interleaved channels (RTP, RTCP) — ours until the server's
+    /// `SETUP` answer assigns others.
+    channels: (u8, u8),
+}
+
+impl Link {
+    /// Write one request; the response is read by the caller or the
+    /// read loop.
+    async fn send(
+        &mut self,
+        method: &str,
+        uri: &str,
+        extra: &[(&str, &str)],
+    ) -> std::io::Result<()> {
+        self.cseq += 1;
+        let text = request_text(method, uri, self.cseq, self.session.as_deref(), extra);
+        self.writer.write_all(text.as_bytes()).await
+    }
+
+    async fn send_rtcp_receiver_report(&mut self) -> std::io::Result<()> {
+        let report = rtcp_receiver_report(RECEIVER_SSRC);
+        let frame = interleaved_frame(self.channels.1, &report);
+        self.writer.write_all(&frame).await
+    }
+
+    /// Acknowledge a request the server sent us.
+    async fn ack(&mut self, cseq: &str) -> std::io::Result<()> {
+        let reply = format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n\r\n");
+        self.writer.write_all(reply.as_bytes()).await
+    }
+}
+
+struct Client {
+    reader: Reader,
+    link: Link,
 }
 
 impl Client {
@@ -199,10 +255,15 @@ impl Client {
         } else {
             Box::new(tcp)
         };
+        let (reader, writer) = tokio::io::split(io);
         Ok(Self {
-            io: BufReader::new(io),
-            cseq: 0,
-            session: None,
+            reader: BufReader::new(reader),
+            link: Link {
+                writer,
+                cseq: 0,
+                session: None,
+                channels: (RTP_CHANNEL, RTCP_CHANNEL),
+            },
         })
     }
 
@@ -212,20 +273,17 @@ impl Client {
         uri: &str,
         extra: &[(&str, &str)],
     ) -> Result<Response, MediaError> {
-        self.cseq += 1;
-        let text = request_text(method, uri, self.cseq, self.session.as_deref(), extra);
-        self.io
-            .get_mut()
-            .write_all(text.as_bytes())
+        self.link
+            .send(method, uri, extra)
             .await
             .map_err(|e| MediaError::Relay(format!("{method}: send: {e}")))?;
-        let response = tokio::time::timeout(REQUEST_TIMEOUT, read_response(&mut self.io))
+        let response = tokio::time::timeout(REQUEST_TIMEOUT, read_response(&mut self.reader))
             .await
             .map_err(|_| {
                 MediaError::Relay(format!("{method}: no response in {REQUEST_TIMEOUT:?}"))
             })??;
         if let Some(s) = response.header("Session") {
-            self.session = Some(session_id(s).to_string());
+            self.link.session = Some(session_id(s).to_string());
         }
         debug!(method, code = response.code, "rtsp relay exchange");
         if response.code != 200 {
@@ -254,10 +312,20 @@ impl Client {
         })
     }
 
+    /// `SETUP` the video track and take the channels the server assigns
+    /// (it may answer with others than the ones asked for).
     async fn setup_video(&mut self, base: &Described) -> Result<(), MediaError> {
         let transport = format!("RTP/AVP/TCP;unicast;interleaved={RTP_CHANNEL}-{RTCP_CHANNEL}");
-        self.request("SETUP", &base.video_control, &[("Transport", &transport)])
+        let response = self
+            .request("SETUP", &base.video_control, &[("Transport", &transport)])
             .await?;
+        let answered = response.header("Transport").unwrap_or_default();
+        self.link.channels = interleaved_channels(answered).unwrap_or((RTP_CHANNEL, RTCP_CHANNEL));
+        debug!(
+            transport = answered,
+            rtp_channel = self.link.channels.0,
+            "video track set up"
+        );
         Ok(())
     }
 
@@ -266,25 +334,13 @@ impl Client {
             .await?;
         Ok(())
     }
-
-    /// A request whose response arrives in the read loop.
-    async fn send_only(&mut self, method: &str, uri: &str) -> std::io::Result<()> {
-        self.cseq += 1;
-        let text = request_text(method, uri, self.cseq, self.session.as_deref(), &[]);
-        self.io.get_mut().write_all(text.as_bytes()).await
-    }
-
-    async fn send_rtcp_receiver_report(&mut self) -> std::io::Result<()> {
-        let report = rtcp_receiver_report(RECEIVER_SSRC);
-        let frame = interleaved_frame(RTCP_CHANNEL, &report);
-        self.io.get_mut().write_all(&frame).await
-    }
 }
 
-/// The read loop: interleaved frames and stray RTSP messages until the
-/// server closes, a transport error, or a stop request.
+/// The write side of the session: keep-alives, receiver reports, acks of
+/// server requests, `TEARDOWN` on a stop. The read half lives in its own
+/// task ([`read_loop`]) so that no timer ever interrupts a frame mid-read.
 async fn run(
-    mut client: Client,
+    client: Client,
     aggregate: String,
     sink: LiveRtpSink,
     activity: Arc<RtpActivity>,
@@ -292,54 +348,105 @@ async fn run(
     notifier: LiveLossNotifier,
     mut stop: oneshot::Receiver<()>,
 ) {
+    let Client { reader, mut link } = client;
+    let (acks, mut pending_acks) = mpsc::channel(ACK_QUEUE);
+    let rtp_channel = link.channels.0;
+    let mut reading = tokio::spawn(read_loop(
+        reader,
+        rtp_channel,
+        sink,
+        activity,
+        first_rtp,
+        acks,
+    ));
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     let mut rtcp = tokio::time::interval(RTCP_INTERVAL);
     keepalive.tick().await;
     rtcp.tick().await;
-    let mut got_first = false;
     let end = loop {
-        tokio::select! {
+        let sent = tokio::select! {
             _ = &mut stop => break None,
-            _ = keepalive.tick() => {
-                if let Err(e) = client.send_only("GET_PARAMETER", &aggregate).await {
-                    break Some((LiveLossReason::PeerDisconnected, format!("keep-alive: {e}")));
-                }
-            }
-            _ = rtcp.tick() => {
-                if let Err(e) = client.send_rtcp_receiver_report().await {
-                    break Some((LiveLossReason::PeerDisconnected, format!("rtcp: {e}")));
-                }
-            }
-            next = read_next(&mut client.io) => match next {
-                Ok(Incoming::Rtp(packet)) => {
-                    activity.touch(Instant::now());
-                    if !got_first {
-                        got_first = true;
-                        first_rtp.notify_one();
-                    }
-                    let _ = sink.push(packet);
-                }
-                Ok(Incoming::Other) => {}
-                Ok(Incoming::ServerRequest { cseq }) => {
-                    let reply = format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n\r\n");
-                    if let Err(e) = client.io.get_mut().write_all(reply.as_bytes()).await {
-                        break Some((LiveLossReason::PeerDisconnected, format!("reply: {e}")));
-                    }
-                }
-                Ok(Incoming::Closed) => break Some((LiveLossReason::EndOfStream, "server closed the stream".into())),
-                Err(e) => break Some((LiveLossReason::PeerDisconnected, e)),
-            }
+            ended = &mut reading => break Some(read_loop_outcome(ended)),
+            _ = keepalive.tick() => link
+                .send("GET_PARAMETER", &aggregate, &[])
+                .await
+                .map_err(|e| format!("keep-alive: {e}")),
+            _ = rtcp.tick() => link
+                .send_rtcp_receiver_report()
+                .await
+                .map_err(|e| format!("rtcp: {e}")),
+            ack = pending_acks.recv() => match ack {
+                Some(cseq) => link.ack(&cseq).await.map_err(|e| format!("ack: {e}")),
+                // The read loop is over; collect its outcome.
+                None => break Some(read_loop_outcome((&mut reading).await)),
+            },
+        };
+        if let Err(why) = sent {
+            break Some((LiveLossReason::PeerDisconnected, why));
         }
     };
-    if let Some((reason, why)) = end {
-        warn!(%why, "watch-along relay ended");
-        report_loss(&notifier, reason);
-    } else {
-        let teardown = client.request("TEARDOWN", &aggregate, &[]);
-        if let Err(e) = tokio::time::timeout(TEARDOWN_GRACE, teardown).await {
-            debug!(error = %e, "watch-along TEARDOWN not confirmed");
+    reading.abort();
+    match end {
+        Some((reason, why)) => {
+            warn!(%why, "watch-along relay ended");
+            report_loss(&notifier, reason);
         }
-        debug!("watch-along relay stopped");
+        None => teardown(&mut link, &aggregate).await,
+    }
+}
+
+fn read_loop_outcome(
+    joined: Result<(LiveLossReason, String), tokio::task::JoinError>,
+) -> (LiveLossReason, String) {
+    joined.unwrap_or_else(|e| (LiveLossReason::PeerDisconnected, format!("read loop: {e}")))
+}
+
+/// Best-effort `TEARDOWN` on a stop: written, not awaited, since the
+/// read half is already gone.
+async fn teardown(link: &mut Link, aggregate: &str) {
+    match tokio::time::timeout(TEARDOWN_GRACE, link.send("TEARDOWN", aggregate, &[])).await {
+        Ok(Ok(())) => debug!("watch-along relay stopped"),
+        Ok(Err(e)) => debug!(error = %e, "watch-along TEARDOWN not sent"),
+        Err(_) => debug!("watch-along TEARDOWN not sent in time"),
+    }
+}
+
+/// Owns the read half: forwards the video RTP into the sink, hands the
+/// server's requests over for an ack, and ends with the loss to report.
+async fn read_loop(
+    mut reader: Reader,
+    rtp_channel: u8,
+    sink: LiveRtpSink,
+    activity: Arc<RtpActivity>,
+    first_rtp: Arc<Notify>,
+    acks: mpsc::Sender<String>,
+) -> (LiveLossReason, String) {
+    let mut stats = FrameStats::default();
+    let mut got_first = false;
+    loop {
+        match read_next(&mut reader, rtp_channel, &mut stats).await {
+            Ok(Incoming::Rtp(packet)) => {
+                activity.touch(Instant::now());
+                if !got_first {
+                    got_first = true;
+                    first_rtp.notify_one();
+                }
+                let _ = sink.push(packet);
+            }
+            Ok(Incoming::Other) => {}
+            Ok(Incoming::ServerRequest { cseq }) => {
+                if acks.send(cseq).await.is_err() {
+                    return (LiveLossReason::PeerDisconnected, "writer gone".into());
+                }
+            }
+            Ok(Incoming::Closed) => {
+                return (
+                    LiveLossReason::EndOfStream,
+                    "server closed the stream".into(),
+                );
+            }
+            Err(why) => return (LiveLossReason::PeerDisconnected, why),
+        }
     }
 }
 
@@ -355,33 +462,89 @@ enum Incoming {
     Closed,
 }
 
+/// What the read loop has seen so far: the first frames are logged, and
+/// a desync report says what came before the unexpected bytes.
+#[derive(Default)]
+struct FrameStats {
+    frames: u64,
+    last: Option<(u8, usize)>,
+}
+
+impl FrameStats {
+    fn record(&mut self, channel: u8, payload: &[u8]) {
+        self.frames += 1;
+        self.last = Some((channel, payload.len()));
+        if self.frames <= FIRST_FRAMES_LOGGED {
+            debug!(
+                channel,
+                len = payload.len(),
+                rtp = %rtp_summary(payload),
+                "interleaved frame"
+            );
+        }
+    }
+
+    fn last_label(&self) -> String {
+        self.last.map_or_else(
+            || "none".to_string(),
+            |(channel, len)| format!("channel {channel}, {len} bytes"),
+        )
+    }
+}
+
 /// One interleaved frame or one RTSP message.
-async fn read_next(io: &mut BufReader<Box<dyn Io>>) -> Result<Incoming, String> {
+async fn read_next(
+    io: &mut Reader,
+    rtp_channel: u8,
+    stats: &mut FrameStats,
+) -> Result<Incoming, String> {
     let mut first = [0u8; 1];
     match io.read(&mut first).await {
         Ok(0) => return Ok(Incoming::Closed),
         Ok(_) => {}
         Err(e) => return Err(format!("read: {e}")),
     }
-    if first[0] == b'$' {
-        let mut header = [0u8; 3];
-        io.read_exact(&mut header)
-            .await
-            .map_err(|e| format!("frame header: {e}"))?;
-        let (channel, len) = interleaved_header(header);
-        let mut payload = vec![0u8; len];
-        io.read_exact(&mut payload)
-            .await
-            .map_err(|e| format!("frame payload: {e}"))?;
-        if channel == RTP_CHANNEL && rewrite_payload_type(&mut payload, LIVE_RTP_H264_PT) {
-            return Ok(Incoming::Rtp(Bytes::from(payload)));
+    match first[0] {
+        b'$' => read_frame(io, rtp_channel, stats).await,
+        b if b.is_ascii_uppercase() => read_message(io, b, stats).await,
+        b => {
+            let ahead = io.fill_buf().await.map_err(|e| format!("peek: {e}"))?;
+            Err(desync_report(b, ahead, stats))
         }
-        return Ok(Incoming::Other);
     }
-    let mut line = String::from(first[0] as char);
-    io.read_line(&mut line)
+}
+
+async fn read_frame(
+    io: &mut Reader,
+    rtp_channel: u8,
+    stats: &mut FrameStats,
+) -> Result<Incoming, String> {
+    let mut header = [0u8; 3];
+    io.read_exact(&mut header)
+        .await
+        .map_err(|e| format!("frame header: {e}"))?;
+    let (channel, len) = interleaved_header(header);
+    let mut payload = vec![0u8; len];
+    io.read_exact(&mut payload)
+        .await
+        .map_err(|e| format!("frame payload: {e}"))?;
+    stats.record(channel, &payload);
+    if channel == rtp_channel && rewrite_payload_type(&mut payload, LIVE_RTP_H264_PT) {
+        return Ok(Incoming::Rtp(Bytes::from(payload)));
+    }
+    Ok(Incoming::Other)
+}
+
+/// An RTSP message whose first byte was already read: a response to a
+/// keep-alive, or a request from the server.
+async fn read_message(io: &mut Reader, first: u8, stats: &FrameStats) -> Result<Incoming, String> {
+    let mut line = vec![first];
+    io.read_until(b'\n', &mut line)
         .await
         .map_err(|e| format!("message line: {e}"))?;
+    let Ok(start) = String::from_utf8(line.clone()) else {
+        return Err(desync_report(first, &line[1..], stats));
+    };
     let mut cseq = None;
     let mut content_length = 0usize;
     let mut header = String::new();
@@ -408,7 +571,7 @@ async fn read_next(io: &mut BufReader<Box<dyn Io>>) -> Result<Incoming, String> 
             .await
             .map_err(|e| format!("message body: {e}"))?;
     }
-    if line.starts_with("RTSP/") {
+    if start.starts_with("RTSP/") {
         return Ok(Incoming::Other);
     }
     Ok(Incoming::ServerRequest {
@@ -416,7 +579,7 @@ async fn read_next(io: &mut BufReader<Box<dyn Io>>) -> Result<Incoming, String> 
     })
 }
 
-async fn read_response(io: &mut BufReader<Box<dyn Io>>) -> Result<Response, MediaError> {
+async fn read_response(io: &mut Reader) -> Result<Response, MediaError> {
     let mut line = String::new();
     io.read_line(&mut line)
         .await
@@ -608,6 +771,50 @@ fn join_control(base: &str, control: &str) -> String {
     }
 }
 
+/// The `interleaved=a-b` pair of a `Transport` header, if any.
+fn interleaved_channels(transport: &str) -> Option<(u8, u8)> {
+    let field = transport
+        .split(';')
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix("interleaved="))?;
+    let (data, control) = field.split_once('-')?;
+    Some((data.trim().parse().ok()?, control.trim().parse().ok()?))
+}
+
+/// `v2 pt=96 seq=1234 m=1` for an RTP packet, `not-rtp` otherwise.
+fn rtp_summary(packet: &[u8]) -> String {
+    if packet.len() < 12 || packet[0] >> 6 != 2 {
+        return "not-rtp".to_string();
+    }
+    format!(
+        "v2 pt={} seq={} m={}",
+        packet[1] & 0x7f,
+        u16::from_be_bytes([packet[2], packet[3]]),
+        u8::from(packet[1] & 0x80 != 0)
+    )
+}
+
+/// Describe bytes that are neither a frame nor an RTSP message: what
+/// came before them, a bounded hex dump, and where the next `$` is.
+/// Stream bytes carry no secret; the report goes to the log as it is.
+fn desync_report(first: u8, ahead: &[u8], stats: &FrameStats) -> String {
+    let dump = ahead
+        .iter()
+        .take(DESYNC_DUMP_BYTES)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let marker = ahead.iter().position(|&b| b == b'$').map_or_else(
+        || "none buffered".to_string(),
+        |i| format!("{} bytes ahead", i + 1),
+    );
+    format!(
+        "unexpected byte 0x{first:02x} after {} frames (last: {}); next bytes: {dump}; next '$' {marker}",
+        stats.frames,
+        stats.last_label()
+    )
+}
+
 /// `$`, channel, 16-bit big-endian length.
 fn interleaved_header(header: [u8; 3]) -> (u8, usize) {
     (
@@ -724,6 +931,41 @@ mod tests {
         let mut v1 = vec![0x40; 12];
         assert!(!rewrite_payload_type(&mut v1, 103));
         assert!(!rewrite_payload_type(&mut packet, 300));
+    }
+
+    #[test]
+    fn interleaved_channels_reads_the_servers_transport_answer() {
+        assert_eq!(
+            interleaved_channels("RTP/AVP/TCP;unicast;interleaved=2-3;ssrc=1A2B"),
+            Some((2, 3))
+        );
+        assert_eq!(interleaved_channels("RTP/AVP/TCP;unicast"), None);
+        assert_eq!(interleaved_channels("interleaved=x-1"), None);
+        assert_eq!(interleaved_channels(""), None);
+    }
+
+    #[test]
+    fn rtp_summary_describes_rtp_and_flags_the_rest() {
+        let packet = [0x80, 0x80 | 0x60, 0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(rtp_summary(&packet), "v2 pt=96 seq=4660 m=1");
+        assert_eq!(rtp_summary(&[0x80, 96]), "not-rtp");
+        assert_eq!(rtp_summary(&[0x40; 12]), "not-rtp");
+    }
+
+    #[test]
+    fn desync_report_dumps_bounded_hex_and_locates_the_marker() {
+        let mut stats = FrameStats::default();
+        stats.record(0, &[0x80; 12]);
+        let mut ahead = vec![0xABu8; 30];
+        ahead[27] = b'$';
+        let report = desync_report(0x01, &ahead, &stats);
+        assert!(
+            report.starts_with("unexpected byte 0x01 after 1 frames (last: channel 0, 12 bytes)")
+        );
+        assert_eq!(report.matches("ab").count(), DESYNC_DUMP_BYTES);
+        assert!(report.ends_with("next '$' 28 bytes ahead"));
+        assert!(desync_report(0x01, &[], &FrameStats::default()).contains("(last: none)"));
+        assert!(desync_report(0x01, &[1, 2], &stats).ends_with("next '$' none buffered"));
     }
 
     #[test]
