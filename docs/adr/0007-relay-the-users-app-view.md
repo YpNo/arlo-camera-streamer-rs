@@ -53,13 +53,20 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
   through the shared notifier (server closed → `end-of-stream`,
   transport error → `peer-disconnected`, silence → the stall watchdog).
   **Video only**: the app's audio is AAC where the live audio path is
-  Opus; the silent bed covers it.
+  Opus; the silent bed covers it. (The audio *is* on the wire: Arlo
+  pushes the AAC track's RTP unframed, payload type 0, without any
+  `SETUP` for it — a later audio relay can start from there.)
 - **Orchestrator:** `UserViewStarted` (`Idle → Activating`),
   `UserViewEnded` (`Live → Idle`, emitted only for a relay session),
   `UserViewUnavailable` (`Activating → Idle`, no backoff). A relay has
-  **no cooldown** (it ends with the view, a loss, or the hard cap is not
-  involved) and is **not charged** to the daily budget: the camera
-  streams for the app, not for us. A motion pulse during a relay is
+  **no cooldown** (it ends with the view or a loss) and is **not
+  charged** to the daily budget: the camera streams for the app, not for
+  us. It **is capped** at `max_continuous_live`, though (2026-10-01,
+  third gate): our RTSP session counts as a viewer for Arlo's backend,
+  so once the app closes its view the camera keeps streaming for us and
+  never reports `idle`. The cap bounds that to the same five minutes a
+  motion session gets; the camera idles when we let go, and a longer
+  view in the app relays again at its next `startUserStream`. A motion pulse during a relay is
   absorbed; once the view ends, the next pulse is an ordinary motion
   session. A running motion session is left alone when a view starts
   (ADR 0005). A failed or lost relay arms a 30 s retry guard, since the
@@ -73,7 +80,7 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
 ### Positive
 
 - The NVR shows what the user watches in the app, through the existing
-  outputs, with no extra camera load and no Arlo signaling session.
+  outputs, with no Arlo signaling session of ours.
 - The suppression of motion during a view (ADR 0005) is now a relay of
   the view, and `CameraBusy` keeps catching the views the bus missed.
 
@@ -86,6 +93,12 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
 - **No certificate validation** for the watch-along host; TLS still
   hides the exchange and the token is single-session.
 - **No audio** from the relayed view.
+- **The relay prolongs the camera's streaming**: after the app closes
+  its view, the camera streams for the daemon until the cap (up to
+  `max_continuous_live`), and the NVR keeps showing live for that long.
+  The bus gives no signal of the app leaving while we hold the stream;
+  a shorter, relay-specific cap or a teardown-and-listen probe are the
+  options if that is too long.
 - **In-band SPS/PPS**: Arlo's SDP carries `sprop-parameter-sets`; if
   the stream does not repeat them in-band, the decoder shows nothing
   until it gets them. Unverified at the time of writing; the fix would

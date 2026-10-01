@@ -130,6 +130,14 @@ pub struct CameraOrchestrator {
     /// Until when a failed or lost relay of the user's view is not
     /// retried, so the repeated view reports cannot hammer Arlo.
     user_view_retry_after: Option<Instant>,
+    /// How long a relay of the user's view may run: our RTSP session
+    /// keeps the camera streaming for Arlo's backend even after the app
+    /// closes its view, so a relay is capped like a motion session
+    /// (`max_continuous_live`).
+    relay_cap: Duration,
+    /// When the running relay reaches its cap; `Some` iff live with a
+    /// [`LiveSource::UserView`] session.
+    relay_deadline: Option<Instant>,
     signaler: Arc<dyn WebrtcSignaler>,
     thumbnails: Arc<dyn ArloThumbnailSource>,
     media: Arc<dyn MediaMultiplexer>,
@@ -187,6 +195,8 @@ impl CameraOrchestrator {
             user_view_notice: false,
             session_source: None,
             user_view_retry_after: None,
+            relay_cap: Duration::from_secs(config.cooldown.max_continuous_live),
+            relay_deadline: None,
             signaler,
             thumbnails,
             media,
@@ -397,6 +407,9 @@ impl CameraOrchestrator {
     fn next_deadline(&self) -> Option<Instant> {
         match &self.state {
             CameraState::Idle | CameraState::Activating => None,
+            CameraState::Live if self.session_source == Some(LiveSource::UserView) => {
+                self.relay_deadline
+            }
             CameraState::Live => self.debouncer.next_deadline(now()),
             CameraState::Failed { .. } => self.failed_deadline,
             CameraState::BatteryProtect { .. } => {
@@ -606,6 +619,16 @@ impl CameraOrchestrator {
 
     async fn handle_deadline(&mut self) -> Result<(), DomainError> {
         let signal = match &self.state {
+            CameraState::Live if self.session_source == Some(LiveSource::UserView) => {
+                if self.relay_deadline.is_none_or(|at| now() < at) {
+                    return Ok(());
+                }
+                info!(
+                    cap_secs = self.relay_cap.as_secs(),
+                    "relay of the user's view reached the hard cap; releasing the camera"
+                );
+                StateTransition::MaxLiveExceeded
+            }
             CameraState::Live => match self.debouncer.poll(now()) {
                 DebouncerVerdict::DebounceExpired => StateTransition::CooldownExpired,
                 DebouncerVerdict::MaxLiveExceeded => StateTransition::MaxLiveExceeded,
@@ -636,6 +659,7 @@ impl CameraOrchestrator {
             // side effect awaits, makes a late report unobservable.
             if !matches!(to, CameraState::Live) {
                 self.live = None;
+                self.relay_deadline = None;
             }
             self.session_source = match (&to, &signal) {
                 (CameraState::Activating, StateTransition::UserViewStarted) => {
@@ -684,7 +708,9 @@ impl CameraOrchestrator {
             // cooldown and costs no battery of ours: it is not debounced
             // and not charged to the daily budget.
             (CameraState::Activating, CameraState::Live) => {
-                if self.session_source != Some(LiveSource::UserView) {
+                if self.session_source == Some(LiveSource::UserView) {
+                    self.relay_deadline = Some(now() + self.relay_cap);
+                } else {
                     self.debouncer.on_live_attached(now());
                     self.budget.on_live_started(Local::now().naive_local());
                 }
@@ -1747,6 +1773,46 @@ mod tests {
             1,
             "teardown stays paired with detach"
         );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_view_relay_ends_at_the_hard_cap_and_is_not_resumed() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        let views = StubUserViews::always();
+        let (orch, tx, token) = build_with_views(&cfg, sr.clone(), media.clone(), views.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        assert_eq!(
+            media.calls().await,
+            vec![MediaCall::Register, MediaCall::AttachUserView]
+        );
+        tokio::time::advance(Duration::from_secs(299)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            media.calls().await.is_empty(),
+            "still relaying before the cap"
+        );
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        let calls = media.calls().await;
+        assert_eq!(calls, vec![MediaCall::DetachLive], "{calls:?}");
+        assert_eq!(sr.stop_count().await, 1, "teardown paired with detach");
+        assert_eq!(
+            views.call_count().await,
+            1,
+            "no new query without a new view report"
+        );
+
+        // The camera idles once we let go: the view's end is a no-op now.
+        send(&tx, manual_ended()).await;
+        assert!(media.calls().await.is_empty());
 
         token.cancel();
         handle.await.unwrap();

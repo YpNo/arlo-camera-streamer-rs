@@ -62,7 +62,11 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   Since ADR 0007 the view **is relayed**: `ManualStream` in `Idle` → `UserViewStarted` →
   `Activating` → `start_user_view_relay()` (`user_views.watch_along_url` then
   `media.attach_user_view`) → `Live` with `session_source = UserView`. No debouncer, no
-  budget charge; `ManualStreamEnded` → `UserViewEnded` → `Idle`; a failure →
+  budget charge, but a **hard cap**: `relay_deadline = now + max_continuous_live`, polled
+  by `handle_deadline` → `MaxLiveExceeded` (our RTSP session keeps the camera streaming
+  after the app closes, and the bus never says `idle` while we hold it — captured
+  2026-10-01). Not resumed after the cap: the next `startUserStream` relays again.
+  `ManualStreamEnded` → `UserViewEnded` → `Idle`; a failure →
   `UserViewUnavailable` → `Idle` (no backoff) + 30 s `USER_VIEW_RETRY` guard, same after
   a `LiveLost`. A motion pulse during a relay is absorbed and must not prime the
   debouncer (it would end the relay through the cooldown).

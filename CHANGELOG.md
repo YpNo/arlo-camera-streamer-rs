@@ -54,7 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outputs (ADR 0007; the relay's RTSP client tolerates the unframed
   RTCP and keep-alive packets Arlo's server sends between interleaved
   frames by resynchronising on the next frame header, and reports any
-  other framing surprise with a hex dump): the daemon fetches the
+  other framing surprise with a hex dump; a relay is capped at
+  `max_continuous_live` since it keeps the camera streaming after the
+  app closes its view): the daemon fetches the
   view's own RTSPS stream as
   the app identity (`arlo.app_version`) and splices it in like a motion
   session, video only, with no cooldown and no daily-budget charge. It
