@@ -50,10 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   battery-protect, failed) each new snapshot refreshes it at once; at the
   end of a session the refresh uses the cached snapshot and saves a cloud
   round-trip.
-- While you watch a camera in the Arlo app, its idle frame reads
-  `LIVE IN ARLO APP · <stream>` instead of `STANDBY`, so viewers know the
-  live picture is in the app (which the daemon cannot relay, ADR 0005).
-  It reverts when the view ends or its 120 s hold runs out.
+- A live view you start in the Arlo app is relayed to the RTSP and HLS
+  outputs (ADR 0007): the daemon fetches the view's own RTSPS stream as
+  the app identity (`arlo.app_version`) and splices it in like a motion
+  session, video only, with no cooldown and no daily-budget charge. It
+  ends with the view; a view that cannot be relayed leaves the idle
+  frame reading `LIVE IN ARLO APP · <stream>` (ADR 0005) and is retried
+  30 s later. The admin snapshot gains `live_source`
+  (`motion` / `user-view`).
 - HLS output (ADR 0006): with `[output.hls]` set, each camera's RTSP
   output is repackaged without re-encoding into
   `<dir>/<stream_name>/index.m3u8` and segments by a loopback segmenter.

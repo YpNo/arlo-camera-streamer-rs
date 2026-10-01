@@ -67,6 +67,38 @@ pub enum StateTransition {
     /// view in the Arlo app (`DomainError::CameraBusy`). Returns
     /// `Activating → Idle` without the failure backoff (ADR 0005).
     CameraBusy,
+    /// The user opened a live view in the Arlo app while the camera was
+    /// idle: relay it (ADR 0007). `Idle → Activating`.
+    UserViewStarted,
+    /// The user closed the view a relay session was following.
+    /// `Live → Idle`, no backoff.
+    UserViewEnded,
+    /// The view could not be relayed (no stream handed out, refused,
+    /// no video in time). `Activating → Idle` without backoff: the view
+    /// itself is unaffected and the idle frame says where it is.
+    UserViewUnavailable,
+}
+
+/// What a live session shows: the camera woken by motion through our
+/// own WebRTC call, or the user's view in the Arlo app relayed from
+/// its watch-along stream (ADR 0007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveSource {
+    /// Our own session, started by motion, audio or an admin wake.
+    Motion,
+    /// The user's view in the Arlo app, relayed.
+    UserView,
+}
+
+impl LiveSource {
+    /// Stable label for logs, metrics and the admin snapshot.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Motion => "motion",
+            Self::UserView => "user-view",
+        }
+    }
 }
 
 /// Why an attached live source stopped delivering usable media.
@@ -152,5 +184,11 @@ mod tests {
             assert_eq!(label, format!("live-lost-{}", r.as_label()));
             assert!(seen.insert(label), "duplicate signal label {label}");
         }
+    }
+
+    #[test]
+    fn live_source_labels_are_stable() {
+        assert_eq!(LiveSource::Motion.as_label(), "motion");
+        assert_eq!(LiveSource::UserView.as_label(), "user-view");
     }
 }

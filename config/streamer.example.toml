@@ -19,6 +19,10 @@ password_env       = "ARLO_PASSWORD"
 # here so the second factor is only asked once. Path must be readable +
 # writable by the streamer process. Permissions are forced to 0600.
 session_cache_path = "/var/lib/arlo-streamer/session.json"
+# Arlo app version the daemon identifies as when it fetches the stream of a
+# live view you started in the app, to relay it (ADR 0007). Arlo hands that
+# identity an RTSPS stream; a browser identity gets an unplayable DASH URL.
+# app_version = "6.46.0"
 
 # Second factor for the first login (and whenever the cached session is
 # rejected). Exactly one `[arlo.mfa]` block; pick a `kind`:

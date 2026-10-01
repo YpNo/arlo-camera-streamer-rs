@@ -55,6 +55,11 @@ pub struct CameraSnapshot {
     pub live_secs_today: u64,
     /// Daily live budget, in seconds. `0` when disabled.
     pub daily_budget_secs: u64,
+    /// What the live session shows while `Live`: `"motion"` (our own
+    /// session) or `"user-view"` (the app view relayed, ADR 0007).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub live_source: Option<String>,
     /// Last failure reason, if currently `Failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
@@ -93,6 +98,7 @@ mod tests {
             state: "failed".to_string(),
             live_secs_today: 12,
             daily_budget_secs: 600,
+            live_source: None,
             last_failure: Some("boom".to_string()),
             retries: 2,
             user_view: false,
@@ -110,12 +116,14 @@ mod tests {
             state: "idle".to_string(),
             live_secs_today: 0,
             daily_budget_secs: 0,
+            live_source: None,
             last_failure: None,
             retries: 0,
             user_view: false,
         };
         let s = serde_json::to_string(&snap).unwrap();
         assert!(!s.contains("last_failure"));
+        assert!(!s.contains("live_source"));
     }
 
     #[test]

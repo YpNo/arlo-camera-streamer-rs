@@ -9,13 +9,19 @@
 //!
 //! ## Transition matrix (Phase 1 v0.1)
 //!
-//! | From / Signal      | Motion | LiveAttached | LiveReady | CooldownExpired | MaxLiveExceeded | BudgetExhausted | BudgetReset | Failure | BackoffElapsed | LiveLost  | CameraBusy |
-//! |--------------------|--------|--------------|-----------|-----------------|-----------------|-----------------|-------------|---------|----------------|-----------|------------|
-//! | Idle               | Activ. | (ignored)    | (ignored) | (ignored)       | (ignored)       | BatteryProtect  | Idle        | Failed  | (ignored)      | (ignored) | (ignored)  |
-//! | Activating         | Activ. | Live         | Activ.    | (ignored)       | (ignored)       | BatteryProtect  | Activ.      | Failed  | (ignored)      | (ignored) | Idle       |
-//! | Live               | Live   | Live         | Live      | Idle            | Idle            | BatteryProtect  | Live        | Failed  | (ignored)      | Idle      | (ignored)  |
-//! | BatteryProtect     | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | Idle        | Failed  | (ignored)      | (ignored) | (ignored)  |
-//! | Failed             | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | (ign.)      | Failed+ | Idle           | (ignored) | (ignored)  |
+//! | From / Signal      | Motion | LiveAttached | LiveReady | CooldownExpired | MaxLiveExceeded | BudgetExhausted | BudgetReset | Failure | BackoffElapsed | LiveLost  | CameraBusy | UserViewStarted | UserViewEnded | UserViewUnavailable |
+//! |--------------------|--------|--------------|-----------|-----------------|-----------------|-----------------|-------------|---------|----------------|-----------|------------|-----------------|---------------|---------------------|
+//! | Idle               | Activ. | (ignored)    | (ignored) | (ignored)       | (ignored)       | BatteryProtect  | Idle        | Failed  | (ignored)      | (ignored) | (ignored)  | Activ.          | (ignored)     | (ignored)           |
+//! | Activating         | Activ. | Live         | Activ.    | (ignored)       | (ignored)       | BatteryProtect  | Activ.      | Failed  | (ignored)      | (ignored) | Idle       | Activ.          | (ignored)     | Idle                |
+//! | Live               | Live   | Live         | Live      | Idle            | Idle            | BatteryProtect  | Live        | Failed  | (ignored)      | Idle      | (ignored)  | Live            | Idle          | (ignored)           |
+//! | BatteryProtect     | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | Idle        | Failed  | (ignored)      | (ignored) | (ignored)  | (ignored)       | (ignored)     | (ignored)           |
+//! | Failed             | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | (ign.)      | Failed+ | Idle           | (ignored) | (ignored)  | (ignored)       | (ignored)     | (ignored)           |
+//!
+//! `UserViewStarted` / `UserViewEnded` / `UserViewUnavailable` (ADR 0007)
+//! drive the relay of a live view the user started in the Arlo app: it
+//! activates from `Idle` only, ends when the view ends, and a relay that
+//! cannot be set up returns to `Idle` without backoff, like `CameraBusy`.
+//! The orchestrator emits `UserViewEnded` only for a relay session.
 //!
 //! `CameraBusy` (ADR 0005) is an attach refused because the user is
 //! watching the camera in the Arlo app. It returns to `Idle` without the
@@ -58,20 +64,22 @@ pub fn transition(state: &CameraState, signal: &StateTransition) -> CameraState 
 
     match (state, signal) {
         // ---------- From Idle ----------
-        (S::Idle, T::MotionDetected) => S::Activating,
+        (S::Idle, T::MotionDetected | T::UserViewStarted) => S::Activating,
         (S::Idle, T::BudgetExhausted) => battery_protect(),
         (S::Idle, T::Failure(reason)) => fresh_failed(reason),
         (S::Idle, _) => S::Idle,
 
         // ---------- From Activating ----------
         (S::Activating, T::LiveAttached) => S::Live,
-        (S::Activating, T::CameraBusy) => S::Idle,
+        (S::Activating, T::CameraBusy | T::UserViewUnavailable) => S::Idle,
         (S::Activating, T::Failure(reason)) => fresh_failed(reason),
         (S::Activating, T::BudgetExhausted) => battery_protect(),
         (S::Activating, _) => S::Activating,
 
         // ---------- From Live ----------
-        (S::Live, T::CooldownExpired | T::MaxLiveExceeded | T::LiveLost(_)) => S::Idle,
+        (S::Live, T::CooldownExpired | T::MaxLiveExceeded | T::LiveLost(_) | T::UserViewEnded) => {
+            S::Idle
+        }
         (S::Live, T::BudgetExhausted) => battery_protect(),
         (S::Live, T::Failure(reason)) => fresh_failed(reason),
         (S::Live, _) => state.clone(),
@@ -258,6 +266,48 @@ mod tests {
             ),
             state
         );
+    }
+
+    // ---------- User-view relay (ADR 0007) ----------
+
+    #[test]
+    fn idle_user_view_started_activates() {
+        assert_eq!(
+            transition(&CameraState::Idle, &StateTransition::UserViewStarted),
+            CameraState::Activating
+        );
+    }
+
+    #[test]
+    fn activating_user_view_unavailable_returns_idle_without_failure() {
+        assert_eq!(
+            transition(
+                &CameraState::Activating,
+                &StateTransition::UserViewUnavailable
+            ),
+            CameraState::Idle
+        );
+    }
+
+    #[test]
+    fn live_user_view_ended_returns_idle() {
+        assert_eq!(
+            transition(&live(), &StateTransition::UserViewEnded),
+            CameraState::Idle
+        );
+    }
+
+    #[rstest]
+    #[case(live(), StateTransition::UserViewStarted)]
+    #[case(CameraState::Idle, StateTransition::UserViewEnded)]
+    #[case(CameraState::Idle, StateTransition::UserViewUnavailable)]
+    #[case(battery(), StateTransition::UserViewStarted)]
+    #[case(failed(1), StateTransition::UserViewStarted)]
+    fn user_view_signals_are_ignored_elsewhere(
+        #[case] state: CameraState,
+        #[case] signal: StateTransition,
+    ) {
+        assert_eq!(transition(&state, &signal), state);
     }
 
     // ---------- CameraBusy (ADR 0005) ----------

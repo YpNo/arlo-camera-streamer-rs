@@ -84,6 +84,17 @@ Arlo-specific behaviour with the `live-validation` skill.
 - DASH: stock `dashsink` writes only MPEG-TS and never prunes; fMP4 needs gst-plugins-rs.
   Do not "just wire it".
 
+## App-view relay (ADR 0007, `rtsp_relay.rs`)
+
+- Our own RTSP client, not `rtspsrc` (refused at SETUP by Arlo's server, cause unknown).
+  OPTIONS → DESCRIBE → one SETUP for the H.264 track (`RTP/AVP/TCP;unicast;interleaved=0-1`)
+  → PLAY → loop: `$`-framed RTP → PT rewritten to `LIVE_RTP_H264_PT` → `LiveSinks.video`;
+  `GET_PARAMETER` every 25 s, RTCP RR every 5 s, server requests answered 200.
+- TLS with validation **off** (raw-IP host); the egress token is the access control.
+- Both legs (`LiveLeg::{Webrtc, Relay}`) go through `arm_live`; the stall watchdog and
+  `report_loss` live in `live_watch.rs`.
+- Test source: `Stack::install_source("/mount", launch)` on the crate's own RTSP server.
+
 ## Media lifecycle vs live session
 
 gst-rtsp-server builds the media on the first client and unprepares it after the last,

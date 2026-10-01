@@ -80,9 +80,9 @@ use streamer_domain::error::DomainError;
 use streamer_domain::event::CameraEvent;
 use streamer_domain::metrics::{BudgetDecision, MotionOutcome, SpliceOutcome};
 use streamer_domain::port::{
-    ArloThumbnailSource, MediaMultiplexer, MetricsRecorder, WebrtcSignaler,
+    ArloThumbnailSource, MediaMultiplexer, MetricsRecorder, UserViewSource, WebrtcSignaler,
 };
-use streamer_domain::state::{CameraState, LiveLossReason, StateTransition};
+use streamer_domain::state::{CameraState, LiveLossReason, LiveSource, StateTransition};
 use streamer_domain::stream::LiveSession;
 
 use crate::budget::{BudgetVerdict, LiveBudgetTracker};
@@ -96,6 +96,11 @@ use crate::transition::transition;
 /// motion for good. Every report refreshes it; a view that outlives it
 /// is caught again by the attach failing with `CameraBusy`.
 const USER_VIEW_HOLD: Duration = Duration::from_secs(120);
+
+/// After a relay of the user's view failed or was lost, how long the
+/// repeated `userStreamActive` reports (one every snapshot, ~10 s) are
+/// left alone before another relay is tried (ADR 0007).
+const USER_VIEW_RETRY: Duration = Duration::from_secs(30);
 
 /// Per-camera state-machine task.
 pub struct CameraOrchestrator {
@@ -119,9 +124,16 @@ pub struct CameraOrchestrator {
     /// notice; kept in step with [`Self::user_view_active`] by
     /// [`Self::sync_user_view_notice`].
     user_view_notice: bool,
+    /// What the current `Activating` / `Live` session shows (ADR 0007);
+    /// `None` outside a session.
+    session_source: Option<LiveSource>,
+    /// Until when a failed or lost relay of the user's view is not
+    /// retried, so the repeated view reports cannot hammer Arlo.
+    user_view_retry_after: Option<Instant>,
     signaler: Arc<dyn WebrtcSignaler>,
     thumbnails: Arc<dyn ArloThumbnailSource>,
     media: Arc<dyn MediaMultiplexer>,
+    user_views: Arc<dyn UserViewSource>,
     metrics: Arc<dyn MetricsRecorder>,
     events: mpsc::Receiver<CameraEvent>,
     /// Inbound admin commands (e.g. force-idle, manual-wake). The
@@ -155,6 +167,7 @@ impl CameraOrchestrator {
         signaler: Arc<dyn WebrtcSignaler>,
         thumbnails: Arc<dyn ArloThumbnailSource>,
         media: Arc<dyn MediaMultiplexer>,
+        user_views: Arc<dyn UserViewSource>,
         metrics: Arc<dyn MetricsRecorder>,
         events: mpsc::Receiver<CameraEvent>,
         admin: mpsc::Receiver<crate::admin::AdminCommand>,
@@ -172,9 +185,12 @@ impl CameraOrchestrator {
             live: None,
             user_view_until: None,
             user_view_notice: false,
+            session_source: None,
+            user_view_retry_after: None,
             signaler,
             thumbnails,
             media,
+            user_views,
             metrics,
             events,
             admin,
@@ -194,6 +210,7 @@ impl CameraOrchestrator {
         signaler: Arc<dyn WebrtcSignaler>,
         thumbnails: Arc<dyn ArloThumbnailSource>,
         media: Arc<dyn MediaMultiplexer>,
+        user_views: Arc<dyn UserViewSource>,
         events: mpsc::Receiver<CameraEvent>,
         shutdown: CancellationToken,
     ) -> Result<Self, DomainError> {
@@ -203,6 +220,7 @@ impl CameraOrchestrator {
             signaler,
             thumbnails,
             media,
+            user_views,
             Arc::new(NoopRecorder),
             events,
             admin_rx,
@@ -351,6 +369,10 @@ impl CameraOrchestrator {
             state: state_label.to_string(),
             live_secs_today: self.budget.spent_secs_today(),
             daily_budget_secs: self.budget.daily_budget_secs(),
+            live_source: (self.state == CameraState::Live)
+                .then_some(self.session_source)
+                .flatten()
+                .map(|s| s.as_label().to_string()),
             last_failure,
             retries,
             user_view: self.user_view_active(),
@@ -406,12 +428,18 @@ impl CameraOrchestrator {
             CameraEvent::ManualStream { .. } => {
                 self.on_user_view_started();
                 self.sync_user_view_notice().await;
-                return Ok(());
+                let Some(signal) = self.user_view_relay_signal() else {
+                    return Ok(());
+                };
+                signal
             }
             CameraEvent::ManualStreamEnded { .. } => {
                 self.on_user_view_ended();
                 self.sync_user_view_notice().await;
-                return Ok(());
+                if self.session_source != Some(LiveSource::UserView) {
+                    return Ok(());
+                }
+                StateTransition::UserViewEnded
             }
             CameraEvent::SnapshotAvailable { .. } => {
                 self.on_snapshot_available().await;
@@ -450,7 +478,10 @@ impl CameraOrchestrator {
         // Prime the debouncer only where a session can start or extend;
         // a pulse in BatteryProtect / Failed would leave a stale
         // `live_since` that trips the hard cap right after the next attach.
-        if in_session || self.state == CameraState::Idle {
+        // A relay of the user's view has no cooldown: it ends with the
+        // view, so a pulse during it must not start the debouncer.
+        let relaying = self.session_source == Some(LiveSource::UserView);
+        if (in_session && !relaying) || self.state == CameraState::Idle {
             self.debouncer.on_motion(now());
         }
         let signal = self.intercept_budget(StateTransition::MotionDetected);
@@ -544,6 +575,9 @@ impl CameraOrchestrator {
             reason = reason.as_label(),
             "live source lost; returning to idle"
         );
+        if self.session_source == Some(LiveSource::UserView) {
+            self.user_view_retry_after = Some(now() + USER_VIEW_RETRY);
+        }
         self.process_signals(VecDeque::from([StateTransition::LiveLost(reason)]))
             .await
     }
@@ -603,6 +637,14 @@ impl CameraOrchestrator {
             if !matches!(to, CameraState::Live) {
                 self.live = None;
             }
+            self.session_source = match (&to, &signal) {
+                (CameraState::Activating, StateTransition::UserViewStarted) => {
+                    Some(LiveSource::UserView)
+                }
+                (CameraState::Activating, _) => Some(LiveSource::Motion),
+                (CameraState::Live, _) => self.session_source,
+                _ => None,
+            };
             self.metrics
                 .record_state_change(&self.camera_id, &from, &to, signal_label(&signal));
             // Failures: increment retry counter on Failed entry.
@@ -631,12 +673,21 @@ impl CameraOrchestrator {
         match (from, to) {
             // Cold-start activation: kick off the async stream request.
             (CameraState::Idle, CameraState::Activating) => {
-                follow_ups.extend(self.start_activation().await);
+                let follow = if self.session_source == Some(LiveSource::UserView) {
+                    self.start_user_view_relay().await
+                } else {
+                    self.start_activation().await
+                };
+                follow_ups.extend(follow);
             }
-            // Activation succeeded.
+            // Activation succeeded. A relay of the user's view has no
+            // cooldown and costs no battery of ours: it is not debounced
+            // and not charged to the daily budget.
             (CameraState::Activating, CameraState::Live) => {
-                self.debouncer.on_live_attached(now());
-                self.budget.on_live_started(Local::now().naive_local());
+                if self.session_source != Some(LiveSource::UserView) {
+                    self.debouncer.on_live_attached(now());
+                    self.budget.on_live_started(Local::now().naive_local());
+                }
             }
             // Attach refused because the user watches in the Arlo app:
             // release whatever the attempt left behind, no backoff.
@@ -707,6 +758,55 @@ impl CameraOrchestrator {
         }
     }
 
+    /// Whether a report of the user's view should start a relay now: only
+    /// from `Idle`, and not within [`USER_VIEW_RETRY`] of a failed or lost
+    /// relay (the reports repeat about every 10 s while the view runs).
+    fn user_view_relay_signal(&self) -> Option<StateTransition> {
+        if self.state != CameraState::Idle {
+            return None;
+        }
+        if self
+            .user_view_retry_after
+            .is_some_and(|until| now() < until)
+        {
+            debug!("user view reported again within the relay retry guard; not retrying yet");
+            return None;
+        }
+        Some(StateTransition::UserViewStarted)
+    }
+
+    /// Relay the user's view in the Arlo app (ADR 0007): fetch its
+    /// watch-along stream and attach it as the live source. A failure
+    /// returns to idle without backoff and arms the retry guard; the idle
+    /// frame keeps saying where the live picture is.
+    async fn start_user_view_relay(&mut self) -> Vec<StateTransition> {
+        let started = now();
+        let attached = match self.user_views.watch_along_url(&self.camera_id).await {
+            Ok(url) => self.media.attach_user_view(&self.camera_id, &url).await,
+            Err(e) => Err(e),
+        };
+        match attached {
+            Ok(session) => {
+                self.live = Some(session);
+                self.metrics.record_splice(
+                    &self.camera_id,
+                    SpliceOutcome::Success,
+                    elapsed_ms(started),
+                );
+                info!("relaying the user's live view from the Arlo app");
+                vec![StateTransition::LiveAttached]
+            }
+            Err(e) => {
+                let latency = elapsed_ms(started);
+                warn!(error = %e, latency_ms = latency, "user view not relayed; idle frame keeps the notice");
+                self.metrics
+                    .record_splice(&self.camera_id, SpliceOutcome::AttachFailed, latency);
+                self.user_view_retry_after = Some(now() + USER_VIEW_RETRY);
+                vec![StateTransition::UserViewUnavailable]
+            }
+        }
+    }
+
     /// Detach the live source and refresh the idle thumbnail.
     /// Best-effort: thumbnail-fetch failures are logged but never
     /// propagated — the synthetic black-frame fallback in the media
@@ -716,7 +816,9 @@ impl CameraOrchestrator {
             warn!(error = %e, "detach_live failed");
         }
         self.stop_arlo_live().await;
-        self.budget.on_live_ended(Local::now().naive_local());
+        if self.session_source != Some(LiveSource::UserView) {
+            self.budget.on_live_ended(Local::now().naive_local());
+        }
         self.debouncer.on_idle();
         self.refresh_idle_thumbnail().await;
     }
@@ -827,6 +929,9 @@ fn signal_label(s: &StateTransition) -> &'static str {
         StateTransition::BackoffElapsed => "backoff-elapsed",
         StateTransition::LiveLost(reason) => reason.signal_label(),
         StateTransition::CameraBusy => "camera-busy",
+        StateTransition::UserViewStarted => "user-view-started",
+        StateTransition::UserViewEnded => "user-view-ended",
+        StateTransition::UserViewUnavailable => "user-view-unavailable",
     }
 }
 
@@ -897,6 +1002,9 @@ mod tests {
     }
 
     impl StubSignaler {
+        async fn push_response(&self, r: Result<SignalingAnswer, DomainError>) {
+            self.responses.lock().await.push_back(r);
+        }
         fn with_responses(rs: Vec<Result<SignalingAnswer, DomainError>>) -> Arc<Self> {
             Arc::new(Self {
                 responses: Mutex::new(VecDeque::from(rs)),
@@ -976,8 +1084,52 @@ mod tests {
     enum MediaCall {
         Register,
         AttachLive(String),
+        AttachUserView,
         DetachLive,
         RefreshThumbnail,
+    }
+
+    /// `UserViewSource` double: scripted answers, calls counted.
+    struct StubUserViews {
+        responses: Mutex<VecDeque<Result<streamer_domain::stream::WatchAlongUrl, DomainError>>>,
+        calls: Mutex<u32>,
+    }
+
+    impl StubUserViews {
+        fn with_responses(
+            responses: Vec<Result<streamer_domain::stream::WatchAlongUrl, DomainError>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into()),
+                calls: Mutex::new(0),
+            })
+        }
+        /// Always hands out a relayable URL.
+        fn always() -> Arc<Self> {
+            Self::with_responses(vec![])
+        }
+        async fn call_count(&self) -> u32 {
+            *self.calls.lock().await
+        }
+    }
+
+    fn view_url() -> streamer_domain::stream::WatchAlongUrl {
+        streamer_domain::stream::WatchAlongUrl::parse("rtsps://1.2.3.4:443/live/x?t=1").unwrap()
+    }
+
+    #[async_trait]
+    impl UserViewSource for StubUserViews {
+        async fn watch_along_url(
+            &self,
+            _camera: &CameraId,
+        ) -> Result<streamer_domain::stream::WatchAlongUrl, DomainError> {
+            *self.calls.lock().await += 1;
+            self.responses
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| Ok(view_url()))
+        }
     }
 
     impl RecordingMedia {
@@ -1060,9 +1212,15 @@ mod tests {
             _camera: &CameraId,
             _url: &streamer_domain::stream::WatchAlongUrl,
         ) -> Result<LiveSession, DomainError> {
-            Err(DomainError::AdapterTransport(
-                "user-view relay not driven yet".into(),
-            ))
+            self.events.lock().await.push(MediaCall::AttachUserView);
+            let (session, notifier) = LiveSession::new();
+            if self
+                .retain_notifiers
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.notifiers.lock().await.push(notifier);
+            }
+            Ok(session)
         }
     }
 
@@ -1105,6 +1263,19 @@ mod tests {
         mpsc::Sender<CameraEvent>,
         CancellationToken,
     ) {
+        build_with_views(cfg, sr, media, StubUserViews::always())
+    }
+
+    fn build_with_views(
+        cfg: &CameraConfig,
+        sr: Arc<dyn WebrtcSignaler>,
+        media: Arc<dyn MediaMultiplexer>,
+        views: Arc<dyn UserViewSource>,
+    ) -> (
+        CameraOrchestrator,
+        mpsc::Sender<CameraEvent>,
+        CancellationToken,
+    ) {
         let (tx, rx) = mpsc::channel(32);
         let token = CancellationToken::new();
         let orch = CameraOrchestrator::new_minimal(
@@ -1112,6 +1283,7 @@ mod tests {
             sr,
             Arc::new(StubThumbnails),
             media,
+            views,
             rx,
             token.clone(),
         )
@@ -1366,6 +1538,7 @@ mod tests {
             sr,
             thumbs.clone(),
             media.clone(),
+            StubUserViews::always(),
             rx,
             token.clone(),
         )
@@ -1442,8 +1615,16 @@ mod tests {
 
         send(&tx, manual()).await;
         send(&tx, motion()).await;
-        assert_eq!(sr.call_count().await, 0, "no attach while the user watches");
-        assert_eq!(media.calls().await, vec![MediaCall::Register]);
+        assert_eq!(
+            sr.call_count().await,
+            0,
+            "no WebRTC attach while the user watches"
+        );
+        assert_eq!(
+            media.calls().await,
+            vec![MediaCall::Register, MediaCall::AttachUserView],
+            "the view is relayed instead"
+        );
 
         send(&tx, manual_ended()).await;
         send(&tx, motion()).await;
@@ -1458,7 +1639,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn user_view_never_triggers_an_attach() {
+    async fn user_view_never_triggers_a_webrtc_attach() {
         let cfg = camera_cfg(60, 300);
         let sr = StubSignaler::with_responses(vec![]);
         let media = RecordingMedia::new();
@@ -1467,8 +1648,15 @@ mod tests {
 
         send(&tx, manual()).await;
         send(&tx, manual_ended()).await;
-        assert_eq!(sr.call_count().await, 0);
-        assert_eq!(media.calls().await, vec![MediaCall::Register]);
+        assert_eq!(sr.call_count().await, 0, "Arlo would refuse it (14001)");
+        assert_eq!(
+            media.calls().await,
+            vec![
+                MediaCall::Register,
+                MediaCall::AttachUserView,
+                MediaCall::DetachLive
+            ]
+        );
 
         token.cancel();
         handle.await.unwrap();
@@ -1503,10 +1691,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn user_view_hold_expires_without_an_idle_report() {
+        // The view cannot be relayed here (no stream handed out), so the
+        // camera stays idle with the notice; the hold alone must not pause
+        // motion for good.
         let cfg = camera_cfg(60, 300);
         let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
         let media = RecordingMedia::new();
-        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let views = StubUserViews::with_responses(vec![Err(DomainError::AdapterTransport(
+            "no stream".into(),
+        ))]);
+        let (orch, tx, token) = build_with_views(&cfg, sr.clone(), media.clone(), views);
         let handle = tokio::spawn(orch.run());
 
         send(&tx, manual()).await;
@@ -1517,6 +1711,155 @@ mod tests {
             1,
             "a lost idle report must not pause motion for good"
         );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    // ---------- Relay of the user's view (ADR 0007) ----------
+
+    #[tokio::test(start_paused = true)]
+    async fn user_view_in_idle_relays_the_view_until_it_ends() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        let views = StubUserViews::always();
+        let (orch, tx, token) = build_with_views(&cfg, sr.clone(), media.clone(), views.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        assert_eq!(
+            media.calls().await,
+            vec![MediaCall::Register, MediaCall::AttachUserView]
+        );
+        assert_eq!(views.call_count().await, 1);
+        assert_eq!(sr.call_count().await, 0, "no WebRTC call for a relay");
+        // A repeated view report changes nothing while relaying.
+        send(&tx, manual()).await;
+        assert!(media.calls().await.is_empty());
+        assert_eq!(views.call_count().await, 1);
+
+        send(&tx, manual_ended()).await;
+        let calls = media.calls().await;
+        assert_eq!(calls[0], MediaCall::DetachLive, "{calls:?}");
+        assert_eq!(
+            sr.stop_count().await,
+            1,
+            "teardown stays paired with detach"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn motion_during_a_relay_neither_starts_a_cooldown_nor_a_second_session() {
+        let cfg = camera_cfg(2, 300);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        media.calls().await;
+        send(&tx, motion()).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            media.calls().await.is_empty(),
+            "a motion pulse must not end the relay through the debounce"
+        );
+        assert_eq!(sr.call_count().await, 0);
+
+        send(&tx, manual_ended()).await;
+        assert!(media.calls().await.contains(&MediaCall::DetachLive));
+        // The view is over: the next pulse is an ordinary motion session.
+        sr.push_response(Ok(ok_answer())).await;
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 1);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_failure_returns_to_idle_without_backoff_and_guards_retries() {
+        let cfg = camera_cfg(60, 300);
+        let media = RecordingMedia::new();
+        let views = StubUserViews::with_responses(vec![Err(DomainError::AdapterTransport(
+            "no stream".into(),
+        ))]);
+        let (orch, tx, token) = build_with_views(
+            &cfg,
+            StubSignaler::with_responses(vec![]),
+            media.clone(),
+            views.clone(),
+        );
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        assert_eq!(views.call_count().await, 1);
+        assert_eq!(
+            media.notices().await,
+            vec![true],
+            "the idle frame keeps the notice"
+        );
+        // Within the guard: the repeated report is left alone.
+        send(&tx, manual()).await;
+        assert_eq!(views.call_count().await, 1);
+        // Past it: the next report tries again, and this time it works.
+        tokio::time::advance(USER_VIEW_RETRY + Duration::from_secs(1)).await;
+        send(&tx, manual()).await;
+        assert_eq!(views.call_count().await, 2);
+        assert!(media.calls().await.contains(&MediaCall::AttachUserView));
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_loss_returns_to_idle_and_is_not_retried_at_once() {
+        let cfg = camera_cfg(60, 300);
+        let media = RecordingMedia::new();
+        let views = StubUserViews::always();
+        let (orch, tx, token) = build_with_views(
+            &cfg,
+            StubSignaler::with_responses(vec![]),
+            media.clone(),
+            views.clone(),
+        );
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        media.calls().await;
+        assert!(media.fail_live(0, LiveLossReason::EndOfStream).await);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(media.calls().await.contains(&MediaCall::DetachLive));
+        send(&tx, manual()).await;
+        assert_eq!(
+            views.call_count().await,
+            1,
+            "lost relay not retried within the guard"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_view_during_a_motion_session_does_not_replace_it() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let views = StubUserViews::always();
+        let (orch, tx, token) = build_with_views(&cfg, sr, media.clone(), views.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        media.calls().await;
+        send(&tx, manual()).await;
+        assert!(media.calls().await.is_empty());
+        assert_eq!(views.call_count().await, 0);
 
         token.cancel();
         handle.await.unwrap();
@@ -1660,6 +2003,7 @@ mod tests {
             sr,
             Arc::new(StubThumbnails),
             media,
+            StubUserViews::always(),
             Arc::new(NoopRecorder),
             rx,
             admin_rx,
@@ -1681,9 +2025,13 @@ mod tests {
         send(&tx, manual()).await;
         let viewed = snap(admin_tx.clone()).await;
         assert!(viewed.user_view);
-        assert_eq!(viewed.state, "idle");
+        assert_eq!(viewed.state, "live", "the view is relayed");
+        assert_eq!(viewed.live_source.as_deref(), Some("user-view"));
         send(&tx, manual_ended()).await;
-        assert!(!snap(admin_tx).await.user_view);
+        let after = snap(admin_tx).await;
+        assert!(!after.user_view);
+        assert_eq!(after.state, "idle");
+        assert_eq!(after.live_source, None);
 
         token.cancel();
         handle.await.unwrap();
@@ -1692,6 +2040,18 @@ mod tests {
     #[test]
     fn signal_label_covers_camera_busy() {
         assert_eq!(signal_label(&StateTransition::CameraBusy), "camera-busy");
+        assert_eq!(
+            signal_label(&StateTransition::UserViewStarted),
+            "user-view-started"
+        );
+        assert_eq!(
+            signal_label(&StateTransition::UserViewEnded),
+            "user-view-ended"
+        );
+        assert_eq!(
+            signal_label(&StateTransition::UserViewUnavailable),
+            "user-view-unavailable"
+        );
     }
 
     // ---------- Failure path ----------

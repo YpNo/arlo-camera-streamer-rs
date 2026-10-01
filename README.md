@@ -19,7 +19,7 @@ Frigate's pull from Arlo's push**:
 | Activating | Frame freezes briefly | `start_stream` in flight |
 | Live  | Real H.264/H.265 from the camera, until `debounce_secs` after the last motion | Awake |
 | Battery-protect | Idle frame returns | Sleeping (quota exhausted) |
-| Viewed in app | You watch the camera in the Arlo app: Arlo allows one stream per camera and exposes the app's to no one else, so the idle frame reads `LIVE IN ARLO APP`; motion resumes when you close the app | Awake (because of you) |
+| Viewed in app | You watch the camera in the Arlo app: the daemon relays the app's own stream (ADR 0007, video only); if Arlo hands out none, the idle frame reads `LIVE IN ARLO APP`. Motion resumes when you close the app | Awake (because of you) |
 
 The transition is driven by Arlo's **MQTT event bus**: when the camera
 fires a motion event, the daemon negotiates a WebRTC session with Arlo's
@@ -48,6 +48,7 @@ to see the contracts. The ADRs document the load-bearing decisions:
 - [docs/adr/0003-seamless-input-selector-splice.md](./docs/adr/0003-seamless-input-selector-splice.md)
 - [ADR 0004 — Live-loss feedback](./docs/adr/0004-live-lost-feedback.md): a dead live source returns the camera to idle within the stall timeout instead of the debounce or the continuous-live cap.
 - [ADR 0006 — HLS output](./docs/adr/0006-hls-output-via-loopback-segmenter.md): HLS is written by a loopback RTSP client of each camera, without re-encoding; DASH is not supported.
+- [ADR 0007 — Relay the user's app view](./docs/adr/0007-relay-the-users-app-view.md): a live view started in the Arlo app is relayed from the RTSPS stream Arlo hands the app identity; no cooldown, no budget charge.
 
 ## Prerequisites
 
@@ -124,6 +125,7 @@ holding the values.
 | `arlo.email`                        | string         | (required)           | Arlo cloud account email.                                |
 | `arlo.password_env`                 | string         | (required)           | Env var name holding the password.                       |
 | `arlo.session_cache_path`           | path           | (required)           | Persisted session token — survives restarts.             |
+| `arlo.app_version`                  | string         | `6.46.0`             | Arlo app version the daemon identifies as when fetching the stream of a view you started in the app (ADR 0007). |
 | `arlo.mfa.kind`                     | `email`/`push`/`sms` | (required)     | Second factor. `email` and `push` run headless; `sms` prompts on stdin. |
 | `arlo.mfa.host` / `.provider` / `.user` / `.password_env` / `.port` | strings | (port: 993) | IMAP mailbox for `kind = "email"`; without them the OTP is prompted on stdin. |
 | `arlo.mfa.poll_interval_secs` / `.timeout_secs` | u64  | `3` / `120`          | Approval polling for `kind = "push"`.                    |

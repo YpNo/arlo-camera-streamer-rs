@@ -69,6 +69,7 @@ of each event is unchanged, which is why `event_mapper.rs` still works.
 - `0004-live-lost-feedback` — accepted; `LiveSession` handle + `LiveLost` transition.
 - `0005-manual-stream-piggyback` — accepted (revised): observe user views, never compete. Re-examined 2026-09-29: all four routes to the app's stream fail (14001, 502, 502, `NO_ROUTE_DESTINATION`); it cannot be relayed.
 - `0006-hls-output-via-loopback-segmenter` — accepted; HLS from a loopback RTSP client of each camera, no re-encode; DASH unsupported (stock dashsink writes only TS, never prunes).
+- `0007-relay-the-users-app-view` — accepted 2026-10-01; the app's view relayed from the RTSPS stream Arlo hands the iOS-app identity (`rtsp_relay.rs`, own RTSP client, TLS validation off). Needs arlo-rs `get_stream_url_as` (0.2.2; local `[patch]` meanwhile). Not yet run on the Frigate box.
 
 ---
 
@@ -153,6 +154,7 @@ per-camera `SipInfo` cache were folded into one `negotiate` call on
 | Item | Notes |
 |---|---|
 | Coverage gate | 86 % (measured 88.25 % on 2026-09-28, GStreamer files counted since the integration tests). Still excluded: `streamer-bin` and the infra-arlo network wrappers (`boot`, `events`, `stream_requester`, `thumbnails`). |
+| App-view relay | Built 2026-10-01 (ADR 0007), integration-tested against the crate's RTSP server; live gate pending: first VLC check of a relayed view, and whether Arlo's H.264 carries SPS/PPS in-band (else pass `sprop-parameter-sets` through the appsrc caps). Audio not relayed (AAC vs Opus path). `[patch.crates-io]` on until arlo-rs 0.2.2. |
 | HLS / DASH | HLS wired 2026-09-28 (ADR 0006, `hls.rs`), integration-tested (live picture in a segment, retention, cleanup); not yet run on the Frigate box. DASH unsupported: parsed, warned, ignored. |
 | Integration test vs a real gateway | `tests/live_session.rs` (2026-09-28) replaces the planned recorded-session fixture: DTLS keys are per call, so a recording cannot be replayed; a local `webrtcbin` answers instead. It proves negotiation, the splice seen by a client, mid-session join, stall and setup loss. Arlo-specific quirks (TURN, SDP shape drift) still need the Frigate box. |
 | Live session vs RTSP client lifecycle | **Fixed 2026-09-28.** The pumps push into the *current* media's appsrc (slot set at `media-configure`, cleared at `unprepared`), discard while none exists, and a media built during a live session gets its switch armed. Validated live 2026-09-28: VLC disconnected and reconnected mid-session and got the live video back ("media built during a live session; live switch armed"). |

@@ -291,6 +291,7 @@ mod tests {
                 state: "idle".to_string(),
                 live_secs_today: 0,
                 daily_budget_secs: 0,
+                live_source: None,
                 last_failure: None,
                 retries: 0,
                 user_view: false,

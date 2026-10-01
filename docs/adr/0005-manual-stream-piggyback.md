@@ -1,8 +1,10 @@
 # ADR 0005 — User views in the Arlo app: observe, never compete
 
-- **Status:** Accepted (revised 2026-09-28 after three live captures; the
-  first version, a piggy-backed "manual" session, was built, captured
-  against, and removed)
+- **Status:** Partly superseded by 0007 (2026-10-01): the view is now
+  relayed from the stream Arlo hands the app identity; the suppression
+  rules, the `CameraBusy` path and the notice fallback below stand
+  (revised 2026-09-28 after three live captures; the first version, a
+  piggy-backed "manual" session, was built, captured against, and removed)
 - **Date:** 2026-09-27, revised 2026-09-28, re-examined 2026-09-29
 - **Deciders:** Senior architect, project owner
 - **Supersedes:** —

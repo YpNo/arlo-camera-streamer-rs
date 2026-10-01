@@ -88,7 +88,8 @@ mockall    = "0.15"
 rstest     = "0.27"
 tokio-test = "0.4"
 
-# Local development against an unreleased ../arlo-rs. Keep commented in git:
-# a path override here would break every build that lacks the sibling tree.
-# [patch.crates-io]
-# arlo-rs = { path = "../arlo-rs" }
+# ADR 0007 development: the user-view relay needs arlo-rs's unreleased
+# `get_stream_url_as` (branch fix/force-start-stream-reply-url). Comment the
+# block out again once arlo-rs 0.2.2 is on crates.io: CI has no sibling tree.
+[patch.crates-io]
+arlo-rs = { path = "../arlo-rs" }

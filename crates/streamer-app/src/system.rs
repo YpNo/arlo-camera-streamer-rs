@@ -33,7 +33,8 @@ use streamer_domain::config::StreamerConfig;
 use streamer_domain::error::DomainError;
 use streamer_domain::event::CameraEvent;
 use streamer_domain::port::{
-    ArloEventSource, ArloThumbnailSource, MediaMultiplexer, MetricsRecorder, WebrtcSignaler,
+    ArloEventSource, ArloThumbnailSource, MediaMultiplexer, MetricsRecorder, UserViewSource,
+    WebrtcSignaler,
 };
 
 use crate::admin::{ADMIN_MAILBOX_CAPACITY, AdminCommand, AdminControlActor, AdminRoute};
@@ -73,6 +74,7 @@ impl StreamerSystem {
         signaler: Arc<dyn WebrtcSignaler>,
         thumbnails: Arc<dyn ArloThumbnailSource>,
         media: Arc<dyn MediaMultiplexer>,
+        user_views: Arc<dyn UserViewSource>,
         metrics: Arc<dyn MetricsRecorder>,
         version: &'static str,
     ) -> Result<Self, DomainError> {
@@ -111,6 +113,7 @@ impl StreamerSystem {
                 signaler.clone(),
                 thumbnails.clone(),
                 media.clone(),
+                user_views.clone(),
                 metrics.clone(),
                 event_rx,
                 admin_rx,
@@ -147,6 +150,7 @@ impl StreamerSystem {
         signaler: Arc<dyn WebrtcSignaler>,
         thumbnails: Arc<dyn ArloThumbnailSource>,
         media: Arc<dyn MediaMultiplexer>,
+        user_views: Arc<dyn UserViewSource>,
     ) -> Result<Self, DomainError> {
         Self::spawn(
             config,
@@ -154,6 +158,7 @@ impl StreamerSystem {
             signaler,
             thumbnails,
             media,
+            user_views,
             Arc::new(NoopRecorder),
             "0.0.0",
         )
@@ -265,6 +270,17 @@ mod tests {
 
     /// Retains every notifier so a session never resolves as
     /// `AdapterDropped` behind the wiring tests' back.
+    struct StubUserViews;
+    #[async_trait]
+    impl UserViewSource for StubUserViews {
+        async fn watch_along_url(
+            &self,
+            _camera: &CameraId,
+        ) -> Result<streamer_domain::stream::WatchAlongUrl, DomainError> {
+            Err(DomainError::AdapterTransport("not in this stub".into()))
+        }
+    }
+
     #[derive(Default)]
     struct StubMedia {
         notifiers: std::sync::Mutex<Vec<streamer_domain::stream::LiveLossNotifier>>,
@@ -318,6 +334,7 @@ mod tests {
                 email: "u@example.com".to_string(),
                 password_env: "PW".to_string(),
                 session_cache_path: PathBuf::from("/tmp/x.json"),
+                app_version: "6.46.0".to_string(),
                 mfa: MfaConfig::Email(EmailMfaConfig {
                     host: Some("h".to_string()),
                     provider: None,
@@ -356,6 +373,7 @@ mod tests {
             Arc::new(StubSignaler),
             Arc::new(StubThumbnails),
             Arc::new(StubMedia::default()),
+            Arc::new(StubUserViews),
         )
         .await
         .expect_err("must reject empty camera list");
@@ -371,6 +389,7 @@ mod tests {
             Arc::new(StubSignaler),
             Arc::new(StubThumbnails),
             Arc::new(StubMedia::default()),
+            Arc::new(StubUserViews),
         )
         .await
         .expect_err("must surface subscribe failure");
@@ -386,6 +405,7 @@ mod tests {
             Arc::new(StubSignaler),
             Arc::new(StubThumbnails),
             Arc::new(StubMedia::default()),
+            Arc::new(StubUserViews),
         )
         .await
         .expect("spawn ok");

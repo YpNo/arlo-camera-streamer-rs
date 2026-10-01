@@ -37,6 +37,7 @@ them.
 | `CooldownExpired`, `MaxLiveExceeded` | `Live → Idle` (detach + teardown + thumbnail refresh) |
 | `LiveLost(reason)` | `Live → Idle`, same exit, **no backoff** (ADR 0004) |
 | `CameraBusy` | `Activating → Idle`, **no backoff** (ADR 0005) |
+| `UserViewStarted` / `UserViewEnded` / `UserViewUnavailable` | Relay of the app view (ADR 0007): `Idle → Activating`, `Live → Idle`, `Activating → Idle` without backoff |
 | `Failure(reason)` | `→ Failed`, exponential backoff, then `BackoffElapsed → Idle` |
 | `BudgetExhausted` / `BudgetReset` | `→ BatteryProtect` / back to `Idle` |
 
@@ -58,7 +59,13 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   report), `ManualStreamEnded` clears it. Motion during a view is counted as
   `MotionOutcome::SuppressedUserView` and starts nothing; a running session is left alone.
   An unreported view shows up as `DomainError::CameraBusy` (Arlo 14001) from `attach_live`.
-  The app's view can never be relayed (ADR 0005 addendum: four routes tried).
+  Since ADR 0007 the view **is relayed**: `ManualStream` in `Idle` → `UserViewStarted` →
+  `Activating` → `start_user_view_relay()` (`user_views.watch_along_url` then
+  `media.attach_user_view`) → `Live` with `session_source = UserView`. No debouncer, no
+  budget charge; `ManualStreamEnded` → `UserViewEnded` → `Idle`; a failure →
+  `UserViewUnavailable` → `Idle` (no backoff) + 30 s `USER_VIEW_RETRY` guard, same after
+  a `LiveLost`. A motion pulse during a relay is absorbed and must not prime the
+  debouncer (it would end the relay through the cooldown).
 - **User-view notice**: `sync_user_view_notice()` keeps `media.set_user_view_notice` in
   step with `user_view_active()`. Call it after every change of `user_view_until`
   (report, `idle`, `CameraBusy`); a select arm fires it when the hold runs out.

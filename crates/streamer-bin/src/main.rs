@@ -54,11 +54,12 @@ use streamer_app::system::StreamerSystem;
 use streamer_domain::config::StreamerConfig;
 use streamer_domain::event::ConnectionStatus;
 use streamer_domain::port::{
-    AdminControl, ArloEventSource, ArloThumbnailSource, MetricsRecorder, WebrtcSignaler,
+    AdminControl, ArloEventSource, ArloThumbnailSource, MetricsRecorder, UserViewSource,
+    WebrtcSignaler,
 };
 use streamer_infra_arlo::{
-    ArloEventSourceAdapter, ArloThumbnailSourceAdapter, ArloWebrtcSignalerAdapter, DeviceRegistry,
-    SnapshotUrlCache, boot::boot,
+    ArloEventSourceAdapter, ArloThumbnailSourceAdapter, ArloUserViewSourceAdapter,
+    ArloWebrtcSignalerAdapter, DeviceRegistry, SnapshotUrlCache, boot::boot,
 };
 use streamer_infra_media::{GstMediaMultiplexer, GstPipelineRegistry, RtspServer};
 use streamer_infra_ops::{AdminServer, Metrics, OpsServer, Readiness};
@@ -154,35 +155,13 @@ async fn run(config: StreamerConfig) -> Result<()> {
     // -- Admin token --
     let admin_token = read_admin_token().context("failed to read admin token")?;
 
-    // -- Arlo adapter trio --
-    let arlo_client = boot(&config.arlo)
-        .await
-        .context("failed to boot arlo-rs client")?;
-    // One shared reqwest client so connection pooling kicks in across
-    // cameras when fetching presigned thumbnail URLs from S3.
-    let http = reqwest::Client::builder()
-        .user_agent(concat!("arlo-camera-streamer/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("failed to build reqwest client")?;
-    // One shared device cache: stream requests resolve CameraId → Device
-    // through it instead of hitting get_devices() on every live request.
-    let device_registry = Arc::new(DeviceRegistry::new(arlo_client.clone()));
-    // Snapshot URLs announced on the bus, shared by the event adapter
-    // (writer) and the thumbnail adapter (reader).
-    let snapshots = Arc::new(SnapshotUrlCache::default());
-    let event_source: Arc<dyn ArloEventSource> = Arc::new(ArloEventSourceAdapter::new(
-        arlo_client.clone(),
-        snapshots.clone(),
-    ));
-    let signaler: Arc<dyn WebrtcSignaler> = Arc::new(ArloWebrtcSignalerAdapter::new(
-        arlo_client.clone(),
-        device_registry,
-    ));
-    let thumbnails: Arc<dyn ArloThumbnailSource> = Arc::new(ArloThumbnailSourceAdapter::new(
-        arlo_client,
-        http,
-        snapshots,
-    ));
+    // -- Arlo adapters --
+    let ArloAdapters {
+        event_source,
+        signaler,
+        thumbnails,
+        user_views,
+    } = arlo_adapters(&config).await?;
 
     // -- Media adapter --
     let rtsp_server =
@@ -207,6 +186,7 @@ async fn run(config: StreamerConfig) -> Result<()> {
         signaler,
         thumbnails,
         media,
+        user_views,
         metrics_recorder,
         env!("CARGO_PKG_VERSION"),
     )
@@ -370,6 +350,60 @@ fn spawn_connection_watcher(
                 },
             }
         }
+    })
+}
+
+/// The Arlo-side ports, all on one authenticated client.
+struct ArloAdapters {
+    event_source: Arc<dyn ArloEventSource>,
+    signaler: Arc<dyn WebrtcSignaler>,
+    thumbnails: Arc<dyn ArloThumbnailSource>,
+    user_views: Arc<dyn UserViewSource>,
+}
+
+/// Boot the Arlo client and build the four adapters on it.
+async fn arlo_adapters(config: &StreamerConfig) -> Result<ArloAdapters> {
+    let arlo_client = boot(&config.arlo)
+        .await
+        .context("failed to boot arlo-rs client")?;
+    // One shared reqwest client so connection pooling kicks in across
+    // cameras when fetching presigned thumbnail URLs from S3.
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("arlo-camera-streamer/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("failed to build reqwest client")?;
+    // One shared device cache: stream requests resolve CameraId → Device
+    // through it instead of hitting get_devices() on every live request.
+    let device_registry = Arc::new(DeviceRegistry::new(arlo_client.clone()));
+    // Snapshot URLs announced on the bus, shared by the event adapter
+    // (writer) and the thumbnail adapter (reader).
+    let snapshots = Arc::new(SnapshotUrlCache::default());
+    let event_source: Arc<dyn ArloEventSource> = Arc::new(ArloEventSourceAdapter::new(
+        arlo_client.clone(),
+        snapshots.clone(),
+    ));
+    let signaler: Arc<dyn WebrtcSignaler> = Arc::new(ArloWebrtcSignalerAdapter::new(
+        arlo_client.clone(),
+        device_registry.clone(),
+    ));
+    let thumbnails: Arc<dyn ArloThumbnailSource> = Arc::new(ArloThumbnailSourceAdapter::new(
+        arlo_client.clone(),
+        http,
+        snapshots,
+    ));
+    // The user's live view in the Arlo app, relayed from its watch-along
+    // stream (ADR 0007).
+    let user_views: Arc<dyn UserViewSource> = Arc::new(ArloUserViewSourceAdapter::new(
+        arlo_client,
+        device_registry.clone(),
+        &config.arlo.app_version,
+    ));
+
+    Ok(ArloAdapters {
+        event_source,
+        signaler,
+        thumbnails,
+        user_views,
     })
 }
 

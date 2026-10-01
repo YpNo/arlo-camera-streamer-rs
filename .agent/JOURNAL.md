@@ -222,3 +222,16 @@ Tests:    Relay pure pieces unit-tested; integration: relayed white source
 Open:     Orchestrator wiring + Arlo adapter (UserViewSource) + ADR 0007;
           Arlo's H.264 may lack in-band SPS/PPS (SDP carries sprop) —
           check at the live gate, inject via appsrc caps if black.
+
+## 2026-10-01 — ADR 0007: the app's view relayed (orchestrator + adapter)
+Changed:  Signals UserViewStarted/Ended/Unavailable, LiveSource tag,
+          CameraSnapshot.live_source, ArloConfig.app_version (6.46.0),
+          ArloUserViewSourceAdapter (get_stream_url_as as the iOS app),
+          orchestrator relay flow (no debounce, no budget, 30 s retry guard,
+          motion absorbed during a relay), main.rs arlo_adapters() helper,
+          `[patch.crates-io] arlo-rs = ../arlo-rs` ON (owner's request;
+          remove when 0.2.2 ships).
+Tests:    App 120 (5 new relay tests; 4 ADR-0005 tests retargeted), domain
+          57, infra-arlo 75, media 97 + 10 integration, ops 38; clippy/doc
+          clean; release built.
+Open:     Live gate of the relay; SPS/PPS in-band question; audio.

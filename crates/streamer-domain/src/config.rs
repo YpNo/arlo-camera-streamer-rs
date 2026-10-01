@@ -94,6 +94,11 @@ pub struct ArloConfig {
     /// persisted across restarts. Must be readable + writable by the
     /// streamer process.
     pub session_cache_path: PathBuf,
+    /// Version of the Arlo mobile app the stream query identifies as
+    /// when relaying the user's own live view (ADR 0007): Arlo hands the
+    /// app identity the view's RTSPS stream, a browser gets DASH.
+    #[serde(default = "default_app_version")]
+    pub app_version: String,
     /// MFA strategy for cold-start (when session cache is missing or
     /// expired).
     pub mfa: MfaConfig,
@@ -268,6 +273,9 @@ pub struct DashOutput {
     pub segment_secs: u32,
 }
 
+fn default_app_version() -> String {
+    "6.46.0".to_string()
+}
 fn default_rtsp_bind() -> String {
     "0.0.0.0:8554".to_string()
 }
