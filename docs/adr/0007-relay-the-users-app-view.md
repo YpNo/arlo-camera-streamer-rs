@@ -27,7 +27,11 @@ stream. Captures on 2026-09-30:
 - GStreamer's `rtspsrc` is refused at SETUP (403) for a reason not
   identified — not the token: SETUP without it is accepted;
 - the server's certificate cannot match a raw IP, so validation must be
-  off for that host.
+  off for that host;
+- (2026-10-01, first gate) the server sends its periodic RTCP sender
+  reports **without** the interleaved `$` framing, only the first one at
+  `PLAY` is framed; the client skips bare RTCP packets by their own
+  length field. This may be why `rtspsrc` fails on this server.
 
 ## Decision
 

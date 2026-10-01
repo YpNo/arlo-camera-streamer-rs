@@ -88,8 +88,15 @@ Arlo-specific behaviour with the `live-validation` skill.
 
 - Our own RTSP client, not `rtspsrc` (refused at SETUP by Arlo's server, cause unknown).
   OPTIONS → DESCRIBE → one SETUP for the H.264 track (`RTP/AVP/TCP;unicast;interleaved=0-1`)
-  → PLAY → loop: `$`-framed RTP → PT rewritten to `LIVE_RTP_H264_PT` → `LiveSinks.video`;
-  `GET_PARAMETER` every 25 s, RTCP RR every 5 s, server requests answered 200.
+  → PLAY → two tasks: `read_loop` owns the read half (`$`-framed RTP → PT rewritten to
+  `LIVE_RTP_H264_PT` → `LiveSinks.video`), `run` owns the write half (`GET_PARAMETER`
+  every 25 s, RTCP RR every 5 s, acks of server requests, TEARDOWN). Never read frames
+  inside a `select!` with timers: a cancelled read leaves the stream mid-frame.
+- **Arlo's server framing (captured 2026-10-01):** the SETUP answer keeps `interleaved=0-1`;
+  the first RTCP SR after PLAY is framed on channel 1, the periodic ones arrive **bare**
+  (`80 c8 00 06 …`, no `$` header). `read_bare_rtcp` skips them by RTCP's own length
+  field. Anything else ends the relay with `unexpected byte 0x..` + a hex dump — read
+  that line before touching the parser.
 - TLS with validation **off** (raw-IP host); the egress token is the access control.
 - Both legs (`LiveLeg::{Webrtc, Relay}`) go through `arm_live`; the stall watchdog and
   `report_loss` live in `live_watch.rs`.
