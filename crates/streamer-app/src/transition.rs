@@ -9,19 +9,22 @@
 //!
 //! ## Transition matrix (Phase 1 v0.1)
 //!
-//! | From / Signal      | Motion | LiveAttached | LiveReady | CooldownExpired | MaxLiveExceeded | BudgetExhausted | BudgetReset | Failure | BackoffElapsed | LiveLost  | CameraBusy | UserViewStarted | UserViewEnded | UserViewUnavailable |
-//! |--------------------|--------|--------------|-----------|-----------------|-----------------|-----------------|-------------|---------|----------------|-----------|------------|-----------------|---------------|---------------------|
-//! | Idle               | Activ. | (ignored)    | (ignored) | (ignored)       | (ignored)       | BatteryProtect  | Idle        | Failed  | (ignored)      | (ignored) | (ignored)  | Activ.          | (ignored)     | (ignored)           |
-//! | Activating         | Activ. | Live         | Activ.    | (ignored)       | (ignored)       | BatteryProtect  | Activ.      | Failed  | (ignored)      | (ignored) | Idle       | Activ.          | (ignored)     | Idle                |
-//! | Live               | Live   | Live         | Live      | Idle            | Idle            | BatteryProtect  | Live        | Failed  | (ignored)      | Idle      | (ignored)  | Live            | Idle          | (ignored)           |
-//! | BatteryProtect     | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | Idle        | Failed  | (ignored)      | (ignored) | (ignored)  | (ignored)       | (ignored)     | (ignored)           |
-//! | Failed             | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | (ign.)      | Failed+ | Idle           | (ignored) | (ignored)  | (ignored)       | (ignored)     | (ignored)           |
+//! | From / Signal      | Motion | LiveAttached | LiveReady | CooldownExpired | MaxLiveExceeded | BudgetExhausted | BudgetReset | Failure | BackoffElapsed | LiveLost  | CameraBusy | UserViewStarted | UserViewEnded | UserViewUnavailable | UserViewProbe |
+//! |--------------------|--------|--------------|-----------|-----------------|-----------------|-----------------|-------------|---------|----------------|-----------|------------|-----------------|---------------|---------------------|---------------|
+//! | Idle               | Activ. | (ignored)    | (ignored) | (ignored)       | (ignored)       | BatteryProtect  | Idle        | Failed  | (ignored)      | (ignored) | (ignored)  | Activ.          | (ignored)     | (ignored)           | (ignored)     |
+//! | Activating         | Activ. | Live         | Activ.    | (ignored)       | (ignored)       | BatteryProtect  | Activ.      | Failed  | (ignored)      | (ignored) | Idle       | Activ.          | (ignored)     | Idle                | (ignored)     |
+//! | Live               | Live   | Live         | Live      | Idle            | Idle            | BatteryProtect  | Live        | Failed  | (ignored)      | Idle      | (ignored)  | Live            | Idle          | (ignored)           | Idle          |
+//! | BatteryProtect     | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | Idle        | Failed  | (ignored)      | (ignored) | (ignored)  | (ignored)       | (ignored)     | (ignored)           | (ignored)     |
+//! | Failed             | (ign.) | (ignored)    | (ignored) | (ignored)       | (ignored)       | (ignored)       | (ign.)      | Failed+ | Idle           | (ignored) | (ignored)  | (ignored)       | (ignored)     | (ignored)           | (ignored)     |
 //!
-//! `UserViewStarted` / `UserViewEnded` / `UserViewUnavailable` (ADR 0007)
-//! drive the relay of a live view the user started in the Arlo app: it
-//! activates from `Idle` only, ends when the view ends, and a relay that
-//! cannot be set up returns to `Idle` without backoff, like `CameraBusy`.
-//! The orchestrator emits `UserViewEnded` only for a relay session.
+//! `UserViewStarted` / `UserViewEnded` / `UserViewUnavailable` /
+//! `UserViewProbe` (ADR 0007) drive the relay of a live view the user
+//! started in the Arlo app: it activates from `Idle` only, ends when the
+//! view ends, and a relay that cannot be set up returns to `Idle` without
+//! backoff, like `CameraBusy`. A probe releases the stream (`Live →
+//! Idle`) so the camera can report whether the view goes on; the
+//! orchestrator relays again when no `idle` report follows. It emits
+//! `UserViewEnded` and `UserViewProbe` only for a relay session.
 //!
 //! `CameraBusy` (ADR 0005) is an attach refused because the user is
 //! watching the camera in the Arlo app. It returns to `Idle` without the
@@ -77,9 +80,14 @@ pub fn transition(state: &CameraState, signal: &StateTransition) -> CameraState 
         (S::Activating, _) => S::Activating,
 
         // ---------- From Live ----------
-        (S::Live, T::CooldownExpired | T::MaxLiveExceeded | T::LiveLost(_) | T::UserViewEnded) => {
-            S::Idle
-        }
+        (
+            S::Live,
+            T::CooldownExpired
+            | T::MaxLiveExceeded
+            | T::LiveLost(_)
+            | T::UserViewEnded
+            | T::UserViewProbe,
+        ) => S::Idle,
         (S::Live, T::BudgetExhausted) => battery_protect(),
         (S::Live, T::Failure(reason)) => fresh_failed(reason),
         (S::Live, _) => state.clone(),
@@ -297,10 +305,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn live_user_view_probe_returns_idle() {
+        assert_eq!(
+            transition(&live(), &StateTransition::UserViewProbe),
+            CameraState::Idle
+        );
+    }
+
     #[rstest]
     #[case(live(), StateTransition::UserViewStarted)]
     #[case(CameraState::Idle, StateTransition::UserViewEnded)]
     #[case(CameraState::Idle, StateTransition::UserViewUnavailable)]
+    #[case(CameraState::Idle, StateTransition::UserViewProbe)]
+    #[case(CameraState::Activating, StateTransition::UserViewProbe)]
     #[case(battery(), StateTransition::UserViewStarted)]
     #[case(failed(1), StateTransition::UserViewStarted)]
     fn user_view_signals_are_ignored_elsewhere(

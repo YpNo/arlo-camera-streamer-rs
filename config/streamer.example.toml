@@ -117,6 +117,7 @@ stream_name    = "front_door"
 [cameras.cooldown]
 debounce_secs       = 60     # hold-live after last motion (debounce window)
 max_continuous_live = 300    # hard cap on continuous live time (battery save)
+user_view_probe_secs = 60    # relayed app view: release every N s to learn whether the app still views (0 = never, cap only)
 daily_live_budget   = 0      # 0 = unlimited; otherwise total live secs/day
 budget_reset        = "00:00"
 

@@ -186,6 +186,7 @@ mod tests {
             max_continuous_live: 300,
             daily_live_budget: budget,
             budget_reset: reset.to_string(),
+            user_view_probe_secs: 0,
         }
     }
 
@@ -319,6 +320,7 @@ mod tests {
             max_continuous_live: 300,
             daily_live_budget: u64::MAX,
             budget_reset: "00:00".to_string(),
+            user_view_probe_secs: 0,
         };
         let err = LiveBudgetTracker::new(&cfg, dt(2024, 1, 1, 12, 0)).expect_err("must reject");
         assert!(matches!(err, DomainError::InvalidConfig(_)));

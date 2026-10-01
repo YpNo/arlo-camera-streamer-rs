@@ -48,7 +48,7 @@ to see the contracts. The ADRs document the load-bearing decisions:
 - [docs/adr/0003-seamless-input-selector-splice.md](./docs/adr/0003-seamless-input-selector-splice.md)
 - [ADR 0004 — Live-loss feedback](./docs/adr/0004-live-lost-feedback.md): a dead live source returns the camera to idle within the stall timeout instead of the debounce or the continuous-live cap.
 - [ADR 0006 — HLS output](./docs/adr/0006-hls-output-via-loopback-segmenter.md): HLS is written by a loopback RTSP client of each camera, without re-encoding; DASH is not supported.
-- [ADR 0007 — Relay the user's app view](./docs/adr/0007-relay-the-users-app-view.md): a live view started in the Arlo app is relayed from the RTSPS stream Arlo hands the app identity; no cooldown, no budget charge, capped at `max_continuous_live` because the relay keeps the camera streaming.
+- [ADR 0007 — Relay the user's app view](./docs/adr/0007-relay-the-users-app-view.md): a live view started in the Arlo app is relayed from the RTSPS stream Arlo hands the app identity; no cooldown, no budget charge; the relay lets go of the stream every `user_view_probe_secs` so the camera can report whether the app still views.
 
 ## Prerequisites
 
@@ -142,7 +142,8 @@ holding the values.
 | `[[cameras]]`                       | array          | `[]`                 | One block per camera — see example.                      |
 | `cameras.codec_hint`                | `h264`/`h265`  | (auto)               | Skip first-stream codec detection.                       |
 | `cameras.cooldown.debounce_secs`    | u64            | `60`                 | Hold-live debounce after last motion.                    |
-| `cameras.cooldown.max_continuous_live` | u64         | `300`                | Hard cap on continuous live, motion or relayed app view (battery protection). |
+| `cameras.cooldown.max_continuous_live` | u64         | `300`                | Hard cap on continuous live (battery protection); also caps a relayed app view when probing is off. |
+| `cameras.cooldown.user_view_probe_secs` | u64        | `60`                 | How often a relayed app view is released for a few seconds to learn whether the app still views (our session keeps the camera streaming). `0` = never, cap only. |
 | `cameras.cooldown.daily_live_budget` | u64           | `0`                  | `0` = unlimited; otherwise total live secs/day.          |
 | `cameras.cooldown.budget_reset`     | `HH:MM`        | `00:00`              | Local-clock reset.                                       |
 

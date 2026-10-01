@@ -165,6 +165,7 @@ mod tests {
             max_continuous_live: max,
             daily_live_budget: 0,
             budget_reset: "00:00".to_string(),
+            user_view_probe_secs: 0,
         }
     }
 

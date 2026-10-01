@@ -77,6 +77,11 @@ pub enum StateTransition {
     /// no video in time). `Activating → Idle` without backoff: the view
     /// itself is unaffected and the idle frame says where it is.
     UserViewUnavailable,
+    /// The relay let go of the stream on purpose to learn whether the
+    /// app still views (ADR 0007): our session keeps the camera
+    /// streaming, so only a release lets it report `idle`. `Live →
+    /// Idle`; the orchestrator relays again if no `idle` report comes.
+    UserViewProbe,
 }
 
 /// What a live session shows: the camera woken by motion through our

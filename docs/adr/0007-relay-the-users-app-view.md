@@ -61,12 +61,17 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
   `UserViewUnavailable` (`Activating → Idle`, no backoff). A relay has
   **no cooldown** (it ends with the view or a loss) and is **not
   charged** to the daily budget: the camera streams for the app, not for
-  us. It **is capped** at `max_continuous_live`, though (2026-10-01,
-  third gate): our RTSP session counts as a viewer for Arlo's backend,
-  so once the app closes its view the camera keeps streaming for us and
-  never reports `idle`. The cap bounds that to the same five minutes a
-  motion session gets; the camera idles when we let go, and a longer
-  view in the app relays again at its next `startUserStream`. A motion pulse during a relay is
+  us. But our RTSP session counts as a viewer for Arlo's backend
+  (2026-10-01, third gate): once the app closes its view the camera
+  keeps streaming for us and never reports `idle`. So the relay
+  **probes**: every `user_view_probe_secs` (60 s) it lets go of the
+  stream (`UserViewProbe`, `Live → Idle`, the still shows the notice)
+  and listens for the camera's `idle` report for a 5 s grace — the
+  report came 340 ms after our `TEARDOWN` at the gate. A report means
+  the app had left; none means the view goes on and the relay resumes
+  through the ordinary `UserViewStarted` path, about 1.5 s later. With
+  probing off (`0`) the relay is capped at `max_continuous_live`
+  instead. A motion pulse during a relay is
   absorbed; once the view ends, the next pulse is an ordinary motion
   session. A running motion session is left alone when a view starts
   (ADR 0005). A failed or lost relay arms a 30 s retry guard, since the
@@ -93,12 +98,14 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
 - **No certificate validation** for the watch-along host; TLS still
   hides the exchange and the token is single-session.
 - **No audio** from the relayed view.
-- **The relay prolongs the camera's streaming**: after the app closes
-  its view, the camera streams for the daemon until the cap (up to
-  `max_continuous_live`), and the NVR keeps showing live for that long.
-  The bus gives no signal of the app leaving while we hold the stream;
-  a shorter, relay-specific cap or a teardown-and-listen probe are the
-  options if that is too long.
+- **The relay prolongs the camera's streaming** by up to one probe
+  interval after the app closes its view, and the NVR shows live for
+  that long; the bus gives no signal of the app leaving while we hold
+  the stream. Each probe costs the viewers a gap of about seven
+  seconds (grace plus re-attach).
+- **A late `idle` report** (later than the grace) makes the re-attach
+  query reach a camera that has just stopped, which starts it again
+  for one more segment. Not seen so far (340 ms).
 - **In-band SPS/PPS**: verified on 2026-10-01 — the stream repeats
   them, VLC decodes the relayed view without caps help.
 - One more arlo-rs dependency surface (`get_stream_url_as`, released as

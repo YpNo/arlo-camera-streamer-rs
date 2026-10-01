@@ -331,6 +331,14 @@ pub struct CooldownConfig {
     /// `HH:MM`, parsed and validated in `streamer-app`.
     #[serde(default = "default_budget_reset")]
     pub budget_reset: String,
+    /// How often, in seconds, a relay of the user's app view (ADR 0007)
+    /// lets go of the stream to learn whether the app still views: our
+    /// session keeps the camera streaming, so the camera can only report
+    /// `idle` once we release it. No report within a few seconds means
+    /// the view goes on and the relay resumes. `0` never probes and caps
+    /// the relay at `max_continuous_live` instead.
+    #[serde(default = "default_user_view_probe")]
+    pub user_view_probe_secs: u64,
 }
 
 impl Default for CooldownConfig {
@@ -340,6 +348,7 @@ impl Default for CooldownConfig {
             max_continuous_live: default_max_continuous_live(),
             daily_live_budget: 0,
             budget_reset: default_budget_reset(),
+            user_view_probe_secs: default_user_view_probe(),
         }
     }
 }
@@ -349,6 +358,9 @@ const fn default_debounce() -> u64 {
 }
 const fn default_max_continuous_live() -> u64 {
     300
+}
+const fn default_user_view_probe() -> u64 {
+    60
 }
 fn default_budget_reset() -> String {
     "00:00".to_string()
@@ -426,6 +438,7 @@ mod tests {
         assert_eq!(c.max_continuous_live, 300);
         assert_eq!(c.daily_live_budget, 0);
         assert_eq!(c.budget_reset, "00:00");
+        assert_eq!(c.user_view_probe_secs, 60);
     }
 
     #[test]

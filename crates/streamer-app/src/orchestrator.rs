@@ -101,6 +101,10 @@ const USER_VIEW_HOLD: Duration = Duration::from_secs(120);
 /// repeated `userStreamActive` reports (one every snapshot, ~10 s) are
 /// left alone before another relay is tried (ADR 0007).
 const USER_VIEW_RETRY: Duration = Duration::from_secs(30);
+/// After a probe released the stream, how long the camera gets to report
+/// `idle` before the view is taken to go on and the relay resumes. The
+/// report came 340 ms after our `TEARDOWN` on 2026-10-01.
+const USER_VIEW_PROBE_GRACE: Duration = Duration::from_secs(5);
 
 /// Per-camera state-machine task.
 pub struct CameraOrchestrator {
@@ -135,9 +139,16 @@ pub struct CameraOrchestrator {
     /// closes its view, so a relay is capped like a motion session
     /// (`max_continuous_live`).
     relay_cap: Duration,
-    /// When the running relay reaches its cap; `Some` iff live with a
+    /// When the running relay releases the stream — the next probe, or
+    /// the cap when probing is off; `Some` iff live with a
     /// [`LiveSource::UserView`] session.
     relay_deadline: Option<Instant>,
+    /// How often a relay lets go of the stream to learn whether the app
+    /// still views (`user_view_probe_secs`); `None` never probes.
+    probe_interval: Option<Duration>,
+    /// Until when, after a probe, the camera's `idle` report is awaited
+    /// in `Idle`; `None` outside a probe.
+    probe_until: Option<Instant>,
     signaler: Arc<dyn WebrtcSignaler>,
     thumbnails: Arc<dyn ArloThumbnailSource>,
     media: Arc<dyn MediaMultiplexer>,
@@ -197,6 +208,9 @@ impl CameraOrchestrator {
             user_view_retry_after: None,
             relay_cap: Duration::from_secs(config.cooldown.max_continuous_live),
             relay_deadline: None,
+            probe_interval: (config.cooldown.user_view_probe_secs > 0)
+                .then(|| Duration::from_secs(config.cooldown.user_view_probe_secs)),
+            probe_until: None,
             signaler,
             thumbnails,
             media,
@@ -406,7 +420,8 @@ impl CameraOrchestrator {
 
     fn next_deadline(&self) -> Option<Instant> {
         match &self.state {
-            CameraState::Idle | CameraState::Activating => None,
+            CameraState::Idle => self.probe_until,
+            CameraState::Activating => None,
             CameraState::Live if self.session_source == Some(LiveSource::UserView) => {
                 self.relay_deadline
             }
@@ -532,13 +547,19 @@ impl CameraOrchestrator {
 
     fn user_view_active(&self) -> bool {
         self.user_view_until.is_some_and(|until| now() < until)
+            || self.probe_until.is_some_and(|until| now() < until)
+            || self.session_source == Some(LiveSource::UserView)
     }
 
     /// When the shown notice must be re-checked: the end of the hold.
+    /// When the shown notice may stop being wanted by time alone. A relay
+    /// session keeps it wanted until a transition re-syncs it, so no
+    /// instant is returned then — a past instant would spin the loop.
     fn user_view_notice_expiry(&self) -> Option<Instant> {
-        self.user_view_notice
-            .then_some(self.user_view_until)
-            .flatten()
+        if !self.user_view_notice || self.session_source == Some(LiveSource::UserView) {
+            return None;
+        }
+        self.user_view_until.max(self.probe_until)
     }
 
     /// Make the idle frame's notice match the user-view flag. Best-effort:
@@ -571,8 +592,12 @@ impl CameraOrchestrator {
     /// During our own session Arlo reports `idle` after every motion
     /// snapshot, about every 10 s, so that case stays at `trace`.
     fn on_user_view_ended(&mut self) {
-        if self.user_view_until.take().is_some() {
-            info!("user view in the Arlo app ended; motion activations resumed");
+        let probing = self.probe_until.take().is_some();
+        if self.user_view_until.take().is_some() || probing {
+            info!(
+                after_probe = probing,
+                "user view in the Arlo app ended; motion activations resumed"
+            );
         } else if self.state == CameraState::Live {
             trace!("camera idle report during our session (after a motion snapshot)");
         } else {
@@ -617,17 +642,44 @@ impl CameraOrchestrator {
         }
     }
 
+    /// Why a relay lets go of the stream: to probe for the view's end
+    /// (the camera only reports `idle` once released), or because the
+    /// cap is reached when probing is off.
+    fn relay_release_signal(&self) -> StateTransition {
+        if let Some(every) = self.probe_interval {
+            info!(
+                every_secs = every.as_secs(),
+                grace_secs = USER_VIEW_PROBE_GRACE.as_secs(),
+                "releasing the relayed view to learn whether the app still views"
+            );
+            StateTransition::UserViewProbe
+        } else {
+            info!(
+                cap_secs = self.relay_cap.as_secs(),
+                "relay of the user's view reached the hard cap; releasing the camera"
+            );
+            StateTransition::MaxLiveExceeded
+        }
+    }
+
     async fn handle_deadline(&mut self) -> Result<(), DomainError> {
         let signal = match &self.state {
+            CameraState::Idle => {
+                if self.probe_until.is_none_or(|at| now() < at) {
+                    return Ok(());
+                }
+                self.probe_until = None;
+                let Some(signal) = self.user_view_relay_signal() else {
+                    return Ok(());
+                };
+                info!("no idle report after the probe; the app still views, relaying again");
+                signal
+            }
             CameraState::Live if self.session_source == Some(LiveSource::UserView) => {
                 if self.relay_deadline.is_none_or(|at| now() < at) {
                     return Ok(());
                 }
-                info!(
-                    cap_secs = self.relay_cap.as_secs(),
-                    "relay of the user's view reached the hard cap; releasing the camera"
-                );
-                StateTransition::MaxLiveExceeded
+                self.relay_release_signal()
             }
             CameraState::Live => match self.debouncer.poll(now()) {
                 DebouncerVerdict::DebounceExpired => StateTransition::CooldownExpired,
@@ -636,7 +688,7 @@ impl CameraOrchestrator {
             },
             CameraState::Failed { .. } => StateTransition::BackoffElapsed,
             CameraState::BatteryProtect { .. } => StateTransition::BudgetReset,
-            _ => return Ok(()),
+            CameraState::Activating => return Ok(()),
         };
         self.process_signals(VecDeque::from([signal])).await
     }
@@ -661,6 +713,13 @@ impl CameraOrchestrator {
                 self.live = None;
                 self.relay_deadline = None;
             }
+            self.probe_until = match (&to, &signal) {
+                (CameraState::Idle, StateTransition::UserViewProbe) => {
+                    Some(now() + USER_VIEW_PROBE_GRACE)
+                }
+                (CameraState::Idle, _) => self.probe_until,
+                _ => None,
+            };
             self.session_source = match (&to, &signal) {
                 (CameraState::Activating, StateTransition::UserViewStarted) => {
                     Some(LiveSource::UserView)
@@ -709,7 +768,8 @@ impl CameraOrchestrator {
             // and not charged to the daily budget.
             (CameraState::Activating, CameraState::Live) => {
                 if self.session_source == Some(LiveSource::UserView) {
-                    self.relay_deadline = Some(now() + self.relay_cap);
+                    let segment = self.probe_interval.unwrap_or(self.relay_cap);
+                    self.relay_deadline = Some(now() + segment);
                 } else {
                     self.debouncer.on_live_attached(now());
                     self.budget.on_live_started(Local::now().naive_local());
@@ -847,6 +907,7 @@ impl CameraOrchestrator {
         }
         self.debouncer.on_idle();
         self.refresh_idle_thumbnail().await;
+        self.sync_user_view_notice().await;
     }
 
     /// Fetch the camera's latest snapshot and hand it to the media
@@ -958,6 +1019,7 @@ fn signal_label(s: &StateTransition) -> &'static str {
         StateTransition::UserViewStarted => "user-view-started",
         StateTransition::UserViewEnded => "user-view-ended",
         StateTransition::UserViewUnavailable => "user-view-unavailable",
+        StateTransition::UserViewProbe => "user-view-probe",
     }
 }
 
@@ -1267,6 +1329,10 @@ mod tests {
     }
 
     fn camera_cfg(debounce: u64, max: u64) -> CameraConfig {
+        camera_cfg_probing(debounce, max, 0)
+    }
+
+    fn camera_cfg_probing(debounce: u64, max: u64, probe: u64) -> CameraConfig {
         CameraConfig {
             arlo_device_id: CameraId::new("CAM"),
             stream_name: streamer_domain::camera::StreamName::parse("cam").unwrap(),
@@ -1276,6 +1342,7 @@ mod tests {
                 max_continuous_live: max,
                 daily_live_budget: 0,
                 budget_reset: "00:00".to_string(),
+                user_view_probe_secs: probe,
             },
         }
     }
@@ -1819,6 +1886,84 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn user_view_relay_probe_relays_again_when_no_idle_report_comes() {
+        let cfg = camera_cfg_probing(60, 300, 60);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        let views = StubUserViews::always();
+        let (orch, tx, token) = build_with_views(&cfg, sr.clone(), media.clone(), views.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        assert_eq!(
+            media.calls().await,
+            vec![MediaCall::Register, MediaCall::AttachUserView]
+        );
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            media.calls().await,
+            vec![MediaCall::DetachLive],
+            "probe lets go"
+        );
+        assert_eq!(sr.stop_count().await, 1);
+
+        // No idle report within the grace: the view goes on.
+        tokio::time::advance(USER_VIEW_PROBE_GRACE + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(media.calls().await, vec![MediaCall::AttachUserView]);
+        assert_eq!(views.call_count().await, 2);
+
+        // The next segment probes again, so the relay never runs past the cap unchecked.
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(media.calls().await, vec![MediaCall::DetachLive]);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_view_relay_probe_stops_when_the_camera_reports_idle() {
+        let cfg = camera_cfg_probing(60, 300, 60);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        let views = StubUserViews::always();
+        let (orch, tx, token) = build_with_views(&cfg, sr.clone(), media.clone(), views.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert!(media.calls().await.contains(&MediaCall::DetachLive));
+
+        assert_eq!(
+            media.notices().await,
+            vec![true],
+            "the still says where the view is while the probe listens"
+        );
+
+        // The camera idles once released: the app had closed its view.
+        send(&tx, manual_ended()).await;
+        tokio::time::advance(USER_VIEW_PROBE_GRACE + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(media.calls().await.is_empty(), "no relay without a view");
+        assert_eq!(views.call_count().await, 1);
+        assert_eq!(
+            media.notices().await,
+            vec![true, false],
+            "notice down with the view"
+        );
+
+        // A new view in the app relays as usual.
+        send(&tx, manual()).await;
+        assert_eq!(media.calls().await, vec![MediaCall::AttachUserView]);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn motion_during_a_relay_neither_starts_a_cooldown_nor_a_second_session() {
         let cfg = camera_cfg(2, 300);
         let sr = StubSignaler::with_responses(vec![]);
@@ -1950,9 +2095,18 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn user_view_notice_clears_when_the_hold_expires() {
+        // A view the daemon could not relay: the notice lives on the hold alone.
         let cfg = camera_cfg(60, 300);
         let media = RecordingMedia::new();
-        let (orch, tx, token) = build(&cfg, StubSignaler::with_responses(vec![]), media.clone());
+        let views = StubUserViews::with_responses(vec![Err(DomainError::AdapterTransport(
+            "no stream".into(),
+        ))]);
+        let (orch, tx, token) = build_with_views(
+            &cfg,
+            StubSignaler::with_responses(vec![]),
+            media.clone(),
+            views,
+        );
         let handle = tokio::spawn(orch.run());
 
         send(&tx, manual()).await;
