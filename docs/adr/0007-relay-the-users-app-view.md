@@ -99,10 +99,8 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
   The bus gives no signal of the app leaving while we hold the stream;
   a shorter, relay-specific cap or a teardown-and-listen probe are the
   options if that is too long.
-- **In-band SPS/PPS**: Arlo's SDP carries `sprop-parameter-sets`; if
-  the stream does not repeat them in-band, the decoder shows nothing
-  until it gets them. Unverified at the time of writing; the fix would
-  be to pass them through the live `appsrc` caps.
+- **In-band SPS/PPS**: verified on 2026-10-01 — the stream repeats
+  them, VLC decodes the relayed view without caps help.
 - One more arlo-rs dependency surface (`get_stream_url_as`, released as
   0.2.2; the streamer builds against the local checkout meanwhile).
 
