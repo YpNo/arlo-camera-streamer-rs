@@ -5,7 +5,8 @@
 //! The idle screen is black with a small caption and the fake gateway
 //! sends white, so brightness alone tells idle from live. It also
 //! records whether the client ever saw end-of-stream or an error: a
-//! seamless splice shows neither.
+//! seamless splice shows neither. The audio track is decoded through a
+//! `level` element so a test can tell the silent bed from relayed sound.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,10 +17,17 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
+/// `level` reports silence as a very negative dB value; anything above
+/// this is sound.
+const AUDIBLE_DB: f64 = -40.0;
+
 #[derive(Default)]
 struct Seen {
     frames: AtomicU64,
     mean_luma: AtomicU64,
+    /// Latest RMS level of the audio track in dB, stored as the f64's bits.
+    audio_rms_bits: AtomicU64,
+    audio_windows: AtomicU64,
     eos: AtomicBool,
     error: AtomicBool,
 }
@@ -41,10 +49,12 @@ impl RtspProbe {
     /// `udp`) and start playing. VLC and many cameras default to UDP.
     pub fn connect_over(url: &str, protocols: &str) -> Self {
         let launch = format!(
-            "rtspsrc location={url} protocols={protocols} latency=0 \
-             ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert \
+            "rtspsrc name=src location={url} protocols={protocols} latency=0 \
+             src. ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert \
              ! video/x-raw,format=GRAY8 \
-             ! appsink name=frames sync=false max-buffers=1 drop=true"
+             ! appsink name=frames sync=false max-buffers=1 drop=true \
+             src. ! rtpmp4adepay ! aacparse ! avdec_aac ! audioconvert \
+             ! level interval=100000000 ! fakesink sync=false"
         );
         let pipeline = gst::parse::launch(&launch)
             .expect("probe launch")
@@ -92,6 +102,18 @@ impl RtspProbe {
         self.seen.mean_luma.load(Ordering::Relaxed)
     }
 
+    /// Latest RMS level of the audio track in dB (`level` element);
+    /// silence reads far below [`AUDIBLE_DB`].
+    pub fn audio_rms_db(&self) -> f64 {
+        f64::from_bits(self.seen.audio_rms_bits.load(Ordering::Relaxed))
+    }
+
+    /// Whether the latest audio window carried sound rather than the
+    /// silent bed. `false` until the first window was measured.
+    pub fn hears_sound(&self) -> bool {
+        self.seen.audio_windows.load(Ordering::Relaxed) > 0 && self.audio_rms_db() > AUDIBLE_DB
+    }
+
     /// Whether the client saw end-of-stream or an error at any point.
     pub fn interrupted(&self) -> bool {
         self.seen.eos.load(Ordering::Relaxed) || self.seen.error.load(Ordering::Relaxed)
@@ -110,6 +132,19 @@ impl Drop for RtspProbe {
             let _ = thread.join();
         }
     }
+}
+
+/// The loudest channel's RMS (dB) of a `level` message, if it is one.
+fn level_rms_db(s: &gst::StructureRef) -> Option<f64> {
+    if s.name() != "level" {
+        return None;
+    }
+    let rms = s.get::<gst::glib::ValueArray>("rms").ok()?;
+    rms.iter()
+        .filter_map(|v| v.get::<f64>().ok())
+        .fold(None, |max: Option<f64>, db| {
+            Some(max.map_or(db, |m| m.max(db)))
+        })
 }
 
 fn mean(frame: &[u8]) -> u64 {
@@ -137,6 +172,12 @@ fn watch_bus(pipeline: &gst::Pipeline, seen: Arc<Seen>) -> JoinHandle<()> {
                     if app.structure().is_some_and(|s| s.name() == "probe-stop") =>
                 {
                     return;
+                }
+                gst::MessageView::Element(el) => {
+                    if let Some(db) = el.structure().and_then(level_rms_db) {
+                        seen.audio_rms_bits.store(db.to_bits(), Ordering::Relaxed);
+                        seen.audio_windows.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 _ => {}
             }

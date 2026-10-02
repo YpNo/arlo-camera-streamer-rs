@@ -60,10 +60,15 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
   `GET_PARAMETER` keep-alives and RTCP receiver reports, and reports loss
   through the shared notifier (server closed → `end-of-stream`,
   transport error → `peer-disconnected`, silence → the stall watchdog).
-  **Video only**: the app's audio is AAC where the live audio path is
-  Opus; the silent bed covers it. (The audio *is* on the wire: Arlo
-  pushes the AAC track's RTP unframed, payload type 0, without any
-  `SETUP` for it — a later audio relay can start from there.)
+  **Audio too** (2026-10-02): the SDP's RFC 3640 `MPEG4-GENERIC` track
+  is `SETUP` on the next channel pair and its RTP goes to a third mixer
+  input (`live_aac_rtp_src` → `rtpmp4gdepay ! aacparse ! avdec_aac`),
+  whose caps follow the stream's `rtpmap`/`fmtp` (`LiveAacSink`
+  announces the format before the packets). Arlo pushes that track's
+  RTP unframed, payload type 0, with or without a `SETUP`; a bare
+  `AAC-hbr` packet carries its AU size, so the read loop relays it as
+  audio instead of skipping it. A refused audio `SETUP` keeps the relay
+  video-only.
 - **Orchestrator:** `UserViewStarted` (`Idle → Activating`),
   `UserViewEnded` (`Live → Idle`, emitted only for a relay session),
   `UserViewUnavailable` (`Activating → Idle`, no backoff). A relay has
@@ -105,7 +110,9 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
   the daemon falls back to the notice, as before this ADR.
 - **No certificate validation** for the watch-along host; TLS still
   hides the exchange and the token is single-session.
-- **No audio** from the relayed view.
+- **Audio depends on in-band framing or the AU header**: an AAC track
+  with other AU-header widths than `AAC-hbr`'s is decoded only when the
+  server frames it.
 - **The relay prolongs the camera's streaming** by up to one probe
   interval after the app closes its view, and the NVR shows live for
   that long; the bus gives no signal of the app leaving while we hold
@@ -126,5 +133,6 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
   keep-alives and loss signals anyway.
 - **Relay nothing, keep the notice only** (ADR 0005 as revised).
   Rejected by the owner once a working source was found.
-- **Audio through a second AAC branch**: deferred until the video relay
-  has run on the Frigate box.
+- **Transcoding the AAC to Opus inside the relay** to reuse the Opus
+  input: a decode and an encode per relay for nothing; a third mixer
+  input decodes once.

@@ -88,11 +88,11 @@ use streamer_domain::config::VideoEncoder;
 use crate::error::MediaError;
 use crate::hls::{HlsSegmenter, prepare_dir};
 use crate::idle_source::{IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH, standby_caption};
-use crate::live_rtp_sink::{LiveSinkReceivers, LiveSinks};
+use crate::live_rtp_sink::{AacFeed, AacRtpFormat, LiveSinkReceivers, LiveSinks};
 use crate::multiplexer::PipelineRegistry;
 use crate::pipeline_desc::{
-    HlsBranchConfig, IDLE_CAPTION_NAME, IDLE_OVERLAY_NAME, OutputBranches, UNIFIED_ENCODER_NAME,
-    combined_launch_string,
+    HlsBranchConfig, IDLE_CAPTION_NAME, IDLE_OVERLAY_NAME, LIVE_AAC_SRC_NAME, LIVE_RTP_AAC_PT,
+    OutputBranches, UNIFIED_ENCODER_NAME, combined_launch_string,
 };
 use crate::rtsp::RtspServer;
 
@@ -131,14 +131,19 @@ struct LiveWiring {
     /// `audiomixer`. No selector flip needed: the mixer reverts to
     /// silence when live audio stops.
     audio_appsrc: Option<gst_app::AppSrc>,
+    /// The relayed-audio `appsrc` (`live_aac_rtp_src`, ADR 0007) — AAC
+    /// RTP from the app-view relay, decoded onto the mixer's third pad.
+    aac_appsrc: Option<gst_app::AppSrc>,
 }
 
 /// Active live ingestion bookkeeping.
 struct LiveSession {
     /// Drains the video sink's receiver into the video `appsrc`.
-    video_pump: tokio::task::JoinHandle<()>,
+    video: tokio::task::JoinHandle<()>,
     /// Drains the audio sink's receiver into the audio `appsrc`.
-    audio_pump: tokio::task::JoinHandle<()>,
+    audio: tokio::task::JoinHandle<()>,
+    /// Drains the AAC sink's receiver into the AAC `appsrc`.
+    aac: tokio::task::JoinHandle<()>,
 }
 
 /// Per-camera state owned by [`GstPipelineRegistry`].
@@ -244,8 +249,9 @@ impl GstPipelineRegistry {
         for (cam, entry) in guard.drain() {
             self.server.remove_mount(&entry.mount_path);
             if let Some(session) = entry.session {
-                session.video_pump.abort();
-                session.audio_pump.abort();
+                session.video.abort();
+                session.audio.abort();
+                session.aac.abort();
             }
             debug!(camera = %cam, mount = %entry.mount_path, "mount removed during shutdown");
         }
@@ -374,6 +380,7 @@ impl PipelineRegistry for GstPipelineRegistry {
         let LiveSinkReceivers {
             video: video_rx,
             audio: audio_rx,
+            aac: aac_rx,
         } = rxs;
         // Flag first, then look: a media configured concurrently either
         // sees the flag (and arms itself) or is already in the slot.
@@ -387,11 +394,12 @@ impl PipelineRegistry for GstPipelineRegistry {
             );
         }
         let session = LiveSession {
-            video_pump: spawn_live_pump(video_rx, entry.wiring.clone(), video_appsrc, "video"),
+            video: spawn_live_pump(video_rx, entry.wiring.clone(), video_appsrc, "video"),
             // Audio has no idle↔live selector — the audiomixer blends the
             // live Opus onto silence; a media without the audio appsrc
             // (pre-8b launch) simply discards it.
-            audio_pump: spawn_live_pump(audio_rx, entry.wiring.clone(), audio_appsrc, "audio"),
+            audio: spawn_live_pump(audio_rx, entry.wiring.clone(), audio_appsrc, "audio"),
+            aac: spawn_aac_pump(aac_rx, entry.wiring.clone()),
         };
         entry.session = Some(session);
         info!(mount = %entry.mount_path, "live ingestion armed (video + audio)");
@@ -435,8 +443,9 @@ impl PipelineRegistry for GstPipelineRegistry {
         // return `false` and silently discard (no back-pressure). The
         // audiomixer stops receiving live buffers and reverts to the
         // silent bed — no explicit audio flip needed.
-        session.video_pump.abort();
-        session.audio_pump.abort();
+        session.video.abort();
+        session.audio.abort();
+        session.aac.abort();
         info!(mount = %entry.mount_path, "live ingestion released; idle restored");
         Ok(())
     }
@@ -566,6 +575,12 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
     if let Some(a) = &audio_appsrc {
         a.set_property("block", false);
     }
+    let aac_appsrc = bin
+        .by_name(LIVE_AAC_SRC_NAME)
+        .and_then(|el| el.dynamic_cast::<gst_app::AppSrc>().ok());
+    if let Some(a) = &aac_appsrc {
+        a.set_property("block", false);
+    }
 
     Ok(LiveWiring {
         media_element,
@@ -577,6 +592,7 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
         idle_overlay,
         idle_caption,
         audio_appsrc,
+        aac_appsrc,
     })
 }
 
@@ -697,4 +713,65 @@ fn video_appsrc(w: &LiveWiring) -> Option<gst_app::AppSrc> {
 
 fn audio_appsrc(w: &LiveWiring) -> Option<gst_app::AppSrc> {
     w.audio_appsrc.clone()
+}
+
+/// The AAC pump: like [`spawn_live_pump`] for the relayed audio, plus
+/// the caps. The relay announces the stream's format once
+/// ([`AacFeed::Format`]); the pump applies it to the AAC `appsrc` before
+/// the first packet, and again whenever the media — hence the `appsrc`
+/// — changes under a running relay.
+fn spawn_aac_pump(
+    mut rx: mpsc::Receiver<AacFeed>,
+    wiring: WiringSlot,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut format: Option<AacRtpFormat> = None;
+        let mut configured: Option<gst_app::AppSrc> = None;
+        let mut failing = false;
+        while let Some(item) = rx.recv().await {
+            let bytes = match item {
+                AacFeed::Format(f) => {
+                    format = Some(f);
+                    configured = None;
+                    continue;
+                }
+                AacFeed::Rtp(bytes) => bytes,
+            };
+            let target = lock(&wiring).as_ref().and_then(|w| w.aac_appsrc.clone());
+            let Some(appsrc) = target else {
+                continue;
+            };
+            if configured.as_ref() != Some(&appsrc) {
+                if let Some(f) = &format {
+                    apply_aac_caps(&appsrc, f);
+                }
+                configured = Some(appsrc.clone());
+            }
+            match appsrc.push_buffer(gst::Buffer::from_slice(bytes)) {
+                Ok(_) => failing = false,
+                Err(e) if !failing => {
+                    debug!(error = %e, kind = "aac", "live push refused (media going down); dropping until the next media");
+                    failing = true;
+                }
+                Err(_) => {}
+            }
+        }
+        debug!(kind = "aac", "live RTP pump exited");
+    })
+}
+
+/// Set the AAC `appsrc`'s caps from the relayed stream's format.
+fn apply_aac_caps(appsrc: &gst_app::AppSrc, format: &AacRtpFormat) {
+    let caps = format.caps_string(LIVE_RTP_AAC_PT);
+    match caps.parse::<gst::Caps>() {
+        Ok(caps) => {
+            appsrc.set_caps(Some(&caps));
+            debug!(
+                clock_rate = format.clock_rate,
+                channels = format.channels,
+                "AAC appsrc caps set from the relayed stream"
+            );
+        }
+        Err(e) => warn!(error = %e, "AAC caps rejected; the relayed audio keeps the default caps"),
+    }
 }

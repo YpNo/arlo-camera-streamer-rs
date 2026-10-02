@@ -273,12 +273,11 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         url: &WatchAlongUrl,
     ) -> Result<LiveSession, DomainError> {
         // Same splice as a WebRTC session; the source is the RTSP relay
-        // of the view the user watches in the app (ADR 0007). Video
-        // only: the app's audio is AAC, the live audio path is Opus, and
-        // the silent bed covers it.
+        // of the view the user watches in the app (ADR 0007): its H.264
+        // into the video sink, its AAC into the AAC sink.
         let stall = self.webrtc.live_stall_timeout();
         self.arm_live(camera, |sinks, notifier| async move {
-            RtspRelay::start(url, sinks.video, stall, notifier)
+            RtspRelay::start(url, sinks, stall, notifier)
                 .await
                 .map(LiveLeg::Relay)
         })

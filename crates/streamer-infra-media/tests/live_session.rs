@@ -355,6 +355,70 @@ fn white_source(num_buffers: Option<u32>) -> String {
     )
 }
 
+/// The white source plus an AAC audio track carrying a tone (RFC 3640
+/// `AAC-hbr`, 16 kHz mono, as Arlo's cameras send it).
+fn white_source_with_tone() -> String {
+    "( videotestsrc is-live=true pattern=white \
+       ! video/x-raw,width=320,height=240,framerate=15/1 \
+       ! x264enc tune=zerolatency speed-preset=ultrafast key-int-max=15 \
+       ! rtph264pay name=pay0 pt=96 config-interval=1 \
+       audiotestsrc is-live=true wave=sine freq=880 volume=0.5 \
+       ! audio/x-raw,rate=16000,channels=1 \
+       ! avenc_aac ! aacparse ! rtpmp4gpay name=pay1 pt=98 )"
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_view_relay_carries_the_sources_audio_onto_the_mount() {
+    let _serial = SERIAL.lock().await;
+    if !gstreamer_ready() {
+        return;
+    }
+    let stack = Stack::new(WebrtcConfig::default());
+    stack.media.register(&stack.camera).await.expect("register");
+    let probe = RtspProbe::connect(&stack.url());
+    assert!(
+        eventually(PICTURE_TIMEOUT, || shows_idle(&probe)).await,
+        "client never showed the idle screen"
+    );
+    assert!(
+        !probe.hears_sound(),
+        "the idle bed must be silent (rms {} dB)",
+        probe.audio_rms_db()
+    );
+
+    let source = stack.install_source("/app_view_tone", &white_source_with_tone());
+    let url = WatchAlongUrl::parse(source).expect("source url");
+    let session = stack
+        .media
+        .attach_user_view(&stack.camera, &url)
+        .await
+        .expect("attach_user_view");
+    assert!(
+        eventually(PICTURE_TIMEOUT, || shows_live(&probe)
+            && probe.hears_sound())
+        .await,
+        "the relayed audio never reached the client (luma={}, rms={} dB)",
+        probe.mean_luma(),
+        probe.audio_rms_db()
+    );
+
+    stack
+        .media
+        .detach_live(&stack.camera)
+        .await
+        .expect("detach_live");
+    drop(session);
+    assert!(
+        eventually(PICTURE_TIMEOUT, || shows_idle(&probe)
+            && !probe.hears_sound())
+        .await,
+        "the mount did not fall silent after the relay (rms={} dB)",
+        probe.audio_rms_db()
+    );
+    assert!(!probe.interrupted(), "the client saw EOS or an error");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_view_relay_shows_the_source_on_the_camera_mount() {
     let _serial = SERIAL.lock().await;

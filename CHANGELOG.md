@@ -50,8 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   battery-protect, failed) each new snapshot refreshes it at once; at the
   end of a session the refresh uses the cached snapshot and saves a cloud
   round-trip.
-- A live view you start in the Arlo app is relayed to the RTSP and HLS
-  outputs (ADR 0007; the relay's RTSP client tolerates the unframed
+- A live view you start in the Arlo app is relayed, picture and sound,
+  to the RTSP and HLS outputs (ADR 0007; the relay's RTSP client tolerates the unframed
   RTCP and keep-alive packets Arlo's server sends between interleaved
   frames by resynchronising on the next frame header, and reports any
   other framing surprise with a hex dump; since the relay keeps the

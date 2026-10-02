@@ -53,9 +53,9 @@ use streamer_domain::state::LiveLossReason;
 use streamer_domain::stream::{LiveLossNotifier, WatchAlongUrl};
 
 use crate::error::MediaError;
-use crate::live_rtp_sink::LiveRtpSink;
+use crate::live_rtp_sink::{AacRtpFormat, LiveSinks};
 use crate::live_watch::{RtpActivity, report_loss, spawn_stall_watchdog};
-use crate::pipeline_desc::LIVE_RTP_H264_PT;
+use crate::pipeline_desc::{LIVE_RTP_AAC_PT, LIVE_RTP_H264_PT};
 
 /// Per-request RTSP timeout (connect, handshake, each response).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -87,9 +87,19 @@ const INTERLEAVED_HEADER_LEN: usize = 4;
 const FRAME_PROBE_LEN: usize = INTERLEAVED_HEADER_LEN + 2;
 /// Unframed bytes a resync skips before giving the stream up.
 const RESYNC_LIMIT: usize = 64 * 1024;
-/// Interleaved channels asked for in `SETUP`.
+/// Interleaved channels asked for in `SETUP`: video, then audio.
 const RTP_CHANNEL: u8 = 0;
 const RTCP_CHANNEL: u8 = 1;
+const AUDIO_RTP_CHANNEL: u8 = 2;
+const AUDIO_RTCP_CHANNEL: u8 = 3;
+/// RFC 3640 `AAC-hbr` AU-header widths; the bare-packet fallback needs them.
+const AAC_HBR_SIZE_LENGTH: u32 = 13;
+const AAC_HBR_INDEX_LENGTH: u32 = 3;
+/// A bare AAC packet: RTP header, AU-headers-length, one AU header.
+const BARE_AAC_HEAD_LEN: usize = RTP_HEADER_LEN + 4;
+/// Largest bare AAC packet taken at face value (one AU of 16 kHz AAC-LC
+/// is a few hundred bytes).
+const BARE_AAC_MAX_LEN: usize = 4096;
 const USER_AGENT: &str = concat!("arlo-camera-streamer/", env!("CARGO_PKG_VERSION"));
 /// Our SSRC in receiver reports; any value distinct from the sender's.
 const RECEIVER_SSRC: u32 = 0x4152_4c4f;
@@ -118,23 +128,32 @@ impl RtspRelay {
     /// [`MediaError::SpliceTimeout`] when no video arrives in time.
     pub(crate) async fn start(
         url: &WatchAlongUrl,
-        sink: LiveRtpSink,
+        sinks: LiveSinks,
         stall_timeout: Duration,
         notifier: LiveLossNotifier,
     ) -> Result<Self, MediaError> {
         let mut client = Client::connect(url).await?;
         let base = client.describe(url.as_str()).await?;
         client.setup_video(&base).await?;
+        if let Some(audio) = &base.audio {
+            sinks.aac.configure(audio.format.clone());
+            client.setup_audio(audio).await;
+        }
         client.play(&base.aggregate).await?;
         info!(url = %url, "watch-along stream playing; awaiting first video RTP");
 
         let activity = Arc::new(RtpActivity::new(Instant::now()));
         let first_rtp = Arc::new(Notify::new());
         let (stop_tx, stop_rx) = oneshot::channel();
+        let aac_bare = base
+            .audio
+            .as_ref()
+            .is_some_and(|a| hbr_default_widths(&a.format));
         let task = tokio::spawn(run(
             client,
             base.aggregate,
-            sink,
+            sinks,
+            aac_bare,
             activity.clone(),
             first_rtp.clone(),
             notifier.clone(),
@@ -187,6 +206,51 @@ impl Drop for RtspRelay {
 struct Described {
     aggregate: String,
     video_control: String,
+    /// The AAC audio track, when the SDP describes one we can decode.
+    audio: Option<AudioTrack>,
+}
+
+/// An RFC 3640 AAC track of the SDP: its control URL and packetisation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AudioTrack {
+    control: String,
+    format: AacRtpFormat,
+}
+
+/// Interleaved channel pairs (RTP, RTCP) the server assigned per track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Channels {
+    video: (u8, u8),
+    audio: Option<(u8, u8)>,
+}
+
+/// What a channel number carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lane {
+    VideoRtp,
+    AudioRtp,
+    Rtcp,
+    Unknown,
+}
+
+impl Channels {
+    const fn lane(self, channel: u8) -> Lane {
+        if channel == self.video.0 {
+            Lane::VideoRtp
+        } else if channel == self.video.1 {
+            Lane::Rtcp
+        } else if let Some((rtp, rtcp)) = self.audio {
+            if channel == rtp {
+                Lane::AudioRtp
+            } else if channel == rtcp {
+                Lane::Rtcp
+            } else {
+                Lane::Unknown
+            }
+        } else {
+            Lane::Unknown
+        }
+    }
 }
 
 struct Response {
@@ -213,9 +277,9 @@ struct Link {
     writer: Writer,
     cseq: u32,
     session: Option<String>,
-    /// Interleaved channels (RTP, RTCP) — ours until the server's
-    /// `SETUP` answer assigns others.
-    channels: (u8, u8),
+    /// Interleaved channels per track — ours until the server's `SETUP`
+    /// answers assign others.
+    channels: Channels,
 }
 
 impl Link {
@@ -234,7 +298,7 @@ impl Link {
 
     async fn send_rtcp_receiver_report(&mut self) -> std::io::Result<()> {
         let report = rtcp_receiver_report(RECEIVER_SSRC);
-        let frame = interleaved_frame(self.channels.1, &report);
+        let frame = interleaved_frame(self.channels.video.1, &report);
         self.writer.write_all(&frame).await
     }
 
@@ -276,7 +340,10 @@ impl Client {
                 writer,
                 cseq: 0,
                 session: None,
-                channels: (RTP_CHANNEL, RTCP_CHANNEL),
+                channels: Channels {
+                    video: (RTP_CHANNEL, RTCP_CHANNEL),
+                    audio: None,
+                },
             },
         })
     }
@@ -320,9 +387,17 @@ impl Client {
         let sdp = String::from_utf8_lossy(&response.body);
         let control = video_control(&sdp)
             .ok_or_else(|| MediaError::Relay("SDP has no H.264 video track".into()))?;
+        let audio = audio_track(&sdp).map(|track| AudioTrack {
+            control: join_control(&aggregate, &track.control),
+            format: track.format,
+        });
+        if audio.is_none() {
+            debug!("SDP has no AAC audio track; relaying the video only");
+        }
         Ok(Described {
             video_control: join_control(&aggregate, &control),
             aggregate,
+            audio,
         })
     }
 
@@ -334,13 +409,40 @@ impl Client {
             .request("SETUP", &base.video_control, &[("Transport", &transport)])
             .await?;
         let answered = response.header("Transport").unwrap_or_default();
-        self.link.channels = interleaved_channels(answered).unwrap_or((RTP_CHANNEL, RTCP_CHANNEL));
+        self.link.channels.video =
+            interleaved_channels(answered).unwrap_or((RTP_CHANNEL, RTCP_CHANNEL));
         debug!(
             transport = answered,
-            rtp_channel = self.link.channels.0,
+            rtp_channel = self.link.channels.video.0,
             "video track set up"
         );
         Ok(())
+    }
+
+    /// `SETUP` the AAC track on the next channel pair. A refusal keeps
+    /// the relay video-only rather than failing it: the audio is a
+    /// bonus, and Arlo's server pushes it unframed anyway (see
+    /// [`read_unframed`]).
+    async fn setup_audio(&mut self, track: &AudioTrack) {
+        let transport =
+            format!("RTP/AVP/TCP;unicast;interleaved={AUDIO_RTP_CHANNEL}-{AUDIO_RTCP_CHANNEL}");
+        match self
+            .request("SETUP", &track.control, &[("Transport", &transport)])
+            .await
+        {
+            Ok(response) => {
+                let answered = response.header("Transport").unwrap_or_default();
+                let pair = interleaved_channels(answered)
+                    .unwrap_or((AUDIO_RTP_CHANNEL, AUDIO_RTCP_CHANNEL));
+                self.link.channels.audio = Some(pair);
+                debug!(
+                    transport = answered,
+                    rtp_channel = pair.0,
+                    "audio track set up"
+                );
+            }
+            Err(e) => warn!(error = %e, "audio track refused; relaying the video only"),
+        }
     }
 
     async fn play(&mut self, aggregate: &str) -> Result<(), MediaError> {
@@ -356,7 +458,8 @@ impl Client {
 async fn run(
     client: Client,
     aggregate: String,
-    sink: LiveRtpSink,
+    sinks: LiveSinks,
+    aac_bare: bool,
     activity: Arc<RtpActivity>,
     first_rtp: Arc<Notify>,
     notifier: LiveLossNotifier,
@@ -365,7 +468,9 @@ async fn run(
     let Client { reader, mut link } = client;
     let (acks, mut pending_acks) = mpsc::channel(ACK_QUEUE);
     let channels = link.channels;
-    let mut reading = tokio::spawn(read_loop(reader, channels, sink, activity, first_rtp, acks));
+    let mut reading = tokio::spawn(read_loop(
+        reader, channels, sinks, aac_bare, activity, first_rtp, acks,
+    ));
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     let mut rtcp = tokio::time::interval(RTCP_INTERVAL);
     keepalive.tick().await;
@@ -422,13 +527,17 @@ async fn teardown(link: &mut Link, aggregate: &str) {
 /// server's requests over for an ack, and ends with the loss to report.
 async fn read_loop(
     mut reader: Reader,
-    channels: (u8, u8),
-    sink: LiveRtpSink,
+    channels: Channels,
+    sinks: LiveSinks,
+    aac_bare: bool,
     activity: Arc<RtpActivity>,
     first_rtp: Arc<Notify>,
     acks: mpsc::Sender<String>,
 ) -> (LiveLossReason, String) {
-    let mut stats = FrameStats::default();
+    let mut stats = FrameStats {
+        aac_bare,
+        ..FrameStats::default()
+    };
     let mut got_first = false;
     loop {
         match read_next(&mut reader, channels, &mut stats).await {
@@ -438,7 +547,10 @@ async fn read_loop(
                     got_first = true;
                     first_rtp.notify_one();
                 }
-                let _ = sink.push(packet);
+                let _ = sinks.video.push(packet);
+            }
+            Ok(Incoming::Audio(packet)) => {
+                let _ = sinks.aac.push(packet);
             }
             Ok(Incoming::Other) => {}
             Ok(Incoming::ServerRequest { cseq }) => {
@@ -460,7 +572,9 @@ async fn read_loop(
 enum Incoming {
     /// A video RTP packet, payload type already rewritten.
     Rtp(Bytes),
-    /// RTCP, audio, or a response to one of our keep-alives.
+    /// An AAC audio RTP packet, payload type already rewritten.
+    Audio(Bytes),
+    /// RTCP, an unknown channel, or a response to one of our keep-alives.
     Other,
     /// A request from the server to acknowledge.
     ServerRequest {
@@ -475,18 +589,22 @@ enum Incoming {
 struct FrameStats {
     frames: u64,
     bare_rtcp: u64,
+    bare_aac: u64,
     resyncs: u64,
     last: Option<(u8, usize)>,
-    /// Payload type of the stream's RTP, learnt from its first packet;
-    /// a resync trusts no `$` header whose packet carries another one.
+    /// Payload type of the stream's video RTP, learnt from its first
+    /// packet; a resync trusts no `$` header whose packet carries another.
     rtp_pt: Option<u8>,
+    /// Whether bare packets may be AAC-hbr audio worth parsing (the SDP
+    /// described an AAC track with the default AU-header widths).
+    aac_bare: bool,
 }
 
 impl FrameStats {
-    fn record(&mut self, channel: u8, rtp_channel: u8, payload: &[u8]) {
+    fn record(&mut self, channel: u8, lane: Lane, payload: &[u8]) {
         self.frames += 1;
         self.last = Some((channel, payload.len()));
-        if channel == rtp_channel && self.rtp_pt.is_none() && is_rtp(payload) {
+        if lane == Lane::VideoRtp && self.rtp_pt.is_none() && is_rtp(payload) {
             self.rtp_pt = Some(payload[1] & 0x7f);
         }
         if self.frames <= FIRST_FRAMES_LOGGED {
@@ -495,6 +613,16 @@ impl FrameStats {
                 len = payload.len(),
                 rtp = %rtp_summary(payload),
                 "interleaved frame"
+            );
+        }
+    }
+
+    fn record_bare_aac(&mut self, len: usize) {
+        self.bare_aac += 1;
+        if self.bare_aac == 1 {
+            debug!(
+                len,
+                "bare AAC audio packet (no interleaved framing) relayed"
             );
         }
     }
@@ -528,7 +656,7 @@ impl FrameStats {
 /// One interleaved frame or one RTSP message.
 async fn read_next(
     io: &mut Reader,
-    channels: (u8, u8),
+    channels: Channels,
     stats: &mut FrameStats,
 ) -> Result<Incoming, String> {
     let mut first = [0u8; 1];
@@ -546,7 +674,7 @@ async fn read_next(
 
 async fn read_frame(
     io: &mut Reader,
-    channels: (u8, u8),
+    channels: Channels,
     stats: &mut FrameStats,
 ) -> Result<Incoming, String> {
     let mut header = [0u8; 3];
@@ -558,52 +686,74 @@ async fn read_frame(
     io.read_exact(&mut payload)
         .await
         .map_err(|e| format!("frame payload: {e}"))?;
-    Ok(classify(channel, payload, channels.0, stats))
+    Ok(classify(channel, payload, channels, stats))
 }
 
-/// The frame's place in the relay: video RTP goes to the sink, the rest
-/// is noted and dropped.
+/// The frame's place in the relay: video RTP to the video sink, AAC RTP
+/// to the audio sink, the rest noted and dropped.
 fn classify(
     channel: u8,
     mut payload: Vec<u8>,
-    rtp_channel: u8,
+    channels: Channels,
     stats: &mut FrameStats,
 ) -> Incoming {
-    stats.record(channel, rtp_channel, &payload);
-    if channel == rtp_channel && rewrite_payload_type(&mut payload, LIVE_RTP_H264_PT) {
-        return Incoming::Rtp(Bytes::from(payload));
+    let lane = channels.lane(channel);
+    stats.record(channel, lane, &payload);
+    match lane {
+        Lane::VideoRtp if rewrite_payload_type(&mut payload, LIVE_RTP_H264_PT) => {
+            Incoming::Rtp(Bytes::from(payload))
+        }
+        Lane::AudioRtp if rewrite_payload_type(&mut payload, LIVE_RTP_AAC_PT) => {
+            Incoming::Audio(Bytes::from(payload))
+        }
+        _ => Incoming::Other,
     }
-    Incoming::Other
 }
 
 /// Arlo's server sends some packets **without** the interleaved framing
 /// (seen 2026-10-01): its periodic RTCP sender reports (`80 c8 00 06 …`,
-/// only the first one at `PLAY` is framed), each followed by a bare
-/// 12-byte RTP header (`80 80 00 01 …`, payload type 0, no payload — a
-/// keep-alive, presumably). RTCP carries its own length and is skipped
-/// by it; everything else is skipped up to the next `$` header that
-/// checks out ([`resync`]).
+/// only the first one at `PLAY` is framed), and the AAC audio track's
+/// RTP (`80 80 00 01 … 00 10 0e 00 …`, payload type 0), with or without
+/// a `SETUP` for it. RTCP carries its own length and is skipped by it;
+/// an AAC-hbr packet carries its AU size and is relayed as audio
+/// ([`bare_aac_len`]); everything else is skipped up to the next `$`
+/// header that checks out ([`resync`]).
 async fn read_unframed(
     io: &mut Reader,
     first: u8,
-    channels: (u8, u8),
+    channels: Channels,
     stats: &mut FrameStats,
 ) -> Result<Incoming, String> {
     let mut head = [0u8; RTCP_HEADER_LEN - 1];
     io.read_exact(&mut head)
         .await
         .map_err(|e| format!("bare packet header: {e}"))?;
-    let Some(len) = bare_rtcp_len(first, head) else {
-        let mut carried = vec![first];
-        carried.extend_from_slice(&head);
-        return resync(io, carried, channels, stats).await;
-    };
-    let mut rest = vec![0u8; len - RTCP_HEADER_LEN];
-    io.read_exact(&mut rest)
-        .await
-        .map_err(|e| format!("bare rtcp: {e}"))?;
-    stats.record_bare_rtcp(len);
-    Ok(Incoming::Other)
+    if let Some(len) = bare_rtcp_len(first, head) {
+        let mut rest = vec![0u8; len - RTCP_HEADER_LEN];
+        io.read_exact(&mut rest)
+            .await
+            .map_err(|e| format!("bare rtcp: {e}"))?;
+        stats.record_bare_rtcp(len);
+        return Ok(Incoming::Other);
+    }
+    let mut carried = vec![first];
+    carried.extend_from_slice(&head);
+    if stats.aac_bare && first >> 6 == 2 {
+        carried.resize(BARE_AAC_HEAD_LEN, 0);
+        io.read_exact(&mut carried[RTCP_HEADER_LEN..])
+            .await
+            .map_err(|e| format!("bare packet head: {e}"))?;
+        if let Some(len) = bare_aac_len(&carried) {
+            carried.resize(len, 0);
+            io.read_exact(&mut carried[BARE_AAC_HEAD_LEN..])
+                .await
+                .map_err(|e| format!("bare aac: {e}"))?;
+            stats.record_bare_aac(len);
+            rewrite_payload_type(&mut carried, LIVE_RTP_AAC_PT);
+            return Ok(Incoming::Audio(Bytes::from(carried)));
+        }
+    }
+    resync(io, carried, channels, stats).await
 }
 
 /// Skip bytes, `carried` first, until a `$` header that
@@ -612,7 +762,7 @@ async fn read_unframed(
 async fn resync(
     io: &mut Reader,
     carried: Vec<u8>,
-    channels: (u8, u8),
+    channels: Channels,
     stats: &mut FrameStats,
 ) -> Result<Incoming, String> {
     let mut window = carried;
@@ -634,7 +784,7 @@ async fn resync(
             io.read_exact(&mut payload[probed..])
                 .await
                 .map_err(|e| format!("frame payload after resync: {e}"))?;
-            return Ok(classify(channel, payload, channels.0, stats));
+            return Ok(classify(channel, payload, channels, stats));
         }
         skipped.push(window.remove(0));
         if skipped.len() > RESYNC_LIMIT {
@@ -645,20 +795,19 @@ async fn resync(
 
 /// `(channel, length)` when `window` starts with a `$` header worth
 /// trusting: one of our channels, a length that holds a packet header, a
-/// version-2 packet, and on the RTP channel the stream's payload type
-/// (once known), on the RTCP channel a known RTCP type.
-fn frame_header_at(window: &[u8], channels: (u8, u8), rtp_pt: Option<u8>) -> Option<(u8, usize)> {
+/// version-2 packet, and on the video RTP channel the stream's payload
+/// type (once known), on an RTCP channel a known RTCP type.
+fn frame_header_at(window: &[u8], channels: Channels, rtp_pt: Option<u8>) -> Option<(u8, usize)> {
     if window.len() < FRAME_PROBE_LEN || window[0] != b'$' {
         return None;
     }
     let (channel, len) = interleaved_header([window[1], window[2], window[3]]);
     let (version, pt) = (window[4] >> 6, window[5] & 0x7f);
-    let plausible = if channel == channels.0 {
-        len >= RTP_HEADER_LEN && rtp_pt.is_none_or(|known| pt == known)
-    } else if channel == channels.1 {
-        len >= RTCP_HEADER_LEN && (RTCP_PT_FIRST..=RTCP_PT_LAST).contains(&window[5])
-    } else {
-        false
+    let plausible = match channels.lane(channel) {
+        Lane::VideoRtp => len >= RTP_HEADER_LEN && rtp_pt.is_none_or(|known| pt == known),
+        Lane::AudioRtp => len >= RTP_HEADER_LEN,
+        Lane::Rtcp => len >= RTCP_HEADER_LEN && (RTCP_PT_FIRST..=RTCP_PT_LAST).contains(&window[5]),
+        Lane::Unknown => false,
     };
     (version == 2 && plausible).then_some((channel, len))
 }
@@ -883,6 +1032,103 @@ fn video_control(sdp: &str) -> Option<String> {
     (in_video && h264).then_some(control).flatten()
 }
 
+/// The first `m=audio` section whose payload is RFC 3640 `MPEG4-GENERIC`
+/// with an `AudioSpecificConfig` (`config=`): its control and format.
+/// `sizelength` / `indexlength` / `indexdeltalength` default to the
+/// `AAC-hbr` widths when the `fmtp` omits them.
+fn audio_track(sdp: &str) -> Option<AudioTrack> {
+    let mut in_audio = false;
+    let mut control = None;
+    let mut rtpmap: Option<(u32, u32)> = None;
+    let mut fmtp: Option<String> = None;
+    for line in sdp.lines().map(str::trim_end) {
+        if let Some(media) = line.strip_prefix("m=") {
+            if in_audio && rtpmap.is_some() && fmtp.is_some() {
+                break;
+            }
+            in_audio = media.starts_with("audio ");
+            control = None;
+            rtpmap = None;
+            fmtp = None;
+            continue;
+        }
+        if !in_audio {
+            continue;
+        }
+        if let Some(c) = line.strip_prefix("a=control:") {
+            control = Some(c.trim().to_string());
+        } else if let Some(map) = line.strip_prefix("a=rtpmap:") {
+            rtpmap = aac_rtpmap(map);
+        } else if let Some(f) = line.strip_prefix("a=fmtp:") {
+            fmtp = f.split_once(' ').map(|(_, params)| params.to_string());
+        }
+    }
+    if !in_audio {
+        return None;
+    }
+    let (clock_rate, channels) = rtpmap?;
+    let params = fmtp?;
+    let param = |key: &str| -> Option<String> {
+        params.split(';').map(str::trim).find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            k.trim()
+                .eq_ignore_ascii_case(key)
+                .then(|| v.trim().to_string())
+        })
+    };
+    if param("mode").is_some_and(|m| !m.eq_ignore_ascii_case("AAC-hbr")) {
+        return None;
+    }
+    let width =
+        |key: &str, default: u32| param(key).and_then(|v| v.parse().ok()).unwrap_or(default);
+    Some(AudioTrack {
+        control: control.unwrap_or_else(|| "*".to_string()),
+        format: AacRtpFormat {
+            clock_rate,
+            channels,
+            config: param("config")?,
+            size_length: width("sizelength", AAC_HBR_SIZE_LENGTH),
+            index_length: width("indexlength", AAC_HBR_INDEX_LENGTH),
+            index_delta_length: width("indexdeltalength", AAC_HBR_INDEX_LENGTH),
+        },
+    })
+}
+
+/// `(clock rate, channels)` of an `rtpmap` value naming `MPEG4-GENERIC`.
+fn aac_rtpmap(map: &str) -> Option<(u32, u32)> {
+    let (_, encoding) = map.trim().split_once(' ')?;
+    let mut parts = encoding.split('/');
+    if !parts.next()?.eq_ignore_ascii_case("MPEG4-GENERIC") {
+        return None;
+    }
+    let clock_rate = parts.next()?.parse().ok()?;
+    let channels = parts.next().map_or(Some(1), |c| c.parse().ok())?;
+    Some((clock_rate, channels))
+}
+
+/// Whether the bare-packet fallback can read the AU size: it assumes the
+/// `AAC-hbr` widths (13-bit size, 3-bit index).
+fn hbr_default_widths(format: &AacRtpFormat) -> bool {
+    format.size_length == AAC_HBR_SIZE_LENGTH && format.index_length == AAC_HBR_INDEX_LENGTH
+}
+
+/// Total length of a bare `AAC-hbr` RTP packet whose first
+/// `BARE_AAC_HEAD_LEN` bytes are `head`: a version-2 header without CSRCs
+/// or extension, an AU-headers-length of 16 bits (one AU), and that AU's
+/// 13-bit size. `None` when the bytes do not read that way.
+fn bare_aac_len(head: &[u8]) -> Option<usize> {
+    if head.len() < BARE_AAC_HEAD_LEN || head[0] >> 6 != 2 || head[0] & 0x1f != 0 {
+        return None;
+    }
+    let au_headers_bits = u16::from_be_bytes([head[12], head[13]]);
+    if au_headers_bits != 16 {
+        return None;
+    }
+    let au_size = usize::from(u16::from_be_bytes([head[14], head[15]]) >> 3);
+    let total = BARE_AAC_HEAD_LEN + au_size;
+    (au_size > 0 && total <= BARE_AAC_MAX_LEN).then_some(total)
+}
+
 /// Resolve a track control against the aggregate URL: absolute controls
 /// are used as they are, relative ones appended with one `/`.
 fn join_control(base: &str, control: &str) -> String {
@@ -1010,6 +1256,7 @@ mod tests {
 
     const SDP: &str = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=cam\r\nt=0 0\r\n\
         m=audio 0 RTP/AVP 98\r\na=control:trackid=2\r\na=rtpmap:98 MPEG4-GENERIC/16000/1\r\n\
+        a=fmtp:98 streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1408\r\n\
         m=video 0 RTP/AVP 96\r\na=control:trackid=1\r\na=rtpmap:96 H264/90000\r\na=ssrc:1\r\n";
 
     #[test]
@@ -1103,7 +1350,7 @@ mod tests {
     #[test]
     fn desync_report_dumps_bounded_hex_and_locates_the_marker() {
         let mut stats = FrameStats::default();
-        stats.record(0, 0, &[0x80; 12]);
+        stats.record(0, Lane::VideoRtp, &[0x80; 12]);
         let mut ahead = vec![0xABu8; 30];
         ahead[27] = b'$';
         let report = desync_report(0x01, &ahead, &stats);
@@ -1150,11 +1397,16 @@ mod tests {
         let mut second = rtp;
         second[3] = 2;
         stream.extend_from_slice(&interleaved_frame(0, &second));
+        // A framed AAC packet on the audio channel.
+        let aac = [
+            0x80, 0x62, 0, 7, 0, 0, 0, 0, 0, 0, 0, 2, 0x00, 0x10, 0x00, 0x08, 0xAA,
+        ];
+        stream.extend_from_slice(&interleaved_frame(2, &aac));
         // Junk holding a '$' on a wrong channel, then the end.
         stream.extend_from_slice(&[0x01, 0x02, 0x03, b'$', 0x07, 0, 1, 0x80]);
         let mut reader = reader_fed_with(&stream);
         let mut stats = FrameStats::default();
-        let channels = (0, 1);
+        let channels = both_tracks();
 
         let Ok(Incoming::Rtp(packet)) = read_next(&mut reader, channels, &mut stats).await else {
             panic!("first frame is the RTP packet");
@@ -1185,6 +1437,11 @@ mod tests {
         };
         assert_eq!(packet[3], 2, "second RTP packet, seq 2");
         assert_eq!((stats.resyncs, stats.frames), (1, 3));
+        let Ok(Incoming::Audio(packet)) = read_next(&mut reader, channels, &mut stats).await else {
+            panic!("the audio channel's frame goes to the AAC sink");
+        };
+        assert_eq!(packet[1] & 0x7f, u8::try_from(LIVE_RTP_AAC_PT).unwrap());
+        assert_eq!(packet[3], 7, "audio seq kept");
         // Junk up to EOF: the stream is reported closed, not desynced.
         assert!(matches!(
             read_next(&mut reader, channels, &mut stats).await,
@@ -1192,9 +1449,19 @@ mod tests {
         ));
     }
 
+    fn both_tracks() -> Channels {
+        Channels {
+            video: (0, 1),
+            audio: Some((2, 3)),
+        }
+    }
+
     #[test]
     fn frame_header_at_trusts_only_a_plausible_header() {
-        let channels = (0, 1);
+        let channels = Channels {
+            video: (0, 1),
+            audio: None,
+        };
         // '$', channel 0, len 12, RTP v2 pt 96.
         let good = [b'$', 0, 0, 12, 0x80, 0x60];
         assert_eq!(frame_header_at(&good, channels, None), Some((0, 12)));
@@ -1221,10 +1488,99 @@ mod tests {
             None
         );
         assert_eq!(frame_header_at(&good[..5], channels, None), None);
+        // With an audio track set up, its channel is trusted on version alone.
+        assert_eq!(
+            frame_header_at(&[b'$', 2, 0, 12, 0x80, 0x00], both_tracks(), Some(0x60)),
+            Some((2, 12))
+        );
+        assert_eq!(
+            frame_header_at(&[b'$', 3, 0, 28, 0x80, 0xc8], both_tracks(), None),
+            Some((3, 28))
+        );
         assert_eq!(
             frame_header_at(&[0, 0, 0, 12, 0x80, 0x60], channels, None),
             None
         );
+    }
+
+    #[test]
+    fn audio_track_parses_the_aac_track_of_the_sdp() {
+        let track = audio_track(SDP).expect("aac track");
+        assert_eq!(track.control, "trackid=2");
+        assert_eq!(
+            track.format,
+            AacRtpFormat {
+                clock_rate: 16000,
+                channels: 1,
+                config: "1408".into(),
+                size_length: 13,
+                index_length: 3,
+                index_delta_length: 3,
+            }
+        );
+        // Widths default to AAC-hbr when the fmtp omits them; channels to 1.
+        let terse = SDP
+            .replace(";sizelength=13;indexlength=3;indexdeltalength=3", "")
+            .replace("MPEG4-GENERIC/16000/1", "MPEG4-GENERIC/44100");
+        let track = audio_track(&terse).expect("terse track");
+        assert_eq!((track.format.clock_rate, track.format.channels), (44100, 1));
+        assert_eq!(track.format.size_length, 13);
+    }
+
+    #[test]
+    fn audio_track_needs_a_config_and_the_hbr_mode() {
+        assert!(audio_track(&SDP.replace(";config=1408", "")).is_none());
+        assert!(audio_track(&SDP.replace("mode=AAC-hbr", "mode=AAC-lbr")).is_none());
+        assert!(audio_track(&SDP.replace("MPEG4-GENERIC", "opus")).is_none());
+        assert!(audio_track("v=0\r\nm=video 0 RTP/AVP 96\r\n").is_none());
+    }
+
+    #[test]
+    fn bare_aac_len_reads_the_au_size_of_an_hbr_packet() {
+        // Arlo's capture: V2, M=1, PT 0, seq 1; AU-headers-length 16; AU size 448.
+        let mut head = vec![
+            0x80, 0x80, 0, 1, 0, 0, 0, 0, 0x5a, 0x4a, 0xd4, 0x7b, 0x00, 0x10, 0x0e, 0x00,
+        ];
+        assert_eq!(bare_aac_len(&head), Some(16 + 448));
+        head[12] = 0x00;
+        head[13] = 0x20; // two AU headers: not the shape we parse
+        assert_eq!(bare_aac_len(&head), None);
+        let with_csrc = [
+            0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x10, 0x0e, 0x00,
+        ];
+        assert_eq!(bare_aac_len(&with_csrc), None);
+        assert_eq!(bare_aac_len(&head[..10]), None);
+        let empty = [
+            0x80, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x10, 0x00, 0x00,
+        ];
+        assert_eq!(bare_aac_len(&empty), None);
+    }
+
+    #[tokio::test]
+    async fn read_unframed_relays_a_bare_aac_packet_when_the_sdp_announced_aac() {
+        let mut stream = vec![
+            0x80, 0x80, 0, 5, 0, 0, 0x0c, 0x00, 1, 2, 3, 4, 0x00, 0x10, 0x00, 0x18,
+        ];
+        stream.extend_from_slice(&[0xAB; 3]); // AU of 3 bytes
+        let rtp = [0x80, 0x60, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0xAA];
+        stream.extend_from_slice(&interleaved_frame(0, &rtp));
+        let mut reader = reader_fed_with(&stream);
+        let mut stats = FrameStats {
+            aac_bare: true,
+            ..FrameStats::default()
+        };
+        let Ok(Incoming::Audio(packet)) = read_next(&mut reader, both_tracks(), &mut stats).await
+        else {
+            panic!("a bare AAC packet is relayed as audio");
+        };
+        assert_eq!(packet.len(), 19);
+        assert_eq!(packet[1] & 0x7f, u8::try_from(LIVE_RTP_AAC_PT).unwrap());
+        assert_eq!(stats.bare_aac, 1);
+        assert!(matches!(
+            read_next(&mut reader, both_tracks(), &mut stats).await,
+            Ok(Incoming::Rtp(_))
+        ));
+        assert_eq!(stats.resyncs, 0, "no resync needed around a parsed packet");
     }
 
     #[tokio::test]
@@ -1232,7 +1588,7 @@ mod tests {
         let junk = vec![0x01u8; RESYNC_LIMIT + 16];
         let mut reader = reader_fed_with(&junk);
         let mut stats = FrameStats::default();
-        let Err(why) = read_next(&mut reader, (0, 1), &mut stats).await else {
+        let Err(why) = read_next(&mut reader, both_tracks(), &mut stats).await else {
             panic!("endless junk ends the relay");
         };
         assert!(

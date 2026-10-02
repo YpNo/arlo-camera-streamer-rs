@@ -29,6 +29,7 @@
 
 use std::path::Path;
 
+use crate::live_rtp_sink::AacRtpFormat;
 use streamer_domain::camera::StreamName;
 use streamer_domain::config::{DashOutput, HlsOutput, OutputConfig, VideoEncoder};
 
@@ -81,6 +82,27 @@ pub(crate) const UNIFIED_AUDIO_ENCODER_NAME: &str = "audio_enc";
 /// Opus RTP payload type of the live audio: the audio transceiver's PT
 /// in our WebRTC offer and the live audio appsrc's caps.
 pub(crate) const LIVE_RTP_OPUS_PT: i32 = 111;
+/// AAC (RFC 3640) RTP payload type of the relayed app-view audio
+/// (ADR 0007): the relay rewrites the stream's PT to it, and the AAC
+/// appsrc's caps declare it.
+pub(crate) const LIVE_RTP_AAC_PT: i32 = 98;
+/// Name of the AAC audio `appsrc` in the unified pipeline.
+pub(crate) const LIVE_AAC_SRC_NAME: &str = "live_aac_rtp_src";
+
+/// The AAC format the appsrc starts with — AAC-LC, 16 kHz mono, as
+/// Arlo's cameras send it — until a relay announces the stream's own
+/// (`LiveAacSink::configure`).
+#[must_use]
+pub(crate) fn default_aac_format() -> AacRtpFormat {
+    AacRtpFormat {
+        clock_rate: 16000,
+        channels: 1,
+        config: "1408".to_string(),
+        size_length: 13,
+        index_length: 3,
+        index_delta_length: 3,
+    }
+}
 
 // ── Phase 8b (Opus audio bridging) — via `audiomixer` ────────────────
 // Live audio uses an `audiomixer`, NOT a second `input-selector`. A
@@ -257,6 +279,7 @@ pub fn combined_launch_string(idle: &IdleKind, encoder: VideoEncoder) -> String 
             ! rtph264pay name=pay0 pt=96 config-interval=1 \
             {idle_audio} ! queue max-size-buffers=32 leaky=downstream ! amix.sink_0 \
             {live_audio} ! queue max-size-buffers=32 leaky=downstream ! amix.sink_1 \
+            {live_aac} ! queue max-size-buffers=32 leaky=downstream ! amix.sink_2 \
             audiomixer name=amix \
             ! audioconvert \
             ! avenc_aac name={aenc} bitrate=64000 \
@@ -267,6 +290,7 @@ pub fn combined_launch_string(idle: &IdleKind, encoder: VideoEncoder) -> String 
         video_enc = video_encoder_segment(encoder),
         idle_audio = idle_audio_raw_chain(),
         live_audio = live_audio_decode_chain(),
+        live_aac = live_aac_decode_chain(),
         aenc = UNIFIED_AUDIO_ENCODER_NAME,
     )
 }
@@ -373,6 +397,20 @@ fn live_audio_decode_chain() -> String {
          caps=\"application/x-rtp,media=audio,encoding-name=OPUS,\
 clock-rate=48000,payload={pt}\" \
          ! rtpopusdepay ! opusdec \
+         ! audioconvert ! audioresample \
+         ! audio/x-raw,format=F32LE,rate=48000,channels=2"
+    )
+}
+
+/// Relayed AAC RTP (ADR 0007) → depayload → decode → the unified raw
+/// audio caps, onto the mixer's third pad. Silent until a relay pushes;
+/// the caps follow the relayed stream's SDP (the pump sets them).
+fn live_aac_decode_chain() -> String {
+    let caps = default_aac_format().caps_string(LIVE_RTP_AAC_PT);
+    format!(
+        "appsrc name={LIVE_AAC_SRC_NAME} is-live=true do-timestamp=true format=time \
+         caps=\"{caps}\" \
+         ! rtpmp4gdepay ! aacparse ! avdec_aac \
          ! audioconvert ! audioresample \
          ! audio/x-raw,format=F32LE,rate=48000,channels=2"
     )
@@ -618,6 +656,11 @@ mod tests {
         assert!(s.contains("amix.sink_0"));
         assert!(s.contains("amix.sink_1"));
         assert!(s.contains("appsrc name=live_audio_rtp_src"));
+        // The relayed app-view audio (AAC) has its own decode branch on sink_2.
+        assert!(s.contains("amix.sink_2"));
+        assert!(s.contains("appsrc name=live_aac_rtp_src"));
+        assert!(s.contains("encoding-name=MPEG4-GENERIC"));
+        assert!(s.contains("rtpmp4gdepay ! aacparse ! avdec_aac"));
         assert!(s.contains("rtpopusdepay ! opusdec"));
         // No second input-selector anywhere.
         assert!(!s.contains("sel_a"));

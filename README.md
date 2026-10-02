@@ -48,7 +48,7 @@ to see the contracts. The ADRs document the load-bearing decisions:
 - [docs/adr/0003-seamless-input-selector-splice.md](./docs/adr/0003-seamless-input-selector-splice.md)
 - [ADR 0004 — Live-loss feedback](./docs/adr/0004-live-lost-feedback.md): a dead live source returns the camera to idle within the stall timeout instead of the debounce or the continuous-live cap.
 - [ADR 0006 — HLS output](./docs/adr/0006-hls-output-via-loopback-segmenter.md): HLS is written by a loopback RTSP client of each camera, without re-encoding; DASH is not supported.
-- [ADR 0007 — Relay the user's app view](./docs/adr/0007-relay-the-users-app-view.md): a live view started in the Arlo app is relayed from the RTSPS stream Arlo hands the app identity; no cooldown, no budget charge; the relay lets go of the stream every `user_view_probe_secs` so the camera can report whether the app still views.
+- [ADR 0007 — Relay the user's app view](./docs/adr/0007-relay-the-users-app-view.md): a live view started in the Arlo app is relayed from the RTSPS stream Arlo hands the app identity; no cooldown, no budget charge; picture and sound; the relay lets go of the stream every `user_view_probe_secs` so the camera can report whether the app still views.
 
 ## Prerequisites
 

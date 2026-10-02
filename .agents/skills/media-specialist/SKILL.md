@@ -89,14 +89,18 @@ Arlo-specific behaviour with the `live-validation` skill.
 - Our own RTSP client, not `rtspsrc` (refused at SETUP by Arlo's server, cause unknown).
   OPTIONS → DESCRIBE → one SETUP for the H.264 track (`RTP/AVP/TCP;unicast;interleaved=0-1`)
   → PLAY → two tasks: `read_loop` owns the read half (`$`-framed RTP → PT rewritten to
-  `LIVE_RTP_H264_PT` → `LiveSinks.video`), `run` owns the write half (`GET_PARAMETER`
+  `LIVE_RTP_H264_PT` → `LiveSinks.video`; the AAC track's RTP → `LIVE_RTP_AAC_PT` →
+  `LiveSinks.aac`, whose caps follow the SDP through `AacFeed::Format` — the SDP-derived
+  caps fields must be typed `(string)`, untyped digits parse as ints and the depayloader
+  ignores them), `run` owns the write half (`GET_PARAMETER`
   every 25 s, RTCP RR every 5 s, acks of server requests, TEARDOWN). Never read frames
   inside a `select!` with timers: a cancelled read leaves the stream mid-frame.
 - **Arlo's server framing (captured 2026-10-01):** the SETUP answer keeps `interleaved=0-1`;
   the first RTCP SR after PLAY is framed on channel 1, the periodic ones arrive **bare**
-  (`80 c8 00 06 …`, no `$` header), each followed by a bare 12-byte RTP header
-  (`80 80 00 01 …`, PT 0, empty — a keep-alive). `read_unframed` skips bare RTCP by
-  its own length; anything else goes through `resync`, which scans to the next `$`
+  (`80 c8 00 06 …`, no `$` header), and the AAC audio track's RTP arrives bare too
+  (`80 80 00 01 … 00 10 0e 00 …`, PT 0, AU-headers-length 16, one AU). `read_unframed`
+  skips bare RTCP by its own length, relays a bare `AAC-hbr` packet by its AU size
+  (`bare_aac_len`); anything else goes through `resync`, which scans to the next `$`
   header `frame_header_at` trusts (our channel, length ≥ a packet header, version 2,
   the stream's RTP payload type or a known RTCP type) and logs the skipped bytes
   (`unframed bytes skipped`, first four at debug). After `RESYNC_LIMIT` (64 KiB) the

@@ -252,3 +252,15 @@ Tests:    App 126, domain 57, infra-arlo 75, media 104 + 10 integration,
 Open:     Probe resume path only unit-tested; audio relay; arlo-rs 0.2.2
           release then drop `[patch.crates-io]`; MFA skill not yet run by
           the owner on a fresh cache.
+
+## 2026-10-02 — Audio relay (ADR 0007), CI staged, arlo-rs 0.2.2
+Changed:  Third audiomixer input (`live_aac_rtp_src`, rtpmp4gdepay →
+          avdec_aac) fed by `LiveAacSink` (format first, then RTP; the pump
+          applies the caps per media; SDP fields typed `(string)`). The relay
+          parses the AAC track, SETUPs it on channels 2-3, routes its frames,
+          and relays Arlo's bare AAC packets by their AU size. Both repos'
+          CI staged; streamer release job folded into ci.yml; arlo-rs 0.2.2
+          from crates.io, patch block off.
+Tests:    Media 110 unit + 11 integration (new: tone through the relay heard
+          by the probe's `level`); workspace green; release built.
+Open:     Hear the relayed audio live (VLC); probe resume path live.
