@@ -26,7 +26,9 @@ cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
 
-CI adds tarpaulin with `--fail-under 86` (the binary and the infra-arlo network wrappers
+CI is staged (format → clippy → test → coverage/Sonar, doc beside test; docs-only
+changes and Renovate's PRs run less — see the comment atop `ci.yml`). It adds tarpaulin
+with `--fail-under 86` (the binary and the infra-arlo network wrappers
 are excluded in `ci.yml`; the GStreamer files count through `tests/live_session.rs`),
 audit/deny, Sonar, GitGuardian. Clippy is pedantic: functions over
 100 lines fail (`too_many_lines`) — extract a helper rather than `allow`. An `allow` needs a
