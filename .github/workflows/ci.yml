@@ -4,7 +4,8 @@ name: Rust CI
 # format → clippy → test → coverage / SonarQube, with doc beside test — so
 # a failed stage skips the costlier ones (coverage alone is ~9 min);
 # docs-only changes do not run it; the weekly schedule runs the audit
-# only; Renovate's PRs skip coverage and SonarQube.
+# only; Renovate's PRs skip coverage and SonarQube; the GitHub release is
+# the last job, after every gate.
 on:
   pull_request:
     branches: [main, master]
@@ -221,3 +222,46 @@ jobs:
         run: echo "SONAR_TOKEN is not set; skipping the SonarCloud scan."
       - uses: SonarSource/sonarqube-scan-action@ba9859eae8dd6bd29e412f25ddbbef3d032000f4 # v8.2.2
         if: env.SONAR_TOKEN != ''
+
+  # The GitHub release, after every gate: a push to main whose Cargo.toml
+  # version has no release yet gets tagged `v<version>` with generated
+  # notes. SonarCloud is reporting only and does not hold a release back.
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [format, clippy, test, security, doc, coverage]
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags decide whether this version is released already
+
+      - name: Extract version from Cargo.toml
+        run: |
+          VERSION=$(grep '^version =' Cargo.toml | awk -F '"' '{print $2}')
+          echo "VERSION=v$VERSION" >> "$GITHUB_ENV"
+          echo "Detected version: v$VERSION"
+
+      - name: Check whether the release exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists. Skipping."
+            echo "EXISTS=true" >> "$GITHUB_ENV"
+          else
+            echo "EXISTS=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Create Release
+        if: env.EXISTS == 'false'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: Release ${{ env.VERSION }}
+          generate_release_notes: true
+          target_commitish: ${{ github.sha }}

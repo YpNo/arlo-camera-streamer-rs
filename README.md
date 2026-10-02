@@ -333,8 +333,9 @@ integration tests) → coverage gate (86 %; raised deliberately, never above
 what is held) and SonarCloud, with the rustdoc check beside the tests and
 cargo-deny in parallel. A failed stage skips the costlier ones, docs-only
 changes do not run it, the weekly schedule runs cargo-deny only, and
-Renovate's PRs skip coverage and SonarCloud. `release.yml` tags a GitHub
-release on a push to `main` whose `Cargo.toml` version has none yet.
+Renovate's PRs skip coverage and SonarCloud. Its last job, after every
+gate, tags a GitHub release on a push to `main` whose `Cargo.toml` version
+has none yet.
 
 ## Security
 
