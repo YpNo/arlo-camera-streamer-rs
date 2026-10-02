@@ -79,8 +79,8 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
   keeps streaming for us and never reports `idle`. So the relay
   **probes**: every `user_view_probe_secs` (60 s) it lets go of the
   stream (`UserViewProbe`, `Live → Idle`, the still shows the notice)
-  and listens for the camera's `idle` report for a 5 s grace — the
-  report came 340 ms after our `TEARDOWN` at the gate. A report means
+  and listens for the camera's `idle` report for a 2 s grace — the
+  report came 0.34 to 0.8 s after our `TEARDOWN` over four gates. A report means
   the app had left; none means the view goes on and the relay resumes
   through the ordinary `UserViewStarted` path, about 1.5 s later. With
   probing off (`0`) the relay is capped at `max_continuous_live`
@@ -117,7 +117,7 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
   interval after the app closes its view, and the NVR shows live for
   that long; the bus gives no signal of the app leaving while we hold
   the stream. Each probe costs the viewers a gap of about seven
-  seconds (grace plus re-attach).
+  seconds (grace plus re-attach, about 2.5 s measured).
 - **A late `idle` report** (later than the grace) makes the re-attach
   query reach a camera that has just stopped, which starts it again
   for one more segment. Not seen so far (340 ms).

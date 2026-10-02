@@ -38,7 +38,7 @@ them.
 | `LiveLost(reason)` | `Live → Idle`, same exit, **no backoff** (ADR 0004) |
 | `CameraBusy` | `Activating → Idle`, **no backoff** (ADR 0005) |
 | `UserViewStarted` / `UserViewEnded` / `UserViewUnavailable` | Relay of the app view (ADR 0007): `Idle → Activating`, `Live → Idle`, `Activating → Idle` without backoff |
-| `UserViewProbe` | The relay lets go (`Live → Idle`) to let the camera report `idle`; `probe_until` arms a 5 s grace in `Idle`, after which `UserViewStarted` relays again unless the report came |
+| `UserViewProbe` | The relay lets go (`Live → Idle`) to let the camera report `idle`; `probe_until` arms a 2 s grace in `Idle`, after which `UserViewStarted` relays again unless the report came |
 | `Failure(reason)` | `→ Failed`, exponential backoff, then `BackoffElapsed → Idle` |
 | `BudgetExhausted` / `BudgetReset` | `→ BatteryProtect` / back to `Idle` |
 
@@ -66,7 +66,7 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   budget charge, but a **release deadline**: our RTSP session keeps the camera streaming
   after the app closes, and the bus never says `idle` while we hold it (captured
   2026-10-01). `relay_deadline = now + user_view_probe_secs` → `handle_deadline` →
-  `UserViewProbe` → `Idle` with `probe_until = now + USER_VIEW_PROBE_GRACE` (5 s); the
+  `UserViewProbe` → `Idle` with `probe_until = now + USER_VIEW_PROBE_GRACE` (2 s; the `idle` report takes 0.3–0.8 s); the
   `Idle` deadline then re-emits `UserViewStarted` (through `user_view_relay_signal`, so
   the retry guard applies) unless `ManualStreamEnded` cleared `probe_until` first. With
   `user_view_probe_secs = 0` the deadline is `max_continuous_live` → `MaxLiveExceeded`,

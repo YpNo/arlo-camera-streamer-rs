@@ -103,8 +103,9 @@ const USER_VIEW_HOLD: Duration = Duration::from_secs(120);
 const USER_VIEW_RETRY: Duration = Duration::from_secs(30);
 /// After a probe released the stream, how long the camera gets to report
 /// `idle` before the view is taken to go on and the relay resumes. The
-/// report came 340 ms after our `TEARDOWN` on 2026-10-01.
-const USER_VIEW_PROBE_GRACE: Duration = Duration::from_secs(5);
+/// report came 0.34 to 0.8 s after our `TEARDOWN` over four live gates
+/// (2026-10-01/02); the grace is what viewers see as the gap.
+const USER_VIEW_PROBE_GRACE: Duration = Duration::from_secs(2);
 
 /// Per-camera state-machine task.
 pub struct CameraOrchestrator {

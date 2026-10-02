@@ -95,7 +95,7 @@ Arlo-specific behaviour with the `live-validation` skill.
   ignores them), `run` owns the write half (`GET_PARAMETER`
   every 25 s, RTCP RR every 5 s, acks of server requests, TEARDOWN). Never read frames
   inside a `select!` with timers: a cancelled read leaves the stream mid-frame.
-- **Arlo's server framing (captured 2026-10-01):** the SETUP answer keeps `interleaved=0-1`;
+- **Arlo's server framing (captured 2026-10-01/02):** SETUP answers keep `interleaved=0-1` (video) and `2-3` (audio); once the audio track is set up its RTP arrives framed on channel 2 (PT 98) and nothing is bare any more. Without the audio SETUP:
   the first RTCP SR after PLAY is framed on channel 1, the periodic ones arrive **bare**
   (`80 c8 00 06 …`, no `$` header), and the AAC audio track's RTP arrives bare too
   (`80 80 00 01 … 00 10 0e 00 …`, PT 0, AU-headers-length 16, one AU). `read_unframed`
