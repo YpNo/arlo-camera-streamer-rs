@@ -37,6 +37,7 @@ A stale binary has already cost a validation round.
 
 | Path | Expected lines, in order |
 |---|---|
+| Boot / login | `arlo-rs session restored from cache` (silent) or `no valid cached session — running MFA cold-start` → `Trusted browser accepted by Arlo — no OTP required` / the factor's lines → `arlo-rs authentication complete`. Anything asking for a code on a routine restart is a bug or a lost cache: see the `arlo-mfa-login` skill |
 | Motion pulses (`streamer_infra_arlo::events=debug`, `streamer_app=debug`) | `camera trigger pulse` per `true` (about every 10 s while motion lasts); `trigger pulse … outcome=absorbed session_ends_in_ms=…` shows the cooldown restarting |
 | Motion session | `state transition … to=Activating` → `webrtcbin offer ready` → `answer applied; awaiting first RTP` → `live webrtcbin ready; first RTP flowing` → `to=Live` → (cooldown) `to=Idle` → `webrtcbin bus watch exited` |
 | Stall (kill the source, e.g. cut the camera's network) | `no inbound video RTP; live source stalled` about `live_stall_timeout_secs` after the last packet → `signal=LiveLost(RtpStalled)` → `to=Idle` |

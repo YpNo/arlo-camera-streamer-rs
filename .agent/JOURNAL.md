@@ -235,3 +235,20 @@ Tests:    App 120 (5 new relay tests; 4 ADR-0005 tests retargeted), domain
           57, infra-arlo 75, media 97 + 10 integration, ops 38; clippy/doc
           clean; release built.
 Open:     Live gate of the relay; SPS/PPS in-band question; audio.
+
+## 2026-10-02 — Relay gated live; probe; MFA login skill; ADR cleanup
+Changed:  rtsp_relay.rs: read half in its own task (cancel-safety), bare RTCP
+          skipped by its length, resync on Arlo's unframed packets (the AAC
+          audio RTP, PT 0, arrives unframed on the same connection), desync
+          hex report; relay capped then probed (`user_view_probe_secs`, 60 s,
+          `UserViewProbe` signal, 5 s grace for the camera's `idle`); notice
+          kept through a relay. New skill `arlo-mfa-login` (code-read facts:
+          trusted-browser pairing in the cache file, IMAP/push/stdin paths,
+          log lines, troubleshooting). rust-core: select! lessons.
+          ADR 0005 trimmed to its rules, its dead-end table moved to 0007.
+Tests:    App 126, domain 57, infra-arlo 75, media 104 + 10 integration,
+          ops 38; gates green. Live: relay shows the app's view in VLC;
+          probe stop path proven (idle 340 ms after TEARDOWN).
+Open:     Probe resume path only unit-tested; audio relay; arlo-rs 0.2.2
+          release then drop `[patch.crates-io]`; MFA skill not yet run by
+          the owner on a fresh cache.

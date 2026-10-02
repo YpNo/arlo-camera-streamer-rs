@@ -10,10 +10,18 @@
 ## Context
 
 ADR 0005 concluded that a live view the user starts in the Arlo app
-cannot be shown on the NVR: our own WebRTC call is refused (14001) and
-every watch-along URL Arlo handed a browser identity answered 502. Its
-2026-09-29 addendum closed a third route (`startUserStream`'s call
-coordinates: `NO_ROUTE_DESTINATION`).
+cannot be shown on the NVR. Four routes were tried during an app view,
+the app's own view unaffected each time:
+
+| Route (2026-09-29) | Result |
+|---|---|
+| WebRTC with `sipInfo/v2` (our normal leg) | Refused: 14001, "RTSP Streaming in progress" |
+| `get_stream_url` watch-along DASH URL, browser identity | 502 from Arlo's load balancer, three client variants |
+| `startUserStream` (the RTSP start pyaarlo uses) | Accepted; its reply carries a watch-along DASH URL (502 again) plus `sipCallInfo` + `iceServers` |
+| WebRTC with `startUserStream`'s `sipCallInfo` | Signaling connects; the gateway answers `code 3, NO_ROUTE_DESTINATION`, empty SDP |
+
+The coordinates `startUserStream` hands out describe a call the camera
+is not in: the camera streams once, over RTSP, to the app.
 
 The owner's pyaarlo contribution (twrecked/pyaarlo#166) pointed at the
 missing piece: Arlo answers the same `get` stream query with a format

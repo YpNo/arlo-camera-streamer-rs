@@ -52,6 +52,13 @@ audit/deny, Sonar, GitGuardian. Clippy is pedantic: functions over
   deadline computation.
 - A future that callers may race or cancel must release its resources on drop (RAII
   owner created first, as `WebrtcLive::owning` does).
+- `tokio::select!` drops the losing futures. Never read a framed stream (RTSP interleaved,
+  length-prefixed records) in a `select!` arm beside timers: a tick mid-frame desyncs the
+  stream. Give the read half its own task and keep timers with the write half
+  (`rtsp_relay.rs`, 2026-10-01).
+- An arm that sleeps until a deadline must either move the deadline or change the state
+  when it fires. A past instant whose condition stays true spins the loop; under a paused
+  clock the test hangs instead of failing (`user_view_notice_expiry`, 2026-10-02).
 - Never log secrets, presigned URLs, egress tokens or PII; redact in `Debug` impls.
 
 ## Testing

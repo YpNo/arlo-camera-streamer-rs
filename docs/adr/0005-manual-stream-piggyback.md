@@ -1,14 +1,15 @@
 # ADR 0005 — User views in the Arlo app: observe, never compete
 
-- **Status:** Partly superseded by 0007 (2026-10-01): the view is now
-  relayed from the stream Arlo hands the app identity; the suppression
-  rules, the `CameraBusy` path and the notice fallback below stand
-  (revised 2026-09-28 after three live captures; the first version, a
-  piggy-backed "manual" session, was built, captured against, and removed)
-- **Date:** 2026-09-27, revised 2026-09-28, re-examined 2026-09-29
+- **Status:** Accepted for the rules below; superseded by
+  [ADR 0007](./0007-relay-the-users-app-view.md) for what the NVR shows
+  during a view (the view is relayed since 2026-10-01). Revised
+  2026-09-28 after three live captures; the first version, a
+  piggy-backed "manual" session, was built, captured against, and removed.
+- **Date:** 2026-09-27, revised 2026-09-28
 - **Deciders:** Senior architect, project owner
 - **Supersedes:** —
-- **Superseded by:** —
+- **Superseded by:** 0007 for the relay of the view; the suppression
+  rules, the `CameraBusy` path and the notice stand
 
 ## Context
 
@@ -24,23 +25,25 @@ Arlo allows:
    `sipInfo` refuses our WebRTC session with Arlo error **14001**:
    "RTSP Streaming in progress, SIP Streaming is not allowed, try after
    some time". A second leg is not possible across transports.
-3. **The app's stream cannot be joined.** The `get` query on
-   `/startStream` returns a `watchalong=true` MPEG-DASH URL during a
-   user view, but Arlo's load balancer answers **502** for it whatever
-   the client identity (plain, browser headers, browser TLS emulation,
-   fresh tokens). The same query on an idle camera hands out fresh
-   sessions and reaches the camera, so it must never be polled.
+3. **The app's stream could not be joined** with a browser identity:
+   the `get` query on `/startStream` returns a `watchalong=true`
+   MPEG-DASH URL during a user view, and Arlo's load balancer answers
+   **502** for it. The same query on an idle camera hands out fresh
+   sessions and reaches the camera, so it must never be polled. (ADR
+   0007 later found the stream behind the mobile-app identity.)
 
-The owner's decision: handling two stream sessions is not the goal. Keep
-the events, never attach for a user view, and never fail into backoff
-because of one.
+The decision then: handling two stream sessions is not the goal. Keep
+the events, never attach our own session for a user view, and never
+fail into backoff because of one. These rules still hold under 0007;
+only "the NVR shows the still" became "the NVR shows the relayed view".
 
 ## Decision
 
 - The events stay: `CameraEvent::ManualStream` (`userStreamActive`) and
   `CameraEvent::ManualStreamEnded` (`idle`). They drive an orchestrator
   flag, not the state machine.
-- **A user view never triggers an attach.**
+- **A user view never triggers a WebRTC attach of ours.** (0007 attaches
+  the view's own stream instead, which costs the camera nothing extra.)
 - **While a user view is known, a motion pulse (or an admin wake) does
   not start a session.** It is recorded as `suppressed-user-view` on the
   motion counter. A session that was already running when the user
@@ -72,8 +75,8 @@ because of one.
 
 ### Negative / costs
 
-- The NVR does not show the user's own view, and motion during it is
-  not recorded by the daemon (Arlo would refuse the session anyway).
+- Motion during a view is not a session of ours (Arlo would refuse it);
+  since 0007 the NVR shows the view itself, so nothing is lost on screen.
 - 14001 is read from the structured error code arlo-rs 0.2.1 keeps.
 
 ## Alternatives considered
@@ -82,35 +85,19 @@ because of one.
   a free, cap-only "manual" session). Refused by Arlo (14001). Removed.
 - **Join the app's view through the watch-along DASH URL.** Arlo's load
   balancer answers 502 for every client identity tried. Abandoned.
-- **Fetch the app's RTSP stream by impersonating the mobile app.** Would
-  need a capture of the app's pinned-TLS traffic; high effort, fragile.
-  Not pursued.
+- **Fetch the app's RTSP stream by impersonating the mobile app.** Judged
+  to need a capture of the app's pinned-TLS traffic. It turned out to
+  need only the app's `User-Agent` on the stream query — ADR 0007.
 - **Keep attaching and let `Failed` absorb the refusals.** Wastes an API
   call per motion pulse and hides real failures in the backoff metrics.
 
-## Re-examined 2026-09-29: the app's view cannot be relayed
+## Re-examined 2026-09-29, resolved 2026-10-01
 
-The owner asked again whether the NVR can show a live view started in the
-app when no motion session runs. Every route to that stream was tried,
-during an app view, with the app's own view unaffected each time:
-
-| Route | Result |
-|---|---|
-| WebRTC with `sipInfo/v2` (our normal leg) | Refused: 14001, "RTSP Streaming in progress" |
-| `get_stream_url` watch-along DASH URL | 502 from Arlo's load balancer, three client variants |
-| `startUserStream` (the RTSP start pyaarlo uses) | Accepted. Its reply (not the bus) carries a watch-along DASH URL, 502 again, plus `sipCallInfo` + `iceServers` |
-| WebRTC with `startUserStream`'s `sipCallInfo` | Signaling connects; the gateway answers `code 3, NO_ROUTE_DESTINATION`, empty SDP |
-
-The coordinates `startUserStream` hands out describe a call the camera
-is not in (`callId` and `conferenceId` are null): the camera streams once,
-over RTSP to the app, and Arlo exposes that stream to no client we can
-act as. Impersonating the mobile app to obtain its RTSP URL remains the
-only untried idea and stays rejected (unknown client identity, and a step
-the owner did not ask for). The decision above stands.
-
-The probes are kept, unpushed: arlo-rs branch `probe/force-start-during-view`
-(`probe_force_start_during_view`, `start_user_stream`) and streamer
-branch `probe/join-user-view` (`examples/join_user_view.rs`). They also
-found that current Arlo answers `startUserStream` in the POST reply, which
-arlo-rs's `force_start_stream` ignored (fixed on its own branch).
-
+Every route to the view's stream was tried again on 2026-09-29 and failed
+(14001, two 502s, `NO_ROUTE_DESTINATION`); the table is in ADR 0007's
+context, which also records the route that worked: the same stream query
+sent under the iOS app's `User-Agent` returns the view's RTSPS stream.
+The probes that established the dead ends stay on the unpushed branches
+`probe/force-start-during-view` (arlo-rs) and `probe/join-user-view`
+(streamer); their one by-product, `force_start_stream` ignoring the URL
+in `startUserStream`'s reply, is fixed in arlo-rs 0.2.2.

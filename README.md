@@ -174,7 +174,9 @@ arlo-camera-streamer list-devices --config /etc/arlo-streamer/streamer.toml
 
 It also warns about configured `arlo_device_id` values the account does
 not have, which is how typos show up. Logs go to stderr, the report to
-stdout.
+stdout. The factor choice, the Docker form of this command, the log lines
+that prove the pairing and what to do when a restart asks for a code again
+are in the login runbook, [`.agents/skills/arlo-mfa-login/SKILL.md`](./.agents/skills/arlo-mfa-login/SKILL.md).
 
 ### Run the daemon
 

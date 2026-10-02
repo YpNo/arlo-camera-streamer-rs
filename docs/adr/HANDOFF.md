@@ -67,7 +67,7 @@ of each event is unchanged, which is why `event_mapper.rs` still works.
 - `0002-rtsp-only-output-v1` — superseded by 0006 for HLS.
 - `0003-seamless-input-selector-splice` — accepted; production splice.
 - `0004-live-lost-feedback` — accepted; `LiveSession` handle + `LiveLost` transition.
-- `0005-manual-stream-piggyback` — accepted (revised): observe user views, never compete. Re-examined 2026-09-29: all four routes to the app's stream fail (14001, 502, 502, `NO_ROUTE_DESTINATION`); it cannot be relayed.
+- `0005-manual-stream-piggyback` — accepted for its rules (no WebRTC attach of ours during a view, motion suppressed, 14001 → `CameraBusy` without backoff, the idle-frame notice); superseded by 0007 for what the NVR shows during a view.
 - `0006-hls-output-via-loopback-segmenter` — accepted; HLS from a loopback RTSP client of each camera, no re-encode; DASH unsupported (stock dashsink writes only TS, never prunes).
 - `0007-relay-the-users-app-view` — accepted 2026-10-01; the app's view relayed from the RTSPS stream Arlo hands the iOS-app identity (`rtsp_relay.rs`, own RTSP client, TLS validation off). Needs arlo-rs `get_stream_url_as` (0.2.2; local `[patch]` meanwhile). **Validated live 2026-10-01**: VLC showed the app's view; Arlo's server sends bare RTCP and the AAC audio RTP unframed (the client resyncs); the relay keeps the camera streaming after the app closes, so it probes (`user_view_probe_secs`) and otherwise caps at `max_continuous_live`.
 
