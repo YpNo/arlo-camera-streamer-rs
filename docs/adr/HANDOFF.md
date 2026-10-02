@@ -55,7 +55,7 @@ of each event is unchanged, which is why `event_mapper.rs` still works.
 
 ### Dependencies worth knowing
 
-- `arlo-rs` **0.2.1 from crates.io** (published 2026-09-26, sibling checkout
+- `arlo-rs` **0.2.2 from crates.io** (published 2026-10-02, sibling checkout
   at `../arlo-rs`, MSRV 1.98.1, browser-less `wreq` transport). A commented
   `[patch.crates-io]` block at the end of `Cargo.toml` is the local override.
 - Toolchain **1.98.1** everywhere (`rust-toolchain.toml`, `mise.toml`, CI,
@@ -69,7 +69,7 @@ of each event is unchanged, which is why `event_mapper.rs` still works.
 - `0004-live-lost-feedback` — accepted; `LiveSession` handle + `LiveLost` transition.
 - `0005-manual-stream-piggyback` — accepted for its rules (no WebRTC attach of ours during a view, motion suppressed, 14001 → `CameraBusy` without backoff, the idle-frame notice); superseded by 0007 for what the NVR shows during a view.
 - `0006-hls-output-via-loopback-segmenter` — accepted; HLS from a loopback RTSP client of each camera, no re-encode; DASH unsupported (stock dashsink writes only TS, never prunes).
-- `0007-relay-the-users-app-view` — accepted 2026-10-01; the app's view relayed from the RTSPS stream Arlo hands the iOS-app identity (`rtsp_relay.rs`, own RTSP client, TLS validation off). Needs arlo-rs `get_stream_url_as` (0.2.2; local `[patch]` meanwhile). **Validated live 2026-10-01**: VLC showed the app's view; Arlo's server sends bare RTCP and the AAC audio RTP unframed (the client resyncs); the relay keeps the camera streaming after the app closes, so it probes (`user_view_probe_secs`) and otherwise caps at `max_continuous_live`.
+- `0007-relay-the-users-app-view` — accepted 2026-10-01; the app's view relayed from the RTSPS stream Arlo hands the iOS-app identity (`rtsp_relay.rs`, own RTSP client, TLS validation off). Needs arlo-rs `get_stream_url_as` (0.2.2, on crates.io since 2026-10-02). **Validated live 2026-10-01**: VLC showed the app's view; Arlo's server sends bare RTCP and the AAC audio RTP unframed (the client resyncs); the relay keeps the camera streaming after the app closes, so it probes (`user_view_probe_secs`) and otherwise caps at `max_continuous_live`.
 
 ---
 
@@ -154,7 +154,7 @@ per-camera `SipInfo` cache were folded into one `negotiate` call on
 | Item | Notes |
 |---|---|
 | Coverage gate | 86 % (measured 88.25 % on 2026-09-28, GStreamer files counted since the integration tests). Still excluded: `streamer-bin` and the infra-arlo network wrappers (`boot`, `events`, `stream_requester`, `thumbnails`). |
-| App-view relay | Built and **gated live 2026-10-01** (ADR 0007): VLC shows the relayed view, SPS/PPS arrive in-band (no caps work needed), the hard cap ends the relay at 300 s and the camera idles within a second of our TEARDOWN. The relay probes every `user_view_probe_secs` (60 s): release, 5 s for the camera's `idle` report, resume if none — so the camera stops within a minute of the app and a view may last longer than the cap. Gated 2026-10-02 for the stop path (release at 60 s, `idle` 340 ms later, no re-attach); the resume path (no `idle`, relay again) is unit-tested, not yet seen live. Audio not relayed yet, though Arlo pushes the AAC RTP unframed on the same connection. `[patch.crates-io]` on until arlo-rs 0.2.2. |
+| App-view relay | Built and **gated live 2026-10-01** (ADR 0007): VLC shows the relayed view, SPS/PPS arrive in-band (no caps work needed), the hard cap ends the relay at 300 s and the camera idles within a second of our TEARDOWN. The relay probes every `user_view_probe_secs` (60 s): release, 5 s for the camera's `idle` report, resume if none — so the camera stops within a minute of the app and a view may last longer than the cap. Gated 2026-10-02 for the stop path (release at 60 s, `idle` 340 ms later, no re-attach); the resume path (no `idle`, relay again) is unit-tested, not yet seen live. Audio not relayed yet, though Arlo pushes the AAC RTP unframed on the same connection. |
 | HLS / DASH | HLS wired 2026-09-28 (ADR 0006, `hls.rs`), integration-tested (live picture in a segment, retention, cleanup); not yet run on the Frigate box. DASH unsupported: parsed, warned, ignored. |
 | Integration test vs a real gateway | `tests/live_session.rs` (2026-09-28) replaces the planned recorded-session fixture: DTLS keys are per call, so a recording cannot be replayed; a local `webrtcbin` answers instead. It proves negotiation, the splice seen by a client, mid-session join, stall and setup loss. Arlo-specific quirks (TURN, SDP shape drift) still need the Frigate box. |
 | Live session vs RTSP client lifecycle | **Fixed 2026-09-28.** The pumps push into the *current* media's appsrc (slot set at `media-configure`, cleared at `unprepared`), discard while none exists, and a media built during a live session gets its switch armed. Validated live 2026-09-28: VLC disconnected and reconnected mid-session and got the live video back ("media built during a live session; live switch armed"). |

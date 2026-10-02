@@ -117,7 +117,7 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
 - **In-band SPS/PPS**: verified on 2026-10-01 — the stream repeats
   them, VLC decodes the relayed view without caps help.
 - One more arlo-rs dependency surface (`get_stream_url_as`, released as
-  0.2.2; the streamer builds against the local checkout meanwhile).
+  0.2.2 on 2026-10-02).
 
 ## Alternatives considered
 

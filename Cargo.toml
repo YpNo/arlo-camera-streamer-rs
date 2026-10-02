@@ -38,7 +38,7 @@ streamer-infra-ops   = { path = "crates/streamer-infra-ops" }
 # Pinned to the crates.io release so CI, Docker and a fresh clone resolve it
 # without a sibling checkout. To build against a local ../arlo-rs, uncomment
 # the `[patch.crates-io]` block at the end of this file (never commit it on).
-arlo-rs = "0.2.1"
+arlo-rs = "0.2.2"
 
 # ---- Async runtime ----
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }
@@ -88,8 +88,7 @@ mockall    = "0.15"
 rstest     = "0.27"
 tokio-test = "0.4"
 
-# ADR 0007 development: the user-view relay needs arlo-rs's unreleased
-# `get_stream_url_as` (branch fix/force-start-stream-reply-url). Comment the
-# block out again once arlo-rs 0.2.2 is on crates.io: CI has no sibling tree.
-[patch.crates-io]
-arlo-rs = { path = "../arlo-rs" }
+# To build against a local ../arlo-rs before a release, uncomment this block
+# (never commit it on: CI, Docker and a fresh clone have no sibling tree).
+# [patch.crates-io]
+# arlo-rs = { path = "../arlo-rs" }

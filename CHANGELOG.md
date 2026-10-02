@@ -114,6 +114,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `arlo-rs` 0.2.1: Arlo error codes stay structured (error 14001 is read
   from the code, not the message) and `mediaUploadNotification` events are
   decoded instead of logged as dropped.
+- `arlo-rs` 0.2.2: `get_stream_url_as` and the iOS-app identity the
+  app-view relay (ADR 0007) queries the stream with.
 
 ### Fixed
 - A failed attach (no RTP within 20 s, a loss during setup, a refused
