@@ -263,4 +263,4 @@ Changed:  Third audiomixer input (`live_aac_rtp_src`, rtpmp4gdepay →
           from crates.io, patch block off.
 Tests:    Media 110 unit + 11 integration (new: tone through the relay heard
           by the probe's `level`); workspace green; release built.
-Open:     Hear the relayed audio live (VLC); probe resume path live.
+Open:     — (audio heard in VLC and the probe's resume path seen live on 2026-10-02; grace cut to 2 s).
