@@ -207,7 +207,7 @@ mod tests {
     #[case("Caméra 2", "cam-ra-2")]
     #[case("back_yard", "back-yard")]
     fn stream_name_suggest_slugifies_display_names(#[case] name: &str, #[case] expected: &str) {
-        let suggested = StreamName::suggest(name, &CameraId::new("A4A1127YA1D73"));
+        let suggested = StreamName::suggest(name, &CameraId::new("A4ATEST0A1D73"));
         assert_eq!(suggested.as_str(), expected);
         assert!(StreamName::parse(suggested.as_str()).is_ok());
     }
@@ -217,7 +217,7 @@ mod tests {
     #[case("!!!", "camera-a1d73")]
     #[case("éèà", "camera-a1d73")]
     fn stream_name_suggest_falls_back_to_the_device_id(#[case] name: &str, #[case] expected: &str) {
-        let suggested = StreamName::suggest(name, &CameraId::new("A4A1127YA1D73"));
+        let suggested = StreamName::suggest(name, &CameraId::new("A4ATEST0A1D73"));
         assert_eq!(suggested.as_str(), expected);
     }
 
