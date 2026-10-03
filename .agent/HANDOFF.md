@@ -184,6 +184,9 @@ Verified in production; do not rediscover:
 
 ## 7. Parked ideas
 
+Open work is tracked in GitHub issue #3 (shipping 0.1.0, the live gates still
+owed, these ideas, loose ends). Update the issue, not only this list.
+
 1. ~~An MFA login skill~~ — done 2026-10-02 (`.agents/skills/arlo-mfa-login`).
 2. A reverse-engineering write-up: SDP shape, `sessionDisconnected` quirks,
    TURN UDP-only observation, the User-Agent-keyed stream format and the
