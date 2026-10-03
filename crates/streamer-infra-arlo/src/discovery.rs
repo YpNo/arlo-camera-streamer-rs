@@ -84,6 +84,6 @@ mod tests {
 
     #[test]
     fn streamable_of_an_account_without_cameras_is_empty() {
-        assert!(streamable(&[]).is_empty());
+        assert_eq!(streamable(&[]).len(), 0);
     }
 }

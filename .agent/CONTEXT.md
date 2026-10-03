@@ -4,7 +4,7 @@ Profile: `service` (a daemon that runs unattended next to an NVR). Full
 rigor: boundaries, failure-path tests, ADRs, CI.
 
 ## Stack
-- Rust 1.98.1 (pinned in `rust-toolchain.toml` and `mise.toml`; follows
+- Rust 1.99.0 (pinned in `rust-toolchain.toml` and `mise.toml`; follows
   `arlo-rs` 0.2.0's MSRV), edition 2024, tokio, GStreamer 1.22+ via
   gstreamer-rs 0.25, axum 0.8, prometheus 0.14.
 - Six-crate workspace, hexagonal: `streamer-domain` (ports + types),

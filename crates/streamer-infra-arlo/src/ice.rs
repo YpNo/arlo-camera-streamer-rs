@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn usable_ice_servers_empty_list_is_empty() {
-        assert!(usable_ice_servers(&servers(r#"{"data":[]}"#)).is_empty());
+        assert_eq!(usable_ice_servers(&servers(r#"{"data":[]}"#)).len(), 0);
     }
 
     #[test]

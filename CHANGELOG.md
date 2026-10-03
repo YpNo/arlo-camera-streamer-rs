@@ -236,6 +236,10 @@ First release: the daemon as validated on the owner's camera and box.
   fresh install's device id gets from the trusted-browser probe, is
   classified as an untrusted browser like 9204 rather than falling
   through as an unknown code.
+- `arlo-rs` 0.3.0 (tokio-tungstenite 0.30, base64 0.23, mailparse 0.17);
+  its MSRV moves to 1.99.0 and so do this workspace's `rust-version`,
+  the pinned toolchain, CI and the builder image. The breaking part of
+  that release (the re-exported WebSocket types) is not used here.
 
 ### Fixed
 - A failed attach (no RTP within 20 s, a loss during setup, a refused

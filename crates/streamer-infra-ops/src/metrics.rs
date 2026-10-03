@@ -373,7 +373,7 @@ mod tests {
         // fully parse, but we can sanity-check no panic and non-empty.
         let m = Metrics::new(2, "1.2.3").unwrap();
         let out = m.render().unwrap();
-        assert!(!out.is_empty());
+        assert_ne!(out, "");
         assert!(out.lines().any(|l| l.starts_with("streamer_")));
     }
 

@@ -7,7 +7,7 @@
 # stage exactly (debian:bookworm-slim ships GStreamer 1.22). The build
 # stage carries the dev headers; runtime carries only the .so files.
 # ----------------------------------------------------------------------
-FROM rust:1.98.1-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730 AS builder
+FROM rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e AS builder
 
 # System packages required to build the gstreamer-rs crates against
 # system GStreamer, plus what arlo-rs's transport needs: `wreq` links

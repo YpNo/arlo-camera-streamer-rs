@@ -255,10 +255,13 @@ mod tests {
 
     #[test]
     fn property_keys_are_sorted_and_empty_without_properties() {
-        assert!(property_keys(None).is_empty());
+        assert_eq!(property_keys(None), Vec::<&str>::new());
         let props = json!({ "zeta": 1, "alpha": "x", "mid": null });
         assert_eq!(property_keys(Some(&props)), vec!["alpha", "mid", "zeta"]);
-        assert!(property_keys(Some(&json!("not an object"))).is_empty());
+        assert_eq!(
+            property_keys(Some(&json!("not an object"))),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]

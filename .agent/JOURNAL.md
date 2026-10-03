@@ -367,3 +367,27 @@ Changed:  Domain: `CameraId::parse` + `try_from` deserialize, `InvalidCameraId`,
           arm64 deny target.
 Open:     Live gate of the TLS chain; first image build on the release.
 
+## 2026-10-03 — Review fixes, README, arlo-rs 0.2.3 → 0.3.0
+Changed:  /code-review (high) on the 19 unpushed commits → 10 findings, all
+          fixed: ICE `type` byte slice (panic on non-ASCII), `set_state(Playing)`
+          back inline (a `spawn_blocking` survived cancellation and orphaned
+          the pipeline), snapshot published after each committed transition,
+          bracketed IPv6 `Host` in `healthcheck`, HTTP/1-only listener,
+          thumbnail dir in `spawn_blocking`, claim-then-register in the
+          registry (`bring_up`) and multiplexer, one `build_snapshot` with the
+          configured `stream_name` (the admin API echoed the camera id),
+          `RelayTls::allowing_plaintext_to_loopback()` for the harness only,
+          `MountGuard` generic over `RemoveMount` + spy test (a real
+          `RtspServer` in lib tests deadlocks on GLib's default context).
+          README: quick start, `RUST_LOG` targets, `GST_DEBUG`, RTSP checks,
+          troubleshooting, uid 10001 and loopback binds in Docker.
+          arlo-rs 0.2.3 then 0.3.0 (tungstenite 0.30, MSRV 1.99.0 → toolchain,
+          CI, Dockerfile digest, clippy msrv all moved); clippy 1.99
+          `assert_is_empty` fixed; deny skips pruned.
+Notes:    arlo-rs PR #35 was squash-merged and lost its fix entry: changelog
+          and release notes repaired (PR #39); use rebase/merge-commit there.
+          HTTPS push with the gh token works for commits that touch no
+          workflow file. Root disk hit 100 % (target/debug 30 G): removed.
+Open:     Live gate of the TLS chain; first image build on the release; the
+          arlo-rs `target/` (23 G) is the user's to prune.
+

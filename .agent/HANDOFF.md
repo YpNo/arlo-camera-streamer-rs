@@ -57,10 +57,10 @@ of each event is unchanged, which is why `event_mapper.rs` still works.
 
 ### Dependencies worth knowing
 
-- `arlo-rs` **0.2.3 from crates.io** (published 2026-10-03, sibling checkout
-  at `../arlo-rs`, MSRV 1.98.1, browser-less `wreq` transport). A commented
+- `arlo-rs` **0.3.0 from crates.io** (published 2026-10-03, sibling checkout
+  at `../arlo-rs`, MSRV 1.99.0, browser-less `wreq` transport). A commented
   `[patch.crates-io]` block at the end of `Cargo.toml` is the local override.
-- Toolchain **1.98.1** everywhere (`rust-toolchain.toml`, `mise.toml`, CI,
+- Toolchain **1.99.0** everywhere (`rust-toolchain.toml`, `mise.toml`, CI,
   Dockerfile, workspace `rust-version`) — it follows arlo-rs.
 
 ### ADRs

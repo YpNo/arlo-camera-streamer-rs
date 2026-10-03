@@ -1733,7 +1733,7 @@ mod tests {
         // late report has nowhere to go and nothing else happens.
         assert!(!media.fail_live(0, LiveLossReason::EndOfStream).await);
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(media.calls().await.is_empty());
+        assert_eq!(media.calls().await, Vec::<MediaCall>::new());
         assert_eq!(sr.stop_count().await, 1);
 
         token.cancel();
@@ -2070,7 +2070,7 @@ mod tests {
         assert_eq!(sr.call_count().await, 0, "no WebRTC call for a relay");
         // A repeated view report changes nothing while relaying.
         send(&tx, manual()).await;
-        assert!(media.calls().await.is_empty());
+        assert_eq!(media.calls().await, Vec::<MediaCall>::new());
         assert_eq!(views.call_count().await, 1);
 
         send(&tx, manual_ended()).await;
@@ -2120,7 +2120,7 @@ mod tests {
 
         // The camera idles once we let go: the view's end is a no-op now.
         send(&tx, manual_ended()).await;
-        assert!(media.calls().await.is_empty());
+        assert_eq!(media.calls().await, Vec::<MediaCall>::new());
 
         token.cancel();
         handle.await.unwrap();
@@ -2310,7 +2310,7 @@ mod tests {
         send(&tx, motion()).await;
         media.calls().await;
         send(&tx, manual()).await;
-        assert!(media.calls().await.is_empty());
+        assert_eq!(media.calls().await, Vec::<MediaCall>::new());
         assert_eq!(views.call_count().await, 0);
 
         token.cancel();

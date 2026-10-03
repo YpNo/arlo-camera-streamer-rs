@@ -12,7 +12,7 @@ members  = [
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.98.1"
+rust-version = "1.99.0"
 license      = "MIT"
 repository   = "https://github.com/YpNo/arlo-camera-streamer-rs"
 
@@ -38,7 +38,7 @@ streamer-infra-ops   = { path = "crates/streamer-infra-ops" }
 # Pinned to the crates.io release so CI, Docker and a fresh clone resolve it
 # without a sibling checkout. To build against a local ../arlo-rs, uncomment
 # the `[patch.crates-io]` block at the end of this file (never commit it on).
-arlo-rs = "0.2.3"
+arlo-rs = "0.3.0"
 
 # ---- Async runtime ----
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }

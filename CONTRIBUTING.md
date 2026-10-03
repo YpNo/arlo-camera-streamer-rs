@@ -20,7 +20,7 @@ the zero-warning gates intact.
 
 ## Development workflow
 
-- Toolchain: `rust-toolchain.toml` (1.98.1, follows `arlo-rs`). `mise.toml`
+- Toolchain: `rust-toolchain.toml` (1.99.0, follows `arlo-rs`). `mise.toml`
   pins the same version plus cmake for the BoringSSL build.
 - Gates, all of which CI runs on every PR:
 
