@@ -1,4 +1,18 @@
+<p align="center">
+  <img src="docs/banner.jpeg" alt="arlo-camera-streamer — Arlo cameras on your NVR, without the battery drain" width="100%">
+</p>
+
 # arlo-camera-streamer
+
+[![Rust CI](https://github.com/YpNo/arlo-camera-streamer-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/YpNo/arlo-camera-streamer-rs/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/YpNo/arlo-camera-streamer-rs?sort=semver)](https://github.com/YpNo/arlo-camera-streamer-rs/releases/latest)
+[![Container image](https://img.shields.io/badge/ghcr.io-arlo--camera--streamer--rs-2496ED?logo=docker&logoColor=white)](https://github.com/YpNo/arlo-camera-streamer-rs/pkgs/container/arlo-camera-streamer-rs)
+[![codecov](https://codecov.io/gh/YpNo/arlo-camera-streamer-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/YpNo/arlo-camera-streamer-rs)
+[![Quality gate](https://sonarcloud.io/api/project_badges/measure?project=YpNo_arlo-camera-streamer-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=YpNo_arlo-camera-streamer-rs)
+[![MSRV](https://img.shields.io/badge/MSRV-1.99.0-blue.svg)](https://github.com/YpNo/arlo-camera-streamer-rs)
+[![GStreamer](https://img.shields.io/badge/GStreamer-1.22%2B-brightgreen.svg)](https://gstreamer.freedesktop.org/)
+[![arlo-rs](https://img.shields.io/crates/v/arlo-rs.svg?label=arlo-rs)](https://crates.io/crates/arlo-rs)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A Rust daemon that bridges battery-powered Arlo cameras to a 24/7 NVR
 (Frigate, ZoneMinder, Shinobi, Home Assistant) via RTSP — without
@@ -608,4 +622,4 @@ See [CHANGELOG.md](./CHANGELOG.md) (Keep-a-Changelog, semver).
 
 ## License
 
-MIT OR Apache-2.0 — at your option.
+MIT — see [LICENSE](./LICENSE).
