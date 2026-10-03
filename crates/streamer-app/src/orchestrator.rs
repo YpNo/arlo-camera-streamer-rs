@@ -70,10 +70,11 @@ use std::time::{Duration, Instant};
 
 use chrono::{Local, NaiveDateTime};
 use tokio::select;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, trace, warn};
 
+use streamer_domain::admin::CameraSnapshot;
 use streamer_domain::camera::CameraId;
 use streamer_domain::config::CameraConfig;
 use streamer_domain::error::DomainError;
@@ -110,6 +111,10 @@ const USER_VIEW_PROBE_GRACE: Duration = Duration::from_secs(2);
 /// an admin script alternating wake and idle would otherwise negotiate a
 /// WebRTC call every few seconds for next to no quota.
 const ADMIN_WAKE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// How long a failed update of the idle frame's user-view notice waits
+/// before it is tried again by time. Without it a past notice expiry
+/// and a media call that keeps failing ran the loop at CPU speed.
+const USER_VIEW_NOTICE_RETRY: Duration = Duration::from_secs(30);
 /// Quota charged for the activation itself (wake-up, negotiation), so
 /// short sessions still cost the battery they really cost.
 const ACTIVATION_SURCHARGE_SECS: i64 = 15;
@@ -136,6 +141,9 @@ pub struct CameraOrchestrator {
     /// notice; kept in step with [`Self::user_view_active`] by
     /// [`Self::sync_user_view_notice`].
     user_view_notice: bool,
+    /// When a failed notice update may be retried by time; `None` once an
+    /// update succeeds (or none is pending). See [`USER_VIEW_NOTICE_RETRY`].
+    notice_retry_after: Option<Instant>,
     /// What the current `Activating` / `Live` session shows (ADR 0007);
     /// `None` outside a session.
     session_source: Option<LiveSource>,
@@ -169,6 +177,10 @@ pub struct CameraOrchestrator {
     /// Inbound admin commands (e.g. force-idle, manual-wake). The
     /// admin actor in `crate::admin` enqueues here.
     admin: mpsc::Receiver<crate::admin::AdminCommand>,
+    /// The latest [`CameraSnapshot`], published after every loop
+    /// iteration so the admin layer reads it without a round-trip into
+    /// this task (which may be inside a WebRTC negotiation for seconds).
+    snapshots: watch::Sender<CameraSnapshot>,
     shutdown: CancellationToken,
 }
 
@@ -206,7 +218,20 @@ impl CameraOrchestrator {
         let now = Local::now().naive_local();
         let debouncer = MotionDebouncer::new(&config.cooldown);
         let budget = LiveBudgetTracker::new(&config.cooldown, now)?;
-        Ok(Self {
+        // Placeholder until the first `publish_snapshot` below; the
+        // watch channel needs an initial value before `self` exists.
+        let initial = CameraSnapshot {
+            id: config.arlo_device_id.clone(),
+            stream_name: config.stream_name.clone(),
+            state: String::new(),
+            live_secs_today: 0,
+            daily_budget_secs: 0,
+            live_source: None,
+            last_failure: None,
+            retries: 0,
+            user_view: false,
+        };
+        let this = Self {
             camera_id: config.arlo_device_id.clone(),
             state: CameraState::Idle,
             debouncer,
@@ -215,6 +240,7 @@ impl CameraOrchestrator {
             live: None,
             user_view_until: None,
             user_view_notice: false,
+            notice_retry_after: None,
             session_source: None,
             user_view_retry_after: None,
             relay_cap: Duration::from_secs(config.cooldown.max_continuous_live),
@@ -230,8 +256,19 @@ impl CameraOrchestrator {
             metrics,
             events,
             admin,
+            snapshots: watch::Sender::new(initial),
             shutdown,
-        })
+        };
+        this.publish_snapshot();
+        Ok(this)
+    }
+
+    /// A receiver of this camera's [`CameraSnapshot`], updated after
+    /// every loop iteration. The admin layer reads it with `borrow()`;
+    /// it never waits on the task.
+    #[must_use]
+    pub fn snapshots(&self) -> watch::Receiver<CameraSnapshot> {
+        self.snapshots.subscribe()
     }
 
     /// Convenience constructor for tests / minimal callers — wires a
@@ -268,7 +305,8 @@ impl CameraOrchestrator {
     ///
     /// On entry: registers the camera with the [`MediaMultiplexer`] so
     /// the idle pipeline is up before any motion arrives.
-    /// On exit: detaches any in-flight live source for clean shutdown.
+    /// On exit, whichever way it comes: detaches any in-flight live
+    /// source and releases the upstream session (battery rule).
     #[instrument(skip(self), fields(camera = %self.camera_id))]
     pub async fn run(mut self) {
         if let Err(e) = self.media.register(&self.camera_id).await {
@@ -286,6 +324,7 @@ impl CameraOrchestrator {
         let mut admin_open = true;
 
         loop {
+            self.publish_snapshot();
             let deadline = self.next_deadline();
             let notice_expiry = self.user_view_notice_expiry();
 
@@ -320,7 +359,11 @@ impl CameraOrchestrator {
                         }
                     }
                     None => {
+                        // The router is gone: the system is stopping (it
+                        // cancels the token on an upstream end) or it
+                        // died. Either way leave nothing streaming.
                         warn!("event channel closed; exiting");
+                        self.handle_shutdown().await;
                         return;
                     }
                 },
@@ -345,12 +388,6 @@ impl CameraOrchestrator {
     async fn handle_admin(&mut self, cmd: crate::admin::AdminCommand) {
         use crate::admin::{AdminCommand, WakeOutcome};
         match cmd {
-            AdminCommand::Snapshot { reply } => {
-                let snap = self.snapshot();
-                if reply.send(snap).is_err() {
-                    debug!("admin snapshot reply dropped");
-                }
-            }
             // Mutating commands are acknowledged *before* they are
             // applied: the HTTP layer answers 202 Accepted, and a wake
             // spends several seconds in WebRTC negotiation — longer
@@ -396,10 +433,22 @@ impl CameraOrchestrator {
         }
     }
 
-    /// Build a [`CameraSnapshot`](streamer_domain::admin::CameraSnapshot)
-    /// from the current orchestrator state.
-    fn snapshot(&self) -> streamer_domain::admin::CameraSnapshot {
-        use streamer_domain::admin::CameraSnapshot;
+    /// Publish the current [`CameraSnapshot`] to the admin layer when it
+    /// changed since the last one.
+    fn publish_snapshot(&self) {
+        let snap = self.snapshot();
+        self.snapshots.send_if_modified(|current| {
+            if *current == snap {
+                false
+            } else {
+                *current = snap;
+                true
+            }
+        });
+    }
+
+    /// Build a [`CameraSnapshot`] from the current orchestrator state.
+    fn snapshot(&self) -> CameraSnapshot {
         let state_label = match &self.state {
             CameraState::Idle => "idle",
             CameraState::Activating => "activating",
@@ -599,18 +648,28 @@ impl CameraOrchestrator {
     /// When the shown notice may stop being wanted by time alone. A relay
     /// session keeps it wanted until a transition re-syncs it, so no
     /// instant is returned then — a past instant would spin the loop.
+    ///
+    /// A failed update pushes the instant to its retry time
+    /// ([`USER_VIEW_NOTICE_RETRY`]): the hold's end alone would be in the
+    /// past and fire again at once.
     fn user_view_notice_expiry(&self) -> Option<Instant> {
         if !self.user_view_notice || self.session_source == Some(LiveSource::UserView) {
             return None;
         }
-        self.user_view_until.max(self.probe_until)
+        let expiry = self.user_view_until.max(self.probe_until);
+        match self.notice_retry_after {
+            Some(retry) => Some(expiry.map_or(retry, |e| e.max(retry))),
+            None => expiry,
+        }
     }
 
     /// Make the idle frame's notice match the user-view flag. Best-effort:
-    /// a failure is logged and retried at the next change.
+    /// a failure is logged and retried at the next change or after
+    /// [`USER_VIEW_NOTICE_RETRY`], whichever comes first.
     async fn sync_user_view_notice(&mut self) {
         let wanted = self.user_view_active();
         if wanted == self.user_view_notice {
+            self.notice_retry_after = None;
             return;
         }
         match self
@@ -618,8 +677,19 @@ impl CameraOrchestrator {
             .set_user_view_notice(&self.camera_id, wanted)
             .await
         {
-            Ok(()) => self.user_view_notice = wanted,
-            Err(e) => warn!(error = %e, shown = wanted, "user-view notice not updated"),
+            Ok(()) => {
+                self.user_view_notice = wanted;
+                self.notice_retry_after = None;
+            }
+            Err(e) => {
+                self.notice_retry_after = Some(now() + USER_VIEW_NOTICE_RETRY);
+                warn!(
+                    error = %e,
+                    shown = wanted,
+                    retry_in_secs = USER_VIEW_NOTICE_RETRY.as_secs(),
+                    "user-view notice not updated"
+                );
+            }
         }
     }
 
@@ -1230,6 +1300,8 @@ mod tests {
         retain_notifiers: std::sync::atomic::AtomicBool,
         /// `set_user_view_notice` calls, in order.
         notices: Mutex<Vec<bool>>,
+        /// When `true`, `set_user_view_notice` records the call and fails.
+        fail_notices: std::sync::atomic::AtomicBool,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1300,6 +1372,11 @@ mod tests {
         async fn notices(&self) -> Vec<bool> {
             self.notices.lock().await.clone()
         }
+        /// Make every `set_user_view_notice` call fail (or succeed again).
+        fn fail_notices(&self, fail: bool) {
+            self.fail_notices
+                .store(fail, std::sync::atomic::Ordering::Relaxed);
+        }
         /// Report the `idx`-th session (0-based, in attach order) lost.
         /// Returns what the notifier returned (`false` = unobservable).
         async fn fail_live(&self, idx: usize, reason: LiveLossReason) -> bool {
@@ -1357,6 +1434,11 @@ mod tests {
             shown: bool,
         ) -> Result<(), DomainError> {
             self.notices.lock().await.push(shown);
+            if self.fail_notices.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(DomainError::AdapterTransport(
+                    "notice overlay unavailable".to_string(),
+                ));
+            }
             Ok(())
         }
         async fn attach_user_view(
@@ -2341,25 +2423,24 @@ mod tests {
             token.clone(),
         )
         .unwrap();
+        let snapshots = orch.snapshots();
         let handle = tokio::spawn(orch.run());
+        drop(admin_tx);
 
-        let snap = |admin_tx: mpsc::Sender<crate::admin::AdminCommand>| async move {
-            let (reply, rx) = tokio::sync::oneshot::channel();
-            admin_tx
-                .send(crate::admin::AdminCommand::Snapshot { reply })
-                .await
-                .unwrap();
-            rx.await.unwrap()
-        };
+        // The snapshot is published, not requested: let the task run
+        // between reads.
+        let snap = |snapshots: &watch::Receiver<CameraSnapshot>| snapshots.borrow().clone();
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!snap(admin_tx.clone()).await.user_view);
+        assert!(!snap(&snapshots).user_view);
         send(&tx, manual()).await;
-        let viewed = snap(admin_tx.clone()).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let viewed = snap(&snapshots);
         assert!(viewed.user_view);
         assert_eq!(viewed.state, "live", "the view is relayed");
         assert_eq!(viewed.live_source.as_deref(), Some("user-view"));
         send(&tx, manual_ended()).await;
-        let after = snap(admin_tx).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let after = snap(&snapshots);
         assert!(!after.user_view);
         assert_eq!(after.state, "idle");
         assert_eq!(after.live_source, None);
@@ -2469,6 +2550,86 @@ mod tests {
         let calls = media.calls().await;
         // Register on entry, no live work, no detach (we were idle).
         assert_eq!(calls, vec![MediaCall::Register]);
+    }
+
+    /// The router dropping the mailbox (the system stopping, or dying)
+    /// must leave nothing streaming: same exit as a cancellation.
+    #[tokio::test(start_paused = true)]
+    async fn event_channel_closing_while_live_releases_the_session() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, _token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sr.call_count().await, 1, "precondition: live");
+
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("the task exits when its mailbox closes")
+            .unwrap();
+
+        let calls = media.calls().await;
+        assert!(calls.contains(&MediaCall::DetachLive), "{calls:?}");
+        assert_eq!(sr.stop_count().await, 1, "upstream session released");
+    }
+
+    /// A notice update that keeps failing once the hold has run out used
+    /// to re-fire the expiry arm at CPU speed: the arm now waits
+    /// `USER_VIEW_NOTICE_RETRY` between attempts and stops once one
+    /// succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn notice_update_failure_is_retried_after_a_pause_not_spun() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        // No relay: the view is only a time-bound hold, so the notice is
+        // cleared by time alone once the hold runs out.
+        let views = StubUserViews::with_responses(vec![Err(DomainError::AdapterTransport(
+            "no watch-along".to_string(),
+        ))]);
+        let (orch, tx, token) = build_with_views(&cfg, sr, media.clone(), views);
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            media.notices().await,
+            vec![true],
+            "notice shown for the view"
+        );
+
+        media.fail_notices(true);
+        tokio::time::sleep(USER_VIEW_HOLD + Duration::from_secs(1)).await;
+        assert_eq!(
+            media.notices().await,
+            vec![true, false],
+            "one failed attempt at the hold's end, not a spin"
+        );
+        tokio::time::sleep(USER_VIEW_NOTICE_RETRY.saturating_sub(Duration::from_secs(2))).await;
+        assert_eq!(
+            media.notices().await.len(),
+            2,
+            "no attempt before the retry time"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            media.notices().await.len(),
+            3,
+            "retried once after the pause"
+        );
+
+        media.fail_notices(false);
+        tokio::time::sleep(USER_VIEW_NOTICE_RETRY).await;
+        assert_eq!(media.notices().await.len(), 4, "the retry succeeded");
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(media.notices().await.len(), 4, "nothing more to do");
+
+        token.cancel();
+        handle.await.unwrap();
     }
 
     // ---------- Backoff timing ----------

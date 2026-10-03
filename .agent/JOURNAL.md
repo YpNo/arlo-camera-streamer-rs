@@ -332,3 +332,20 @@ Changed:  Relay: hex-only AAC `config`, typed caps builder, distinct/disjoint
           images and frontend pinned by digest (Renovate maintains them).
 Tests:    Media 119 + 13; workspace green; actionlint clean; release built.
 Open:     Sweep items 7–9.
+
+## 2026-10-03 — Security sweep items 7 and 8
+Changed:  Thumbnails: `thumbnails::http_client` (https only, 10 s/5 s timeouts,
+          2 redirects), body capped at 2 MiB chunk by chunk, JPEG magic check,
+          device-list URL through the shared `is_https_with_host`; files in
+          `<session cache dir>/thumbnails` (0700, `prepare_thumbnail_dir`),
+          `create_new` temp + rename. Supervision: router cancels the shared
+          token on an upstream end, orchestrator runs `handle_shutdown` on a
+          closed mailbox, `supervised()` wraps every task (panic/early exit →
+          cancel), main exits non-zero when the system stopped itself.
+          Admin snapshots on a `watch` channel (no `AdminCommand::Snapshot`,
+          no `unresponsive` stub). Notice update failure retried every 30 s.
+          401s logged with the route; session id logged as a 4-char tail.
+Tests:    New: thumbnails fetch (loopback server), supervised ×3, ended bus,
+          router cancel, channel-close release, notice retry, snapshot watch.
+Open:     Sweep item 9 (hygiene batch); live gate of the TLS chain.
+

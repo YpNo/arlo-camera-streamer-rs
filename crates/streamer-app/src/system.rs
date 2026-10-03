@@ -11,6 +11,14 @@
 //! shutdown propagates atomically. [`StreamerSystem::shutdown`] cancels
 //! the token and awaits every spawned handle.
 //!
+//! # Supervision
+//!
+//! Every task runs under a supervisor: one that panics, or ends while
+//! the token is not cancelled, cancels the token. The composition root
+//! waits on that token next to the signal handler, so the daemon stops
+//! as a whole (and exits non-zero) instead of running without a camera
+//! or without the event bus while `/readyz` keeps answering.
+//!
 //! # Channel sizing
 //!
 //! Each per-camera mailbox is sized at [`MAILBOX_CAPACITY`]. Motion
@@ -21,13 +29,16 @@
 #![allow(clippy::similar_names)]
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use futures::FutureExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use streamer_domain::config::StreamerConfig;
 use streamer_domain::error::DomainError;
@@ -104,13 +115,6 @@ impl StreamerSystem {
                     camera_cfg.arlo_device_id
                 )));
             }
-            admin_routes.insert(
-                camera_cfg.arlo_device_id.clone(),
-                AdminRoute {
-                    sender: admin_tx,
-                    stream_name: camera_cfg.stream_name.clone(),
-                },
-            );
             let orch = CameraOrchestrator::new(
                 camera_cfg,
                 signaler.clone(),
@@ -122,12 +126,31 @@ impl StreamerSystem {
                 admin_rx,
                 shutdown.child_token(),
             )?;
-            handles.push(tokio::spawn(orch.run()));
+            admin_routes.insert(
+                camera_cfg.arlo_device_id.clone(),
+                AdminRoute {
+                    sender: admin_tx,
+                    snapshots: orch.snapshots(),
+                },
+            );
+            handles.push(tokio::spawn(supervised(
+                "orchestrator",
+                camera_cfg.arlo_device_id.to_string(),
+                orch.run(),
+                shutdown.clone(),
+            )));
         }
 
         let events = event_source.subscribe().await?;
         let router = EventRouter::new(event_routes);
-        handles.push(tokio::spawn(router.run(events, shutdown.child_token())));
+        // The router gets the shared token itself: an upstream end must
+        // cancel the orchestrators too, which a child token cannot.
+        handles.push(tokio::spawn(supervised(
+            "router",
+            "event-bus".to_string(),
+            router.run(events, shutdown.clone()),
+            shutdown.clone(),
+        )));
 
         let arlo_connected = Arc::new(AtomicBool::new(false));
         let admin = AdminControlActor::new(admin_routes, version, arlo_connected.clone());
@@ -203,6 +226,27 @@ impl StreamerSystem {
     }
 }
 
+/// Run one actor task and make its end visible. A task that stops while
+/// the system is still meant to run — a panic, or an exit the actor did
+/// not expect — cancels the shared token so the daemon stops as a whole
+/// instead of running without that actor. An exit after the token was
+/// cancelled is the normal shutdown and stays quiet.
+async fn supervised<F>(task: &'static str, name: String, fut: F, shutdown: CancellationToken)
+where
+    F: Future<Output = ()>,
+{
+    let outcome = AssertUnwindSafe(fut).catch_unwind().await;
+    if shutdown.is_cancelled() {
+        return;
+    }
+    if outcome.is_ok() {
+        warn!(task, %name, "task ended while the system is running; stopping the system");
+    } else {
+        error!(task, %name, "task panicked; stopping the system");
+    }
+    shutdown.cancel();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,10 +262,25 @@ mod tests {
     use streamer_domain::event::ConnectionStatus;
     use streamer_domain::stream::SignalingAnswer;
 
-    // Minimal stub adapters for spawn-time wiring tests.
+    // Minimal stub adapters for spawn-time wiring tests. The bus stays
+    // open (pending): an ended bus stops the system, see `EndingEventSource`.
     struct StubEventSource;
     #[async_trait]
     impl ArloEventSource for StubEventSource {
+        async fn subscribe(&self) -> Result<BoxStream<'static, CameraEvent>, DomainError> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+        async fn connection_status(
+            &self,
+        ) -> Result<BoxStream<'static, ConnectionStatus>, DomainError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    /// A bus that ends right away, as a dropped upstream connection does.
+    struct EndingEventSource;
+    #[async_trait]
+    impl ArloEventSource for EndingEventSource {
         async fn subscribe(&self) -> Result<BoxStream<'static, CameraEvent>, DomainError> {
             Ok(Box::pin(futures::stream::empty()))
         }
@@ -416,10 +475,64 @@ mod tests {
 
         // Cancellation token is shared with internal tasks.
         let token = system.cancellation_token();
-        assert!(!token.is_cancelled());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!token.is_cancelled(), "a running system stays up");
 
         tokio::time::timeout(std::time::Duration::from_secs(2), system.shutdown())
             .await
             .expect("shutdown timed out");
+    }
+
+    #[tokio::test]
+    async fn an_ended_event_bus_stops_the_whole_system() {
+        let cfg = one_camera_config();
+        let system = StreamerSystem::spawn_no_metrics(
+            &cfg,
+            Arc::new(EndingEventSource),
+            Arc::new(StubSignaler),
+            Arc::new(StubThumbnails),
+            Arc::new(StubMedia::default()),
+            Arc::new(StubUserViews),
+        )
+        .await
+        .expect("spawn ok");
+
+        let token = system.cancellation_token();
+        tokio::time::timeout(std::time::Duration::from_secs(2), token.cancelled())
+            .await
+            .expect("the system cancels itself when the bus ends");
+        tokio::time::timeout(std::time::Duration::from_secs(2), system.shutdown())
+            .await
+            .expect("shutdown drains");
+    }
+
+    #[tokio::test]
+    async fn supervised_cancels_the_token_when_the_task_panics() {
+        let token = CancellationToken::new();
+        supervised(
+            "test",
+            "panicking".to_string(),
+            async { panic!("simulated actor bug") },
+            token.clone(),
+        )
+        .await;
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn supervised_cancels_the_token_when_the_task_ends_early() {
+        let token = CancellationToken::new();
+        supervised("test", "quitting".to_string(), async {}, token.clone()).await;
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn supervised_leaves_a_cancelled_token_alone_on_a_normal_exit() {
+        let token = CancellationToken::new();
+        let inner = token.clone();
+        let task = async move { inner.cancelled().await };
+        token.cancel();
+        supervised("test", "draining".to_string(), task, token.clone()).await;
+        assert!(token.is_cancelled());
     }
 }

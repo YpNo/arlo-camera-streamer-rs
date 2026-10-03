@@ -96,7 +96,11 @@ impl WebrtcSignaler for ArloWebrtcSignalerAdapter {
             .lock()
             .await
             .insert(camera.as_str().to_string(), socket);
-        debug!(%camera, session = %answer.session_id, "WebRTC signaling negotiated");
+        debug!(
+            %camera,
+            session_tail = %id_tail(&answer.session_id),
+            "WebRTC signaling negotiated"
+        );
         Ok(SignalingAnswer {
             answer_sdp: answer.answer_sdp,
             session_id: answer.session_id,
@@ -107,5 +111,25 @@ impl WebrtcSignaler for ArloWebrtcSignalerAdapter {
         self.take_and_disconnect(camera.as_str()).await;
         debug!(%camera, "WebRTC signaling session torn down");
         Ok(())
+    }
+}
+
+/// The last four characters of a session id: enough to correlate log
+/// lines, not enough to reuse the handle. Shorter ids are returned whole.
+fn id_tail(id: &str) -> &str {
+    let cut = id.char_indices().rev().nth(3).map_or(0, |(i, _)| i);
+    &id[cut..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::id_tail;
+
+    #[test]
+    fn id_tail_keeps_four_characters_or_the_whole_short_id() {
+        assert_eq!(id_tail("abcdef1234"), "1234");
+        assert_eq!(id_tail("abc"), "abc");
+        assert_eq!(id_tail(""), "");
+        assert_eq!(id_tail("héllo"), "éllo");
     }
 }

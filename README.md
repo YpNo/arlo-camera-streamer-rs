@@ -208,6 +208,11 @@ arlo-camera-streamer --config /etc/arlo-streamer/streamer.toml
 `run` is the default subcommand, so `arlo-camera-streamer run --config …`
 is equivalent.
 
+The process exits `0` on Ctrl-C / SIGTERM. It exits non-zero when it stops
+on its own — the Arlo event bus ended, or a camera task ended or panicked —
+after releasing every live session; run it under a restart policy
+(`restart: on-failure` in Compose, `Restart=on-failure` in systemd).
+
 ### Docker run
 
 ```bash
@@ -258,7 +263,7 @@ Stream URL pattern: `rtsp://<host>:<rtsp.bind>/<cameras.stream_name>`.
 | `GET /metrics` (port 9090)            | None     | Prometheus exposition.                 |
 | `GET /healthz` (port 9090)            | None     | Liveness — `200 OK` while running.     |
 | `GET /readyz`  (port 9090)            | None     | Ready iff started **and** Arlo bus connected. |
-| `GET /admin/state` (port 9091)        | Bearer   | System snapshot (JSON).                |
+| `GET /admin/state` (port 9091)        | Bearer   | System snapshot (JSON); per-camera state as the camera task last published it, so a camera mid-negotiation still answers (`activating`). |
 | `GET /admin/cameras/{id}` (port 9091) | Bearer   | Per-camera snapshot.                   |
 | `POST /admin/cameras/{id}/wake` (port 9091) | Bearer | Inject a synthetic motion event; `429` within 30 s of the previous session's end. Each activation also costs 15 s of the daily budget. |
 | `POST /admin/cameras/{id}/idle` (port 9091) | Bearer | Force the camera back to `Idle`. |
@@ -388,7 +393,8 @@ Releasing is therefore: bump `version` in `Cargo.toml`, move the
 - Secrets are read from env vars at boot (`fail fast` on missing).
 - The `/admin/*` surface refuses to start without a non-empty
   `STREAMER_ADMIN_TOKEN`. Rotate it by rotating the env var and
-  restarting.
+  restarting. Rejected requests are logged with their route, never the
+  presented token.
 - Thumbnails are fetched over `https` only, with timeouts, a redirect
   limit, a 2 MiB cap and a JPEG magic check, and written owner-only
   beside the session cache. Presigned URLs, session ids and tokens are

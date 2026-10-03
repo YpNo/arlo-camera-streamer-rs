@@ -145,7 +145,11 @@ fn check_auth(headers: &HeaderMap, expected: &str) -> Option<()> {
     }
 }
 
-fn unauthorized() -> Response {
+/// The 401 answer. The route template is logged (never the presented
+/// token or the caller-chosen path parameters) so a scan or a stale
+/// token shows up in the log.
+fn unauthorized(route: &'static str) -> Response {
+    warn!(route, "admin: rejected unauthenticated request");
     let mut resp = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     resp.headers_mut()
         .insert(header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
@@ -194,7 +198,7 @@ fn json_response<T: serde::Serialize>(value: &T) -> Response {
 
 async fn handle_state(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if check_auth(&headers, &state.token).is_none() {
-        return unauthorized();
+        return unauthorized("GET /admin/state");
     }
     debug!("GET /admin/state");
     match state.admin.snapshot().await {
@@ -209,7 +213,7 @@ async fn handle_camera_state(
     headers: HeaderMap,
 ) -> Response {
     if check_auth(&headers, &state.token).is_none() {
-        return unauthorized();
+        return unauthorized("GET /admin/cameras/{id}");
     }
     debug!(camera = %id, "GET /admin/cameras/{id}");
     match state.admin.camera_snapshot(&CameraId::new(id)).await {
@@ -224,7 +228,7 @@ async fn handle_wake(
     headers: HeaderMap,
 ) -> Response {
     if check_auth(&headers, &state.token).is_none() {
-        return unauthorized();
+        return unauthorized("POST /admin/cameras/{id}/wake");
     }
     info!(camera = %id, "POST /admin/cameras/{id}/wake");
     match state.admin.manual_wake(&CameraId::new(id)).await {
@@ -239,7 +243,7 @@ async fn handle_idle(
     headers: HeaderMap,
 ) -> Response {
     if check_auth(&headers, &state.token).is_none() {
-        return unauthorized();
+        return unauthorized("POST /admin/cameras/{id}/idle");
     }
     info!(camera = %id, "POST /admin/cameras/{id}/idle");
     match state.admin.force_idle(&CameraId::new(id)).await {

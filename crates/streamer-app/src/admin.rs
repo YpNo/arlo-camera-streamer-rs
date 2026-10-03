@@ -3,21 +3,23 @@
 //! [`AdminControl`]: streamer_domain::port::AdminControl
 //!
 //! Each per-camera [`CameraOrchestrator`](crate::orchestrator::CameraOrchestrator)
-//! task owns an inbound admin mailbox of [`AdminCommand`]s. The
-//! [`AdminControlActor`] holds the sender side and a snapshot of the
-//! configured cameras so it can reject unknown ids fast (without
-//! touching the actor task).
+//! task owns an inbound admin mailbox of [`AdminCommand`]s and publishes
+//! its [`CameraSnapshot`] on a [`tokio::sync::watch`] channel. The
+//! [`AdminControlActor`] holds the sender side and the snapshot receiver
+//! of every configured camera, so it rejects unknown ids fast and reads
+//! state without touching the actor task.
 //!
-//! ## Reply protocol
+//! ## Snapshots and the reply protocol
 //!
-//! Each command carries a [`tokio::sync::oneshot::Sender`]. `Snapshot`
-//! is fulfilled with the data; the mutating commands (`ForceIdle`,
-//! `ManualWake`) are acknowledged as soon as the orchestrator dequeues
-//! them and are applied right after — a wake spends seconds in WebRTC
-//! negotiation, and the HTTP contract is 202 Accepted, not "done". The
-//! actor wraps the wait in a per-call timeout so a stuck orchestrator
-//! surfaces as [`AdminError::Unavailable`] rather than blocking the
-//! HTTP handler.
+//! Snapshots are **read**, never requested: the orchestrator publishes
+//! one after every loop iteration, and a camera inside a WebRTC
+//! negotiation (seconds) still reports `activating` instantly instead of
+//! timing out. The mutating commands (`ForceIdle`, `ManualWake`) carry a
+//! [`tokio::sync::oneshot::Sender`] and are acknowledged as soon as the
+//! orchestrator dequeues them, then applied — the HTTP contract is 202
+//! Accepted, not "done". The actor wraps that wait in a per-call timeout
+//! so a stuck orchestrator surfaces as [`AdminError::Unavailable`]
+//! rather than blocking the HTTP handler.
 //!
 //! ## Why an mpsc actor instead of `Arc<RwLock<…>>`?
 //!
@@ -32,12 +34,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
-use tracing::warn;
 
 use streamer_domain::admin::{AdminError, CameraSnapshot, SystemSnapshot};
-use streamer_domain::camera::{CameraId, StreamName};
+use streamer_domain::camera::CameraId;
 use streamer_domain::port::AdminControl;
 
 use crate::system::MAILBOX_CAPACITY;
@@ -63,11 +64,6 @@ pub enum WakeOutcome {
 /// orchestrator over its inbound admin mailbox.
 #[derive(Debug)]
 pub enum AdminCommand {
-    /// Reply with a [`CameraSnapshot`] describing the current state.
-    Snapshot {
-        /// One-shot reply channel.
-        reply: oneshot::Sender<CameraSnapshot>,
-    },
     /// Drop any live session and return to `Idle`. Idempotent.
     ForceIdle {
         /// One-shot acknowledgement channel.
@@ -81,11 +77,12 @@ pub enum AdminCommand {
     },
 }
 
-/// Routing entry: the admin sender and the configured stream name.
+/// Routing entry: the admin sender and the orchestrator's published
+/// snapshot (which carries the stream name).
 #[derive(Debug, Clone)]
 pub(crate) struct AdminRoute {
     pub(crate) sender: mpsc::Sender<AdminCommand>,
-    pub(crate) stream_name: StreamName,
+    pub(crate) snapshots: watch::Receiver<CameraSnapshot>,
 }
 
 /// Application-layer implementation of [`AdminControl`].
@@ -155,20 +152,11 @@ pub const ADMIN_MAILBOX_CAPACITY: usize = MAILBOX_CAPACITY;
 #[async_trait]
 impl AdminControl for AdminControlActor {
     async fn snapshot(&self) -> Result<SystemSnapshot, AdminError> {
-        let mut cameras = Vec::with_capacity(self.routes.len());
-        for id in self.routes.keys() {
-            // `camera_snapshot` already times out per call.
-            match self.camera_snapshot(id).await {
-                Ok(c) => cameras.push(c),
-                Err(AdminError::Unavailable(reason)) => {
-                    warn!(camera = %id, %reason, "admin snapshot: orchestrator unresponsive");
-                    // Don't fail the whole snapshot for one slow camera —
-                    // emit a synthetic stub instead.
-                    cameras.push(stub_snapshot(id, &self.routes[id].stream_name));
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let mut cameras: Vec<CameraSnapshot> = self
+            .routes
+            .values()
+            .map(|route| route.snapshots.borrow().clone())
+            .collect();
         cameras.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
         Ok(SystemSnapshot {
             version: self.version.to_string(),
@@ -182,13 +170,7 @@ impl AdminControl for AdminControlActor {
 
     async fn camera_snapshot(&self, camera: &CameraId) -> Result<CameraSnapshot, AdminError> {
         let route = self.route(camera)?;
-        let (tx, rx) = oneshot::channel();
-        self.send(route, AdminCommand::Snapshot { reply: tx })
-            .await?;
-        timeout(ADMIN_REPLY_TIMEOUT, rx)
-            .await
-            .map_err(|_| AdminError::Unavailable("snapshot timeout".to_string()))?
-            .map_err(|_| AdminError::Unavailable("orchestrator dropped reply".to_string()))
+        Ok(route.snapshots.borrow().clone())
     }
 
     async fn force_idle(&self, camera: &CameraId) -> Result<(), AdminError> {
@@ -221,23 +203,10 @@ impl AdminControl for AdminControlActor {
     }
 }
 
-fn stub_snapshot(id: &CameraId, stream_name: &StreamName) -> CameraSnapshot {
-    CameraSnapshot {
-        id: id.clone(),
-        stream_name: stream_name.clone(),
-        state: "unresponsive".to_string(),
-        live_secs_today: 0,
-        daily_budget_secs: 0,
-        live_source: None,
-        last_failure: Some("orchestrator did not reply".to_string()),
-        retries: 0,
-        user_view: false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use streamer_domain::camera::StreamName;
 
     fn cam(id: &str) -> CameraId {
         CameraId::new(id)
@@ -245,6 +214,34 @@ mod tests {
 
     fn name(s: &str) -> StreamName {
         StreamName::parse(s).unwrap()
+    }
+
+    fn snapshot_of(id: &str, state: &str) -> CameraSnapshot {
+        CameraSnapshot {
+            id: cam(id),
+            stream_name: name("front"),
+            state: state.to_string(),
+            live_secs_today: 0,
+            daily_budget_secs: 0,
+            live_source: None,
+            last_failure: None,
+            retries: 0,
+            user_view: false,
+        }
+    }
+
+    /// A route whose orchestrator is silent: the admin mailbox is never
+    /// read, the snapshot is whatever was last published.
+    fn silent_route(id: &str, state: &str) -> (AdminRoute, mpsc::Receiver<AdminCommand>) {
+        let (tx, rx) = mpsc::channel::<AdminCommand>(8);
+        let (_snap_tx, snapshots) = watch::channel(snapshot_of(id, state));
+        (
+            AdminRoute {
+                sender: tx,
+                snapshots,
+            },
+            rx,
+        )
     }
 
     #[tokio::test]
@@ -259,35 +256,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_includes_known_camera() {
-        let (tx, mut rx) = mpsc::channel::<AdminCommand>(8);
-        // Reply on the next received command.
-        tokio::spawn(async move {
-            while let Some(cmd) = rx.recv().await {
-                if let AdminCommand::Snapshot { reply } = cmd {
-                    let _ = reply.send(CameraSnapshot {
-                        id: cam("CAM"),
-                        stream_name: name("front"),
-                        state: "idle".to_string(),
-                        live_secs_today: 0,
-                        daily_budget_secs: 0,
-                        live_source: None,
-                        last_failure: None,
-                        retries: 0,
-                        user_view: false,
-                    });
-                }
-            }
-        });
-
+    async fn snapshot_includes_known_cameras_sorted_by_id() {
+        let (route_b, _rx_b) = silent_route("CAM-B", "idle");
+        let (route_a, _rx_a) = silent_route("CAM-A", "activating");
         let mut routes = HashMap::new();
-        routes.insert(
-            cam("CAM"),
-            AdminRoute {
-                sender: tx,
-                stream_name: name("front"),
-            },
-        );
+        routes.insert(cam("CAM-B"), route_b);
+        routes.insert(cam("CAM-A"), route_a);
         let actor = AdminControlActor::new(
             routes,
             "0.1.0",
@@ -297,22 +271,18 @@ mod tests {
         let sys = actor.snapshot().await.expect("snapshot ok");
         assert_eq!(sys.version, "0.1.0");
         assert!(sys.arlo_connected);
-        assert_eq!(sys.cameras.len(), 1);
-        assert_eq!(sys.cameras[0].id.as_str(), "CAM");
+        let ids: Vec<&str> = sys.cameras.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["CAM-A", "CAM-B"]);
+        assert_eq!(sys.cameras[0].state, "activating");
     }
 
+    /// A camera deep inside a WebRTC negotiation cannot answer a mailbox
+    /// command for seconds; its published snapshot is read at once.
     #[tokio::test]
-    async fn camera_snapshot_times_out_when_orchestrator_silent() {
-        // We open a channel but never reply.
-        let (tx, _rx) = mpsc::channel::<AdminCommand>(8);
+    async fn camera_snapshot_reads_the_published_state_without_waiting_on_the_task() {
+        let (route, _rx) = silent_route("CAM", "activating");
         let mut routes = HashMap::new();
-        routes.insert(
-            cam("CAM"),
-            AdminRoute {
-                sender: tx,
-                stream_name: name("front"),
-            },
-        );
+        routes.insert(cam("CAM"), route);
         let actor = AdminControlActor::new(
             routes,
             "0.1.0",
@@ -320,16 +290,38 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        let err = tokio::time::timeout(
-            ADMIN_REPLY_TIMEOUT + Duration::from_secs(1),
-            actor.camera_snapshot(&cam("CAM")),
-        )
-        .await
-        .expect("call returned within outer timeout")
-        .expect_err("inner call must time out");
-        assert!(matches!(err, AdminError::Unavailable(_)));
-        // Sanity: we waited roughly ADMIN_REPLY_TIMEOUT, not forever.
-        assert!(started.elapsed() < ADMIN_REPLY_TIMEOUT + Duration::from_secs(1));
+        let snap = actor.camera_snapshot(&cam("CAM")).await.expect("published");
+        assert_eq!(snap.state, "activating");
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn camera_snapshot_follows_the_orchestrator_updates() {
+        let (tx, _rx) = mpsc::channel::<AdminCommand>(8);
+        let (snap_tx, snapshots) = watch::channel(snapshot_of("CAM", "idle"));
+        let mut routes = HashMap::new();
+        routes.insert(
+            cam("CAM"),
+            AdminRoute {
+                sender: tx,
+                snapshots,
+            },
+        );
+        let actor = AdminControlActor::new(
+            routes,
+            "0.1.0",
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        assert_eq!(
+            actor.camera_snapshot(&cam("CAM")).await.unwrap().state,
+            "idle"
+        );
+        snap_tx.send_replace(snapshot_of("CAM", "live"));
+        assert_eq!(
+            actor.camera_snapshot(&cam("CAM")).await.unwrap().state,
+            "live"
+        );
     }
 
     #[tokio::test]
@@ -345,7 +337,7 @@ mod tests {
             cam("CAM"),
             AdminRoute {
                 sender: tx,
-                stream_name: name("front"),
+                snapshots: watch::channel(snapshot_of("CAM", "idle")).1,
             },
         );
         let actor = AdminControlActor::new(
@@ -369,7 +361,7 @@ mod tests {
             cam("CAM"),
             AdminRoute {
                 sender: tx,
-                stream_name: name("front"),
+                snapshots: watch::channel(snapshot_of("CAM", "idle")).1,
             },
         );
         let actor = AdminControlActor::new(
@@ -405,8 +397,8 @@ mod tests {
         routes.insert(
             CameraId::new("CAM"),
             AdminRoute {
-                stream_name: StreamName::parse("cam").unwrap(),
                 sender: tx,
+                snapshots: watch::channel(snapshot_of("CAM", "idle")).1,
             },
         );
         let actor = AdminControlActor::new(

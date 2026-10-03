@@ -255,14 +255,20 @@ async fn run(config: StreamerConfig) -> Result<()> {
     info!("daemon ready; waiting for shutdown signal");
 
     // -- Wait for shutdown --
-    tokio::select! {
+    //
+    // The system cancels its own token when an actor dies or the event
+    // bus ends (see `streamer_app::system`); that is a failure, reported
+    // as a non-zero exit after the drain so a restart policy kicks in.
+    let requested = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             warn!("Ctrl-C received; initiating graceful shutdown");
+            true
         }
         () = shutdown.cancelled() => {
-            warn!("system cancellation triggered shutdown");
+            warn!("the streamer system stopped on its own; initiating shutdown");
+            false
         }
-    }
+    };
 
     // -- Drain --
     //
@@ -297,6 +303,11 @@ async fn run(config: StreamerConfig) -> Result<()> {
     rtsp_server.stop();
     drop(rtsp_server);
 
+    if !requested {
+        anyhow::bail!(
+            "the streamer system stopped on its own (an actor ended or the event bus closed); see the log"
+        );
+    }
     info!("graceful shutdown complete");
     Ok(())
 }

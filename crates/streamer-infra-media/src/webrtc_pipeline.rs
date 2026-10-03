@@ -265,7 +265,7 @@ impl WebrtcLive {
             .await
             .map_err(MediaError::Signaling)?;
         apply_answer(&webrtcbin, &answer)?;
-        info!(%camera, session = %answer.session_id, "answer applied; awaiting first RTP");
+        info!(%camera, "answer applied; awaiting first RTP");
 
         // Keyframe pump: periodic force-key-unit sent *upstream* into
         // the appsink sink pad (webrtcbin/rtpbin turns it into RTCP

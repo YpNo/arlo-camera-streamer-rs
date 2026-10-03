@@ -35,6 +35,8 @@ First release: the daemon as validated on the owner's camera and box.
   session cache (created owner-only at boot) instead of the shared
   system temp directory, through a freshly created temp file; another
   user on the host can no longer plant or block them.
+- A rejected `/admin/*` request is logged (route only, never the token);
+  the WebRTC session id is no longer logged in full.
 
 ### Changed
 - The configuration is validated at boot: unknown keys are errors
@@ -57,6 +59,17 @@ First release: the daemon as validated on the owner's camera and box.
   after the tag existed; pushes to `main` are no longer cancelled, the
   image jobs key on "no image for this version yet" so a re-run
   publishes it, and every CI job has a timeout.
+- The daemon no longer runs as a zombie: when the Arlo event bus ends, or
+  a camera task ends or panics, the system cancels itself, every camera
+  releases its session, and the process exits non-zero after the drain
+  so a restart policy takes over. A closed event mailbox now runs the
+  same release as a shutdown.
+- `GET /admin/state` and `GET /admin/cameras/{id}` read a snapshot the
+  camera task publishes after every step, instead of asking the task and
+  timing out at 2 s with a synthetic `unresponsive` entry while it was
+  negotiating WebRTC.
+- A failing update of the "live in the Arlo app" notice after the view's
+  hold ran out re-fired the loop at CPU speed; it is retried every 30 s.
 
 ### Added
 - The container image is published to GitHub's registry on every release

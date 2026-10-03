@@ -290,14 +290,15 @@ pub trait MetricsRecorder: Send + Sync {
 /// to per-camera orchestrator tasks via `mpsc` and awaits the reply.
 #[async_trait]
 pub trait AdminControl: Send + Sync {
-    /// Return a snapshot of the system: per-camera state, debouncer
-    /// remaining, budget left, last failure, etc. Read-only — never
-    /// blocks the orchestrators for long.
+    /// Return a snapshot of the system: per-camera state, budget left,
+    /// last failure, etc. Read-only and immediate: the per-camera state
+    /// is published by the orchestrators, never requested from them, so
+    /// a camera inside a negotiation still answers.
     ///
     /// # Errors
     ///
-    /// Returns [`AdminError::Unavailable`] if any orchestrator is
-    /// unresponsive (the call timed out waiting on its mailbox).
+    /// Returns [`AdminError::Unavailable`] when the system that publishes
+    /// the state is gone.
     async fn snapshot(&self) -> Result<SystemSnapshot, AdminError>;
 
     /// Snapshot of a single camera. Returns
@@ -306,8 +307,7 @@ pub trait AdminControl: Send + Sync {
     /// # Errors
     ///
     /// Returns [`AdminError::UnknownCamera`] when `camera` is not
-    /// configured or [`AdminError::Unavailable`] when the orchestrator
-    /// task did not respond in time.
+    /// configured.
     async fn camera_snapshot(&self, camera: &CameraId) -> Result<CameraSnapshot, AdminError>;
 
     /// Force a camera into `Idle`, detaching any live stream.

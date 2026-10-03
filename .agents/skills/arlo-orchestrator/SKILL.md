@@ -79,7 +79,22 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   debouncer (it would end the relay through the cooldown).
 - **User-view notice**: `sync_user_view_notice()` keeps `media.set_user_view_notice` in
   step with `user_view_active()`. Call it after every change of `user_view_until`
-  (report, `idle`, `CameraBusy`); a select arm fires it when the hold runs out.
+  (report, `idle`, `CameraBusy`); a select arm fires it when the hold runs out. A
+  failed update arms `notice_retry_after` (`USER_VIEW_NOTICE_RETRY`, 30 s), folded
+  into `user_view_notice_expiry()`: without it a past expiry and a media call that
+  kept failing spun the loop. Every path out of `sync_user_view_notice` must leave
+  `notice_retry_after` consistent, including the early "nothing to do" return.
+- **Exit paths**: `handle_shutdown()` (detach + teardown) runs on the token **and** on
+  a closed event mailbox — the router drops the senders only when the system stops or
+  died, and nothing may stay streaming either way. `StreamerSystem` runs every task
+  under `supervised()`: an exit or panic while the token is live cancels the token,
+  the composition root exits non-zero. An upstream bus end is fatal the same way
+  (`EventRouter` cancels the shared token, so it gets `shutdown.clone()`, not a child).
+- **Snapshots are published, not requested**: `publish_snapshot()` at the top of every
+  loop iteration pushes a `CameraSnapshot` on a `watch` channel (`send_if_modified`);
+  `AdminRoute.snapshots` reads it with `borrow()`. `AdminCommand` has no `Snapshot`
+  variant any more — a camera inside a negotiation used to time out and report
+  `unresponsive`. Tests read `orch.snapshots()` and `sleep` a few ms between reads.
 - **Debouncer priming** only in `Idle|Live` (`motion_signal()`); priming in
   `Failed`/`BatteryProtect` left a stale hard-cap deadline that cut the next session short.
 - **Snapshots** (`CameraEvent::SnapshotAvailable`, no URL in the domain) refresh the idle

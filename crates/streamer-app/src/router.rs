@@ -48,6 +48,12 @@ impl EventRouter {
     }
 
     /// Drive the router until cancelled or the upstream stream ends.
+    ///
+    /// An upstream end is fatal for the system: without the bus no camera
+    /// ever wakes again, and a daemon that kept answering `/readyz` in that
+    /// state would be a zombie. The router cancels `shutdown` (the
+    /// system's shared token, not a child) so every orchestrator releases
+    /// its session and the process stops.
     #[instrument(skip(self, events, shutdown), fields(cameras = self.routes.len()))]
     pub async fn run(
         self,
@@ -65,7 +71,8 @@ impl EventRouter {
                 next = events.next() => match next {
                     Some(event) => self.dispatch(&event),
                     None => {
-                        warn!("upstream event stream ended");
+                        warn!("upstream event stream ended; stopping the system");
+                        shutdown.cancel();
                         return;
                     }
                 },
@@ -186,13 +193,15 @@ mod tests {
         let stream: BoxStream<'static, CameraEvent> = Box::pin(futures::stream::empty());
         let shutdown = CancellationToken::new();
 
-        // Should return promptly when the stream ends.
+        // Should return promptly when the stream ends, and take the
+        // system down with it.
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            router.run(stream, shutdown),
+            router.run(stream, shutdown.clone()),
         )
         .await
         .expect("router exited within timeout");
+        assert!(shutdown.is_cancelled(), "an upstream end stops the system");
     }
 
     #[tokio::test]
