@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-03
+
+First release: the daemon as validated on the owner's camera and box.
+
 ### Added
+- The container image is published to GitHub's registry on every release
+  (`ghcr.io/ypno/arlo-camera-streamer-rs:v<version>`, `:latest`,
+  `:sha-<commit>`), built per platform on native runners, scanned with
+  Trivy before it is tagged; `linux/arm64` is opt-in through the
+  `IMAGE_PLATFORMS` repository variable.
 - Per-camera bridge from Arlo's event-driven live stream to a persistent
   local RTSP output: idle still frame (last thumbnail over a STANDBY
   overlay), motion-triggered WebRTC ingest through `webrtcbin`, and a
@@ -65,7 +74,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   camera can report `idle`, and resumes otherwise): the daemon fetches the
   view's own RTSPS stream as
   the app identity (`arlo.app_version`) and splices it in like a motion
-  session, video only, with no cooldown and no daily-budget charge. It
+  session, picture and sound, with no cooldown and no daily-budget charge. It
   ends with the view; a view that cannot be relayed leaves the idle
   frame reading `LIVE IN ARLO APP · <stream>` (ADR 0005) and is retried
   30 s later. The admin snapshot gains `live_source`
@@ -156,3 +165,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could never succeed.
 - Documentation still described the retired SSE bus and a Chromium
   requirement; both are gone since the move to `arlo-rs` 0.2.0.
+
+[Unreleased]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/YpNo/arlo-camera-streamer-rs/releases/tag/v0.1.0

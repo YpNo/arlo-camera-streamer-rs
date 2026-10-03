@@ -64,6 +64,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ----------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
+# GHCR links the package to the repository through this label; the
+# release workflow adds version, revision and dates.
+LABEL org.opencontainers.image.source="https://github.com/YpNo/arlo-camera-streamer-rs" \
+      org.opencontainers.image.licenses="MIT"
+
 # Runtime libraries: GStreamer base + plugins required by the idle and
 # live pipelines (videotestsrc, jpegdec, x264enc, h264parse, h265parse,
 # rtspserver), the WebRTC transport (`gstreamer1.0-nice` = libnice ICE,

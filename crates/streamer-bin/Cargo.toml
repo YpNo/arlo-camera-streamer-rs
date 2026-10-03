@@ -1,6 +1,6 @@
 [package]
 name        = "arlo-camera-streamer"
-description = "Daemon bridging Arlo battery cameras to Frigate via RTSP / HLS / DASH."
+description = "Daemon bridging Arlo battery cameras to Frigate and other NVRs over RTSP and HLS."
 
 version.workspace      = true
 edition.workspace      = true

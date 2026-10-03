@@ -277,3 +277,18 @@ Tests:    Media 113 unit + 13 integration (auto resolves on a box with VA
           domain 57; workspace green; release built.
 Open:     Hardware backends (va, v4l2, nvenc) unseen on hardware; Frigate
           box deployment pending.
+
+## 2026-10-03 — Release 0.1.0 preparation
+Changed:  ci.yml: `release` exposes version/created; `image` (per-platform,
+          native runners, push by digest) and `image-publish` (Trivy
+          report + CRITICAL gate, manifest tags v<version>/latest/sha-*);
+          Sonar action v8.3.0; Dockerfile OCI labels; Renovate pins image
+          digests. README Docker sections reference the GHCR image;
+          CHANGELOG cut to 0.1.0 with link refs; SECURITY.md rewritten
+          (was another project's); licence "MIT" to match the file; bin
+          description without DASH; stale "video only" wording removed;
+          Cargo.lock refreshed. arlo-rs: refactor + 9261 fix cherry-picked
+          onto ci/stage-the-pipeline (PR #35) for one 0.2.3 release.
+Tests:    Workspace green on the refreshed lockfile; actionlint clean.
+Open:     First image build runs on the merge; arm64 leg needs the
+          IMAGE_PLATFORMS variable and a billed arm64 runner.

@@ -4,8 +4,9 @@ name: Rust CI
 # format → clippy → test → coverage / SonarQube, with doc beside test — so
 # a failed stage skips the costlier ones (coverage alone is ~9 min);
 # docs-only changes do not run it; the weekly schedule runs the audit
-# only; Renovate's PRs skip coverage and SonarQube; the GitHub release is
-# the last job, after every gate.
+# only; Renovate's PRs skip coverage and SonarQube; the GitHub release and
+# the container image (one per released version, to GHCR) come last, after
+# every gate.
 on:
   pull_request:
     branches: [main, master]
@@ -220,12 +221,14 @@ jobs:
       - name: Skip notice
         if: env.SONAR_TOKEN == ''
         run: echo "SONAR_TOKEN is not set; skipping the SonarCloud scan."
-      - uses: SonarSource/sonarqube-scan-action@ba9859eae8dd6bd29e412f25ddbbef3d032000f4 # v8.2.2
+      - uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
         if: env.SONAR_TOKEN != ''
 
   # The GitHub release, after every gate: a push to main whose Cargo.toml
   # version has no release yet gets tagged `v<version>` with generated
   # notes. SonarCloud is reporting only and does not hold a release back.
+  # The image jobs below key on `created`, so an image is published once
+  # per version, never for an unversioned push.
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
@@ -235,33 +238,155 @@ jobs:
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      created: ${{ steps.exists.outputs.created }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # tags decide whether this version is released already
 
       - name: Extract version from Cargo.toml
+        id: version
         run: |
-          VERSION=$(grep '^version =' Cargo.toml | awk -F '"' '{print $2}')
-          echo "VERSION=v$VERSION" >> "$GITHUB_ENV"
+          VERSION=$(grep '^version' Cargo.toml | head -1 | awk -F '"' '{print $2}')
+          echo "version=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "Detected version: v$VERSION"
 
       - name: Check whether the release exists
+        id: exists
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           if gh release view "$VERSION" >/dev/null 2>&1; then
             echo "Release $VERSION already exists. Skipping."
-            echo "EXISTS=true" >> "$GITHUB_ENV"
+            echo "created=false" >> "$GITHUB_OUTPUT"
           else
-            echo "EXISTS=false" >> "$GITHUB_ENV"
+            echo "created=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create Release
-        if: env.EXISTS == 'false'
+        if: steps.exists.outputs.created == 'true'
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          tag_name: ${{ env.VERSION }}
-          name: Release ${{ env.VERSION }}
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Release ${{ steps.version.outputs.version }}
           generate_release_notes: true
           target_commitish: ${{ github.sha }}
+
+  # The container image, one per released version, to GHCR as
+  # ghcr.io/<owner>/<repo>:<version>, :latest and :sha-<commit>. Built per
+  # platform on a native runner and pushed by digest, scanned, then tagged
+  # as one manifest list. `linux/amd64` always; add `linux/arm64` (Raspberry
+  # Pi, native arm64 runner, billed) with the repository variable
+  # IMAGE_PLATFORMS = ["linux/amd64","linux/arm64"]. A QEMU build of the
+  # Rust + BoringSSL stage would take hours, hence native runners.
+  image:
+    name: Container image (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 90
+    needs: [release]
+    if: needs.release.outputs.created == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        platform: ${{ fromJSON(vars.IMAGE_PLATFORMS || '["linux/amd64"]') }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          labels: |
+            org.opencontainers.image.title=arlo-camera-streamer
+            org.opencontainers.image.description=Battery-safe bridge from Arlo cameras to a local RTSP / HLS output for Frigate and other NVRs
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ needs.release.outputs.version }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+      - name: Keep the digest for the manifest job
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+          echo "$PLATFORM -> $DIGEST"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  image-publish:
+    name: Scan and tag the image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [release, image]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pick the digest to scan
+        id: scan_ref
+        run: |
+          FIRST=$(ls /tmp/digests | head -1)
+          echo "ref=ghcr.io/${{ github.repository }}@sha256:${FIRST}" >> "$GITHUB_OUTPUT"
+      # Report everything, then gate on fixable CRITICAL findings only:
+      # the release stops before any tag points at a vulnerable image.
+      - name: Vulnerability report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.scan_ref.outputs.ref }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+      - name: Vulnerability gate
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.scan_ref.outputs.ref }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+      - name: Tag the manifest list
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ needs.release.outputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          cd /tmp/digests
+          docker buildx imagetools create \
+            -t "$IMAGE:$VERSION" -t "$IMAGE:latest" -t "$IMAGE:sha-${SHA::7}" \
+            $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:$VERSION"

@@ -244,18 +244,21 @@ fn format_dir(root: &Path, name: &StreamName) -> String {
     format!("{}/{}", root.display(), name)
 }
 
-/// Build the **Phase-7 unified-encoder** per-camera launch string — a
-/// single persistent pipeline where the `input-selector` operates on
-/// **raw I420** and a single `x264enc` downstream produces the H.264
-/// output. Video-only splice; audio is silent AAC at all times (Opus
-/// bridging deferred to Phase 8b — see the module-level note).
+/// Build the per-camera launch string — one persistent pipeline where
+/// the `input-selector` operates on **raw I420** and a single encoder
+/// (the resolved [`EncoderBackend`]) produces the H.264 output. Audio is
+/// an `audiomixer` of the silent bed, the WebRTC leg's Opus and the
+/// app-view relay's AAC, encoded once to AAC (ADR 0003, 0007).
 ///
 /// ```text
 ///   {idle raw I420 chain}                                 ! sel.sink_0
 ///   appsrc ! rtph264depay ! avdec_h264 ! normalize-caps   ! sel.sink_1
-///   input-selector name=sel ! x264enc name=video_enc
+///   input-selector name=sel ! {encoder} name=video_enc
 ///                           ! h264parse ! rtph264pay name=pay0
-///   audiotestsrc wave=silence ...                         ! rtpmp4apay name=pay1
+///   audiotestsrc wave=silence                             ! amix.sink_0
+///   appsrc (Opus RTP) ! rtpopusdepay ! opusdec            ! amix.sink_1
+///   appsrc (AAC RTP)  ! rtpmp4gdepay ! avdec_aac          ! amix.sink_2
+///   audiomixer name=amix ! avenc_aac ! rtpmp4apay name=pay1
 /// ```
 ///
 /// - Both video branches share `video/x-raw, format=I420, {W}x{H},

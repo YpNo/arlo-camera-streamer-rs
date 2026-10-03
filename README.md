@@ -19,7 +19,7 @@ Frigate's pull from Arlo's push**:
 | Activating | Frame freezes briefly | `start_stream` in flight |
 | Live  | Real H.264/H.265 from the camera, until `debounce_secs` after the last motion | Awake |
 | Battery-protect | Idle frame returns | Sleeping (quota exhausted) |
-| Viewed in app | You watch the camera in the Arlo app: the daemon relays the app's own stream (ADR 0007, video only); if Arlo hands out none, the idle frame reads `LIVE IN ARLO APP`. Motion resumes when you close the app | Awake (because of you) |
+| Viewed in app | You watch the camera in the Arlo app: the daemon relays the app's own stream, picture and sound (ADR 0007); if Arlo hands out none, the idle frame reads `LIVE IN ARLO APP`. Motion resumes when you close the app | Awake (because of you) |
 
 The transition is driven by Arlo's **MQTT event bus**: when the camera
 fires a motion event, the daemon negotiates a WebRTC session with Arlo's
@@ -107,8 +107,18 @@ sudo install -m 0755 target/release/arlo-camera-streamer /usr/local/bin/
 
 ### Docker (recommended)
 
-A multi-stage `Dockerfile` is at the repo root. It runs as non-root,
-drops `tini` as PID 1, and ships every GStreamer plugin needed.
+Every release publishes an image to GitHub's registry, built from the
+`Dockerfile` at the repo root: non-root, `tini` as PID 1, every GStreamer
+plugin the pipelines need, scanned with Trivy before it is tagged.
+
+```bash
+docker pull ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.0
+```
+
+Tags: `v<version>` (pin this one), `latest` (the newest release), and
+`sha-<commit>`. `linux/amd64` is always built; `linux/arm64` (Raspberry
+Pi) is added when the repository variable `IMAGE_PLATFORMS` lists it.
+To build it yourself instead:
 
 ```bash
 docker build -t arlo-camera-streamer:dev .
@@ -202,7 +212,7 @@ docker run -d \
   -e ARLO_PASSWORD \
   -e ARLO_IMAP_PASSWORD \
   -e STREAMER_ADMIN_TOKEN \
-  arlo-camera-streamer:dev
+  ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.0
 ```
 
 Add the encoder device your box has, and `video_encoder = "auto"` will
@@ -355,9 +365,16 @@ integration tests) → coverage gate (86 %; raised deliberately, never above
 what is held) and SonarCloud, with the rustdoc check beside the tests and
 cargo-deny in parallel. A failed stage skips the costlier ones, docs-only
 changes do not run it, the weekly schedule runs cargo-deny only, and
-Renovate's PRs skip coverage and SonarCloud. Its last job, after every
-gate, tags a GitHub release on a push to `main` whose `Cargo.toml` version
-has none yet.
+Renovate's PRs skip coverage and SonarCloud. After every gate, a push to
+`main` whose `Cargo.toml` version has no release yet gets a GitHub release
+tagged `v<version>`, then the container image for that version: built per
+platform on native runners, pushed by digest, scanned with Trivy (a
+fixable CRITICAL finding stops the release), and tagged
+`ghcr.io/ypno/arlo-camera-streamer-rs:v<version>`, `:latest` and
+`:sha-<commit>`. A push without a version bump publishes nothing.
+
+Releasing is therefore: bump `version` in `Cargo.toml`, move the
+`[Unreleased]` changelog entries under the new version, merge.
 
 ## Security
 

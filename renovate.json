@@ -35,6 +35,11 @@
       "matchManagers": ["github-actions"],
       "groupName": "github-actions",
       "pinDigests": true
+    },
+    {
+      "matchManagers": ["dockerfile"],
+      "groupName": "base images",
+      "pinDigests": true
     }
   ],
   "vulnerabilityAlerts": {
