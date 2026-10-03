@@ -231,6 +231,10 @@ First release: the daemon as validated on the owner's camera and box.
   decoded instead of logged as dropped.
 - `arlo-rs` 0.2.2: `get_stream_url_as` and the iOS-app identity the
   app-view relay (ADR 0007) queries the stream with.
+- `arlo-rs` 0.2.3: Arlo's error 9261 ("Invalid factor data"), which a
+  fresh install's device id gets from the trusted-browser probe, is
+  classified as an untrusted browser like 9204 rather than falling
+  through as an unknown code.
 
 ### Fixed
 - A failed attach (no RTP within 20 s, a loss during setup, a refused

@@ -38,7 +38,7 @@ streamer-infra-ops   = { path = "crates/streamer-infra-ops" }
 # Pinned to the crates.io release so CI, Docker and a fresh clone resolve it
 # without a sibling checkout. To build against a local ../arlo-rs, uncomment
 # the `[patch.crates-io]` block at the end of this file (never commit it on).
-arlo-rs = "0.2.2"
+arlo-rs = "0.2.3"
 
 # ---- Async runtime ----
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }

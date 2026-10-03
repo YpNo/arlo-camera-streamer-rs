@@ -57,7 +57,7 @@ of each event is unchanged, which is why `event_mapper.rs` still works.
 
 ### Dependencies worth knowing
 
-- `arlo-rs` **0.2.2 from crates.io** (published 2026-10-02, sibling checkout
+- `arlo-rs` **0.2.3 from crates.io** (published 2026-10-03, sibling checkout
   at `../arlo-rs`, MSRV 1.98.1, browser-less `wreq` transport). A commented
   `[patch.crates-io]` block at the end of `Cargo.toml` is the local override.
 - Toolchain **1.98.1** everywhere (`rust-toolchain.toml`, `mise.toml`, CI,
