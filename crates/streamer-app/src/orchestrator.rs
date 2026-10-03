@@ -474,9 +474,16 @@ impl CameraOrchestrator {
                 self.on_snapshot_available().await;
                 return Ok(());
             }
+            // A camera back online while in `Failed` ends the backoff
+            // early; otherwise the report changes nothing.
             CameraEvent::Online { .. } => {
-                debug!("camera online");
-                return Ok(());
+                if matches!(self.state, CameraState::Failed { .. }) {
+                    info!("camera back online; leaving the failure backoff early");
+                    StateTransition::BackoffElapsed
+                } else {
+                    debug!("camera online");
+                    return Ok(());
+                }
             }
             CameraEvent::Offline { .. } => {
                 StateTransition::Failure("camera went offline".to_string())
@@ -714,6 +721,12 @@ impl CameraOrchestrator {
                 self.live = None;
                 self.relay_deadline = None;
             }
+            // Every entry into `Failed` arms the backoff, whatever the
+            // previous state: an `Offline` report while idle used to enter
+            // `Failed` with no deadline and stay there until a restart.
+            if let CameraState::Failed { retries, .. } = &to {
+                self.failed_deadline = Some(now() + backoff_duration(*retries));
+            }
             self.probe_until = match (&to, &signal) {
                 (CameraState::Idle, StateTransition::UserViewProbe) => {
                     Some(now() + USER_VIEW_PROBE_GRACE)
@@ -789,12 +802,11 @@ impl CameraOrchestrator {
                 self.detach_and_refresh().await;
             }
             // Anywhere → Failed (transient error).
-            (CameraState::Activating | CameraState::Live, CameraState::Failed { retries, .. }) => {
+            (CameraState::Activating | CameraState::Live, CameraState::Failed { .. }) => {
                 let _ = self.media.detach_live(&self.camera_id).await;
                 self.stop_arlo_live().await;
                 self.budget.on_live_ended(Local::now().naive_local());
                 self.debouncer.on_idle();
-                self.failed_deadline = Some(now() + backoff_duration(*retries));
             }
             // Failed → Idle (backoff elapsed; ready to retry).
             (CameraState::Failed { .. }, CameraState::Idle) => {
@@ -1695,6 +1707,18 @@ mod tests {
         }
     }
 
+    fn offline() -> CameraEvent {
+        CameraEvent::Offline {
+            device_id: CameraId::new("CAM"),
+        }
+    }
+
+    fn online() -> CameraEvent {
+        CameraEvent::Online {
+            device_id: CameraId::new("CAM"),
+        }
+    }
+
     fn busy() -> DomainError {
         DomainError::CameraBusy("RTSP Streaming in progress".to_string())
     }
@@ -2373,6 +2397,53 @@ mod tests {
     }
 
     // ---------- Online events ignored ----------
+
+    #[tokio::test(start_paused = true)]
+    async fn offline_while_idle_recovers_after_the_backoff() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, offline()).await;
+        send(&tx, motion()).await;
+        assert_eq!(
+            sr.call_count().await,
+            0,
+            "motion is suppressed while Failed"
+        );
+
+        // The first backoff is 1 s; after it the camera is Idle again.
+        tokio::time::advance(backoff_duration(0) + Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        send(&tx, motion()).await;
+        assert_eq!(
+            sr.call_count().await,
+            1,
+            "a motion after the backoff activates"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offline_then_online_returns_to_idle_at_once() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, offline()).await;
+        send(&tx, online()).await;
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 1, "online ends the backoff early");
+
+        token.cancel();
+        handle.await.unwrap();
+    }
 
     #[tokio::test(start_paused = true)]
     async fn online_event_does_not_drive_state() {

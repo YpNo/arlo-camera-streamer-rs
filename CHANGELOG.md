@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 First release: the daemon as validated on the owner's camera and box.
 
+### Security
+- The app-view relay verifies the watch-along host's certificate chain
+  against the system roots (hostname check waived, since the host is a
+  raw IP) or pins a configured fingerprint (`arlo.watch_along_cert_sha256`);
+  it used to accept any certificate. Its RTSP parser bounds every text
+  line, header count and `Content-Length` from the server.
+- A failing thumbnail fetch no longer puts the presigned URL into the
+  error text and the warning log.
+
+### Fixed
+- A camera reported `Offline` while idle entered `Failed` without a
+  backoff deadline and stayed there until a restart; every entry into
+  `Failed` now arms the backoff, and an `Online` report ends it early.
+- `[webrtc] ice_address_family = "ipv4"` panicked on the first activation
+  (webrtcbin's property is `ice-agent`, not `ice`).
+
 ### Added
 - The container image is published to GitHub's registry on every release
   (`ghcr.io/ypno/arlo-camera-streamer-rs:v<version>`, `:latest`,

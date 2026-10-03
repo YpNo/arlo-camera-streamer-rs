@@ -39,7 +39,7 @@ them.
 | `CameraBusy` | `Activating → Idle`, **no backoff** (ADR 0005) |
 | `UserViewStarted` / `UserViewEnded` / `UserViewUnavailable` | Relay of the app view (ADR 0007): `Idle → Activating`, `Live → Idle`, `Activating → Idle` without backoff |
 | `UserViewProbe` | The relay lets go (`Live → Idle`) to let the camera report `idle`; `probe_until` arms a 2 s grace in `Idle`, after which `UserViewStarted` relays again unless the report came |
-| `Failure(reason)` | `→ Failed`, exponential backoff, then `BackoffElapsed → Idle` |
+| `Failure(reason)` | `→ Failed` from any state; `process_signals` arms `failed_deadline` on **every** entry (an `Offline` while idle used to strand the camera), exponential backoff, then `BackoffElapsed → Idle`; an `Online` report in `Failed` emits `BackoffElapsed` at once |
 | `BudgetExhausted` / `BudgetReset` | `→ BatteryProtect` / back to `Idle` |
 
 The metric `signal` label is `signal_label(&StateTransition)`; `LiveLost` carries its

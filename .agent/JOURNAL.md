@@ -299,3 +299,14 @@ Changed:  `docs/adr/HANDOFF.md` → `.agent/HANDOFF.md` (an AI handoff, not an
           record, live gates by feature); `docs/adr/README.md` index;
           ADR 0005 renamed to its title (`user-views-observe-never-compete`);
           README ADR list uniform; CLAUDE.md points at index, record, memory.
+
+## 2026-10-03 — Security sweep: items 1 and 2 fixed
+Changed:  Relay TLS: chain verification via system roots with hostname waiver
+          or a certificate pin (`RelayTls`, `arlo.watch_along_cert_sha256`);
+          bounded RTSP lines/headers/Content-Length. thumbnails: errors
+          without the presigned URL (`without_url`). Orchestrator: backoff
+          armed on every entry into Failed, Online ends it. webrtc: `ice-agent`.
+          `.security/` ignored. Sweep report in .security/report-2026-10-03.md
+          (48 findings; 29 confirmed; items 3–9 open).
+Tests:    Media 118 + 13, app 128, infra-arlo 76; clippy/doc/deny clean.
+Open:     Live gate of the TLS chain (trusted or pin); remaining sweep items.

@@ -376,7 +376,9 @@ fn apply_ice_address_family(webrtcbin: &gst::Element, family: IceAddressFamily) 
             debug!("ICE: dual-stack candidate gathering (libnice default)");
         }
         IceAddressFamily::Ipv4 => {
-            let ice: gst::glib::Object = webrtcbin.property("ice");
+            // The agent lives behind `ice-agent` (GStreamer ≥ 1.20); there
+            // is no `ice` property, and an unknown name panics.
+            let ice: gst::glib::Object = webrtcbin.property("ice-agent");
             let accepted: bool = ice.emit_by_name("add-local-ip-address", &[&"0.0.0.0"]);
             debug!(accepted, "ICE: IPv4-only (add-local-ip-address = 0.0.0.0)");
         }
@@ -702,5 +704,18 @@ mod tests {
     fn pct_encodes_reserved_userinfo() {
         assert_eq!(pct("ab-_.~"), "ab-_.~");
         assert_eq!(pct("a:b/c=d+e"), "a%3Ab%2Fc%3Dd%2Be");
+    }
+
+    /// `ice_address_family = "ipv4"` used to read a property webrtcbin does
+    /// not have, which panicked on the first activation of every camera.
+    #[test]
+    fn ipv4_only_reads_the_ice_agent_without_panicking() {
+        gst::init().ok();
+        let Ok(bin) = gst::ElementFactory::make("webrtcbin").build() else {
+            eprintln!("webrtcbin not available here; skipping");
+            return;
+        };
+        apply_ice_address_family(&bin, IceAddressFamily::Ipv4);
+        apply_ice_address_family(&bin, IceAddressFamily::Dual);
     }
 }
