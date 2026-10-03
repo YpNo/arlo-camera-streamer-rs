@@ -78,6 +78,7 @@ impl StreamerSystem {
         metrics: Arc<dyn MetricsRecorder>,
         version: &'static str,
     ) -> Result<Self, DomainError> {
+        config.validate()?;
         if config.cameras.is_empty() {
             return Err(DomainError::InvalidConfig(
                 "no [[cameras]] configured — nothing to do".to_string(),
@@ -96,10 +97,12 @@ impl StreamerSystem {
                 .insert(camera_cfg.arlo_device_id.clone(), event_tx)
                 .is_some()
             {
-                warn!(
-                    camera = %camera_cfg.arlo_device_id,
-                    "duplicate [[cameras]] entry; later one wins"
-                );
+                // `validate()` refuses this first; kept as a guard so a
+                // second orchestrator can never be spawned for one camera.
+                return Err(DomainError::InvalidConfig(format!(
+                    "duplicate [[cameras]] arlo_device_id {}",
+                    camera_cfg.arlo_device_id
+                )));
             }
             admin_routes.insert(
                 camera_cfg.arlo_device_id.clone(),

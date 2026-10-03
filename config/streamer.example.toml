@@ -126,6 +126,9 @@ arlo_device_id = "REPLACE_WITH_DEVICE_ID"
 stream_name    = "front_door"
 # codec_hint   = "h264"   # or "h265"; learned automatically on first stream
 
+# Checked at boot: debounce_secs and max_continuous_live 1..=86400, the
+# other two 0..=86400 (0 = disabled). A session is cut the moment the daily
+# budget runs out, and every activation costs it 15 s besides the live time.
 [cameras.cooldown]
 debounce_secs       = 60     # hold-live after last motion (debounce window)
 max_continuous_live = 300    # hard cap on continuous live time (battery save)

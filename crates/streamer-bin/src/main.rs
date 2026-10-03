@@ -417,6 +417,8 @@ fn load_config(path: &std::path::Path) -> Result<StreamerConfig> {
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
     let cfg: StreamerConfig = toml::from_str(&raw)
         .with_context(|| format!("failed to parse config: {}", path.display()))?;
+    cfg.validate()
+        .with_context(|| format!("invalid config: {}", path.display()))?;
     Ok(cfg)
 }
 

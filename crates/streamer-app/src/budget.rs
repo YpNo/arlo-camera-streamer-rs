@@ -61,13 +61,15 @@ impl LiveBudgetTracker {
     /// not a valid `HH:MM` string.
     pub fn new(config: &CooldownConfig, now: NaiveDateTime) -> Result<Self, DomainError> {
         let reset_time = parse_hhmm(&config.budget_reset)?;
-        let daily_budget =
-            ChronoDuration::seconds(i64::try_from(config.daily_live_budget).map_err(|_| {
+        let daily_budget = i64::try_from(config.daily_live_budget)
+            .ok()
+            .and_then(ChronoDuration::try_seconds)
+            .ok_or_else(|| {
                 DomainError::InvalidConfig(format!(
-                    "daily_live_budget {} too large to fit i64 seconds",
+                    "daily_live_budget {} too large for a duration",
                     config.daily_live_budget
                 ))
-            })?);
+            })?;
         let last_reset_date = previous_reset(now, reset_time).date();
         Ok(Self {
             daily_budget,
@@ -97,6 +99,34 @@ impl LiveBudgetTracker {
                 self.spent_today += session;
             }
         }
+    }
+
+    /// Charge `amount` against today's quota without a session: the cost
+    /// of an activation itself (wake, negotiation), so repeated short
+    /// sessions cannot drain the camera for free.
+    pub fn charge(&mut self, now: NaiveDateTime, amount: ChronoDuration) {
+        if self.daily_budget.is_zero() {
+            return;
+        }
+        self.maybe_reset(now);
+        self.spent_today += amount;
+    }
+
+    /// Time left in today's quota at `now`, counting the session in
+    /// flight; `None` when the quota is disabled. Pure: no reset.
+    #[must_use]
+    pub fn remaining(&self, now: NaiveDateTime) -> Option<ChronoDuration> {
+        if self.daily_budget.is_zero() {
+            return None;
+        }
+        let in_flight = self
+            .current_session_start
+            .map_or(ChronoDuration::zero(), |start| {
+                let billable_start = previous_reset(now, self.reset_time).max(start);
+                now.signed_duration_since(billable_start)
+                    .max(ChronoDuration::zero())
+            });
+        Some((self.daily_budget - self.spent_today - in_flight).max(ChronoDuration::zero()))
     }
 
     /// Compute the current verdict at `now`. May trigger an internal
@@ -324,5 +354,30 @@ mod tests {
         };
         let err = LiveBudgetTracker::new(&cfg, dt(2024, 1, 1, 12, 0)).expect_err("must reject");
         assert!(matches!(err, DomainError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn charge_counts_against_today_and_remaining_tracks_the_session() {
+        let mut t = LiveBudgetTracker::new(&cfg(100, "06:00"), dt(2024, 1, 1, 12, 0)).unwrap();
+        assert_eq!(
+            t.remaining(dt(2024, 1, 1, 12, 0)),
+            Some(ChronoDuration::seconds(100))
+        );
+        t.charge(dt(2024, 1, 1, 12, 0), ChronoDuration::seconds(15));
+        t.on_live_started(dt(2024, 1, 1, 12, 0));
+        assert_eq!(
+            t.remaining(dt(2024, 1, 1, 12, 1)),
+            Some(ChronoDuration::seconds(25))
+        );
+        assert_eq!(
+            t.remaining(dt(2024, 1, 1, 12, 5)),
+            Some(ChronoDuration::zero())
+        );
+        assert_eq!(t.poll(dt(2024, 1, 1, 12, 5)), BudgetVerdict::Exhausted);
+        // Disabled quota: nothing to charge or report.
+        let mut off = LiveBudgetTracker::new(&cfg(0, "06:00"), dt(2024, 1, 1, 12, 0)).unwrap();
+        off.charge(dt(2024, 1, 1, 12, 0), ChronoDuration::seconds(15));
+        assert_eq!(off.remaining(dt(2024, 1, 1, 12, 0)), None);
+        assert_eq!(off.poll(dt(2024, 1, 1, 12, 0)), BudgetVerdict::Unlimited);
     }
 }

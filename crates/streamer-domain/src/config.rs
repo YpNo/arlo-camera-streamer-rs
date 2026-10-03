@@ -10,10 +10,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::camera::{CameraId, StreamName};
+use crate::error::DomainError;
 use crate::stream::{Codec, IceAddressFamily};
 
 /// Top-level streamer configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamerConfig {
     /// Arlo cloud / session settings.
     pub arlo: ArloConfig,
@@ -47,7 +49,7 @@ pub const MIN_LIVE_STALL_TIMEOUT_SECS: u64 = 4;
 /// `#[serde(default)]` on the struct makes a `[webrtc]` table with any
 /// subset of keys valid; an absent table is the same as an empty one.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WebrtcConfig {
     /// Address-family policy for local ICE candidate gathering.
     /// Default is dual-stack (IPv4 + IPv6).
@@ -82,6 +84,7 @@ impl WebrtcConfig {
 
 /// Arlo cloud authentication and session-cache configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArloConfig {
     /// Arlo cloud account email (the address used to log into the
     /// Arlo iOS / Android app).
@@ -138,6 +141,7 @@ pub enum MfaConfig {
 /// `password_env` are all set. Any other shape falls back to a stdin
 /// OTP prompt.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmailMfaConfig {
     /// Explicit IMAP server host (e.g. `imap.gmail.com`). Optional when
     /// `provider` is set; an explicit host always wins over `provider`.
@@ -162,6 +166,7 @@ const fn default_imap_port() -> u16 {
 /// Push MFA timing. Both fields are optional in TOML and fall back to
 /// the documented defaults — `[arlo.mfa] kind = "push"` alone is valid.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PushMfaConfig {
     /// Seconds between `finishAuth` polls while waiting for the user to
     /// approve the prompt in the Arlo app.
@@ -216,6 +221,7 @@ pub enum VideoEncoder {
 
 /// All output-side configuration: stream endpoints + ops sockets.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputConfig {
     /// RTSP server (always enabled — primary output).
     pub rtsp: RtspOutput,
@@ -239,6 +245,7 @@ pub struct OutputConfig {
 
 /// RTSP output configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RtspOutput {
     /// Bind address for the embedded RTSP server.
     #[serde(default = "default_rtsp_bind")]
@@ -247,6 +254,7 @@ pub struct RtspOutput {
 
 /// HLS sink configuration. Files are written to `dir/<stream_name>/…`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HlsOutput {
     /// Filesystem directory for HLS segments and playlists.
     pub dir: PathBuf,
@@ -280,6 +288,7 @@ impl HlsOutput {
 
 /// DASH sink configuration. Files are written to `dir/<stream_name>/…`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DashOutput {
     /// Filesystem directory for DASH segments and manifests.
     pub dir: PathBuf,
@@ -309,6 +318,7 @@ const fn default_playlist_length() -> u32 {
 
 /// Per-camera mapping from an Arlo device to an output stream.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CameraConfig {
     /// Arlo cloud device id (opaque, copied from the Arlo app).
     pub arlo_device_id: CameraId,
@@ -328,6 +338,7 @@ pub struct CameraConfig {
 /// See architecture doc §"Refined cooldown" for the trade-off
 /// rationale behind the three caps.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CooldownConfig {
     /// Hold-live debounce after the last motion event, in seconds.
     /// A new motion within this window resets the timer.
@@ -365,6 +376,70 @@ impl Default for CooldownConfig {
             budget_reset: default_budget_reset(),
             user_view_probe_secs: default_user_view_probe(),
         }
+    }
+}
+
+/// Longest value accepted for any cooldown duration or quota: one day.
+pub const MAX_COOLDOWN_SECS: u64 = 86_400;
+
+impl CooldownConfig {
+    /// Range-check the cooldown values. `debounce_secs` and
+    /// `max_continuous_live` must be `1..=MAX_COOLDOWN_SECS` (zero would
+    /// tear every session down right after attach, the churn the cap
+    /// exists to prevent); `daily_live_budget` and `user_view_probe_secs`
+    /// may be `0` (disabled) up to the same ceiling.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::InvalidConfig`] naming the camera and the field.
+    pub fn validate(&self, camera: &CameraId) -> Result<(), DomainError> {
+        let bounded = |name: &str, value: u64, min: u64| {
+            if (min..=MAX_COOLDOWN_SECS).contains(&value) {
+                Ok(())
+            } else {
+                Err(DomainError::InvalidConfig(format!(
+                    "camera {camera}: cooldown.{name} = {value} is outside {min}..={MAX_COOLDOWN_SECS} seconds"
+                )))
+            }
+        };
+        bounded("debounce_secs", self.debounce_secs, 1)?;
+        bounded("max_continuous_live", self.max_continuous_live, 1)?;
+        bounded("daily_live_budget", self.daily_live_budget, 0)?;
+        bounded("user_view_probe_secs", self.user_view_probe_secs, 0)
+    }
+}
+
+impl StreamerConfig {
+    /// Cross-field checks the parser cannot express: no two cameras may
+    /// share an `arlo_device_id` (the second would replace the first's
+    /// routes) or a `stream_name` (the second would replace the first's
+    /// RTSP mount and share its HLS directory), and every cooldown value
+    /// must be in range. Called by the loader so a bad file fails the boot
+    /// before anything is spawned.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::InvalidConfig`] describing the first problem found.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        let mut ids = std::collections::HashSet::new();
+        let mut names = std::collections::HashSet::new();
+        for camera in &self.cameras {
+            if !ids.insert(&camera.arlo_device_id) {
+                return Err(DomainError::InvalidConfig(format!(
+                    "duplicate [[cameras]] arlo_device_id {}",
+                    camera.arlo_device_id
+                )));
+            }
+            if !names.insert(camera.stream_name.as_str()) {
+                return Err(DomainError::InvalidConfig(format!(
+                    "duplicate [[cameras]] stream_name {} (camera {})",
+                    camera.stream_name.as_str(),
+                    camera.arlo_device_id
+                )));
+            }
+            camera.cooldown.validate(&camera.arlo_device_id)?;
+        }
+        Ok(())
     }
 }
 
@@ -450,6 +525,78 @@ mod tests {
         }
         assert!(toml::from_str::<W>("e = \"qsv\"").is_err());
         assert!(toml::from_str::<W>("e = \"X264\"").is_err());
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_in_every_table() {
+        for (table, key) in [
+            ("[arlo]", "emial"),
+            ("[arlo.mfa]", "pasword_env"),
+            ("[webrtc]", "live_stall_timeout_sec"),
+            ("[output]", "video_encodr"),
+            ("[output.rtsp]", "bindd"),
+            ("[cameras.cooldown]", "daily_live_budgetx"),
+        ] {
+            let raw = include_str!("../../../config/streamer.example.toml").to_string();
+            let patched = raw.replacen(table, &format!("{table}\n{key} = \"x\""), 1);
+            let err = toml::from_str::<StreamerConfig>(&patched).expect_err(key);
+            assert!(err.to_string().contains(key), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_the_example_and_refuses_duplicates_and_ranges() {
+        let raw = include_str!("../../../config/streamer.example.toml").to_string();
+        let cfg: StreamerConfig = toml::from_str(&raw).expect("parses");
+        cfg.validate().expect("the example validates");
+
+        let mut dup_id = cfg.clone();
+        dup_id.cameras.push(cfg.cameras[0].clone());
+        assert!(
+            dup_id
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("arlo_device_id")
+        );
+
+        let mut dup_name = cfg.clone();
+        let mut second = cfg.cameras[0].clone();
+        second.arlo_device_id = CameraId::new("OTHER");
+        dup_name.cameras.push(second);
+        assert!(
+            dup_name
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("stream_name")
+        );
+
+        let mut zero_cap = cfg.clone();
+        zero_cap.cameras[0].cooldown.max_continuous_live = 0;
+        assert!(
+            zero_cap
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("max_continuous_live")
+        );
+
+        let mut huge_budget = cfg.clone();
+        huge_budget.cameras[0].cooldown.daily_live_budget = MAX_COOLDOWN_SECS + 1;
+        assert!(
+            huge_budget
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("daily_live_budget")
+        );
+
+        let mut probe_off = cfg;
+        probe_off.cameras[0].cooldown.user_view_probe_secs = 0;
+        probe_off
+            .validate()
+            .expect("0 disables the probe and is allowed");
     }
 
     #[test]
