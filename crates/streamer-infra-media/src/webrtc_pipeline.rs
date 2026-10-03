@@ -223,9 +223,8 @@ impl WebrtcLive {
             ],
         );
 
-        // Inbound video RTP → appsink → caller-supplied `LiveRtpSink`.
-        // Audio pad is drained to `fakesink` (Opus bridging deferred
-        // to Phase 8b — see `pipeline_desc` module-level note).
+        // Inbound RTP → one appsink per pad → the caller's `LiveSinks`
+        // (`link_video_appsink` → `video`, `link_audio_appsink` → `audio`).
         let got_rtp = Arc::new(AtomicBool::new(false));
         let first_rtp = Arc::new(Notify::new());
         // Filled by `pad-added` once the video appsink is linked; the
