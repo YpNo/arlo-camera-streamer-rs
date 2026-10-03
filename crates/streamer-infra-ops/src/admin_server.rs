@@ -169,6 +169,11 @@ fn admin_error_to_response(err: AdminError) -> Response {
             error!(error = %msg, "admin: internal error");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         }
+        AdminError::RateLimited(msg) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("rate limited: {msg}"),
+        )
+            .into_response(),
     }
 }
 

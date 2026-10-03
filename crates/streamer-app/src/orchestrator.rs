@@ -106,6 +106,13 @@ const USER_VIEW_RETRY: Duration = Duration::from_secs(30);
 /// report came 0.34 to 0.8 s after our `TEARDOWN` over four live gates
 /// (2026-10-01/02); the grace is what viewers see as the gap.
 const USER_VIEW_PROBE_GRACE: Duration = Duration::from_secs(2);
+/// A manual wake is refused this long after the previous session ended:
+/// an admin script alternating wake and idle would otherwise negotiate a
+/// WebRTC call every few seconds for next to no quota.
+const ADMIN_WAKE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// Quota charged for the activation itself (wake-up, negotiation), so
+/// short sessions still cost the battery they really cost.
+const ACTIVATION_SURCHARGE_SECS: i64 = 15;
 
 /// Per-camera state-machine task.
 pub struct CameraOrchestrator {
@@ -147,6 +154,9 @@ pub struct CameraOrchestrator {
     /// How often a relay lets go of the stream to learn whether the app
     /// still views (`user_view_probe_secs`); `None` never probes.
     probe_interval: Option<Duration>,
+    /// When the last live session ended; a manual wake within
+    /// [`ADMIN_WAKE_MIN_INTERVAL`] of it is refused.
+    last_session_end: Option<Instant>,
     /// Until when, after a probe, the camera's `idle` report is awaited
     /// in `Idle`; `None` outside a probe.
     probe_until: Option<Instant>,
@@ -212,6 +222,7 @@ impl CameraOrchestrator {
             probe_interval: (config.cooldown.user_view_probe_secs > 0)
                 .then(|| Duration::from_secs(config.cooldown.user_view_probe_secs)),
             probe_until: None,
+            last_session_end: None,
             signaler,
             thumbnails,
             media,
@@ -332,7 +343,7 @@ impl CameraOrchestrator {
     /// Errors during reply (e.g. caller dropped the future) are logged
     /// but never surfaced — admin requests are inherently best-effort.
     async fn handle_admin(&mut self, cmd: crate::admin::AdminCommand) {
-        use crate::admin::AdminCommand;
+        use crate::admin::{AdminCommand, WakeOutcome};
         match cmd {
             AdminCommand::Snapshot { reply } => {
                 let snap = self.snapshot();
@@ -357,7 +368,19 @@ impl CameraOrchestrator {
                 }
             }
             AdminCommand::ManualWake { reply } => {
-                if reply.send(()).is_err() {
+                let too_soon = self.last_session_end.and_then(|end| {
+                    let allowed_at = end + ADMIN_WAKE_MIN_INTERVAL;
+                    (now() < allowed_at).then(|| allowed_at.saturating_duration_since(now()))
+                });
+                if let Some(retry_in) = too_soon {
+                    debug!(
+                        retry_in_secs = retry_in.as_secs(),
+                        "manual wake refused: too soon after the last session"
+                    );
+                    let _ = reply.send(WakeOutcome::TooSoon { retry_in });
+                    return;
+                }
+                if reply.send(WakeOutcome::Accepted).is_err() {
                     debug!("admin manual-wake reply dropped");
                 }
                 // Same guards as a real pulse: absorbed during a manual
@@ -426,7 +449,20 @@ impl CameraOrchestrator {
             CameraState::Live if self.session_source == Some(LiveSource::UserView) => {
                 self.relay_deadline
             }
-            CameraState::Live => self.debouncer.next_deadline(now()),
+            // A motion session ends at the cooldown, the cap, or the moment
+            // the daily quota runs out — whichever comes first.
+            CameraState::Live => {
+                let by_debouncer = self.debouncer.next_deadline(now());
+                let by_budget = self
+                    .budget
+                    .remaining(Local::now().naive_local())
+                    .and_then(|left| left.to_std().ok())
+                    .map(|left| now() + left);
+                match (by_debouncer, by_budget) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+            }
             CameraState::Failed { .. } => self.failed_deadline,
             CameraState::BatteryProtect { .. } => {
                 let wall = Local::now().naive_local();
@@ -689,11 +725,20 @@ impl CameraOrchestrator {
                 }
                 self.relay_release_signal()
             }
-            CameraState::Live => match self.debouncer.poll(now()) {
-                DebouncerVerdict::DebounceExpired => StateTransition::CooldownExpired,
-                DebouncerVerdict::MaxLiveExceeded => StateTransition::MaxLiveExceeded,
-                DebouncerVerdict::KeepLive | DebouncerVerdict::Idle => return Ok(()),
-            },
+            CameraState::Live => {
+                if self.budget.poll(Local::now().naive_local()) == BudgetVerdict::Exhausted {
+                    info!("daily live budget exhausted mid-session; releasing the camera");
+                    self.metrics
+                        .record_budget(&self.camera_id, BudgetDecision::Denied);
+                    StateTransition::BudgetExhausted
+                } else {
+                    match self.debouncer.poll(now()) {
+                        DebouncerVerdict::DebounceExpired => StateTransition::CooldownExpired,
+                        DebouncerVerdict::MaxLiveExceeded => StateTransition::MaxLiveExceeded,
+                        DebouncerVerdict::KeepLive | DebouncerVerdict::Idle => return Ok(()),
+                    }
+                }
+            }
             CameraState::Failed { .. } => StateTransition::BackoffElapsed,
             CameraState::BatteryProtect { .. } => StateTransition::BudgetReset,
             CameraState::Activating => return Ok(()),
@@ -773,6 +818,10 @@ impl CameraOrchestrator {
                 let follow = if self.session_source == Some(LiveSource::UserView) {
                     self.start_user_view_relay().await
                 } else {
+                    self.budget.charge(
+                        Local::now().naive_local(),
+                        chrono::Duration::seconds(ACTIVATION_SURCHARGE_SECS),
+                    );
                     self.start_activation().await
                 };
                 follow_ups.extend(follow);
@@ -911,6 +960,7 @@ impl CameraOrchestrator {
     /// propagated — the synthetic black-frame fallback in the media
     /// adapter handles the missing-image case.
     async fn detach_and_refresh(&mut self) {
+        self.last_session_end = Some(now());
         if let Err(e) = self.media.detach_live(&self.camera_id).await {
             warn!(error = %e, "detach_live failed");
         }
@@ -1079,6 +1129,7 @@ pub fn now_local() -> NaiveDateTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::WakeOutcome;
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::stream::BoxStream;
@@ -1343,6 +1394,41 @@ mod tests {
 
     fn camera_cfg(debounce: u64, max: u64) -> CameraConfig {
         camera_cfg_probing(debounce, max, 0)
+    }
+
+    fn camera_cfg_budget(debounce: u64, max: u64, budget: u64) -> CameraConfig {
+        let mut cfg = camera_cfg(debounce, max);
+        cfg.cooldown.daily_live_budget = budget;
+        cfg
+    }
+
+    /// Like `build`, with the admin mailbox exposed.
+    fn build_with_admin(
+        cfg: &CameraConfig,
+        sr: Arc<dyn WebrtcSignaler>,
+        media: Arc<dyn MediaMultiplexer>,
+    ) -> (
+        CameraOrchestrator,
+        mpsc::Sender<CameraEvent>,
+        mpsc::Sender<crate::admin::AdminCommand>,
+        CancellationToken,
+    ) {
+        let (tx, rx) = mpsc::channel(32);
+        let (admin_tx, admin_rx) = mpsc::channel(8);
+        let token = CancellationToken::new();
+        let orch = CameraOrchestrator::new(
+            cfg,
+            sr,
+            Arc::new(StubThumbnails),
+            media,
+            StubUserViews::always(),
+            Arc::new(crate::metrics_noop::NoopRecorder),
+            rx,
+            admin_rx,
+            token.clone(),
+        )
+        .expect("budget config valid");
+        (orch, tx, admin_tx, token)
     }
 
     fn camera_cfg_probing(debounce: u64, max: u64, probe: u64) -> CameraConfig {
@@ -2397,6 +2483,118 @@ mod tests {
     }
 
     // ---------- Online events ignored ----------
+
+    /// The quota used to be checked only when motion arrived, so a session
+    /// started with seconds left ran its full window. The budget counts
+    /// wall-clock time, which a paused test cannot move, so the cut is
+    /// exercised through a quota the activation surcharge alone exhausts:
+    /// the session is cut as soon as it is live.
+    #[tokio::test(start_paused = true)]
+    async fn live_session_is_cut_when_the_daily_budget_runs_out() {
+        let cfg = camera_cfg_budget(300, 300, 10);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        tokio::task::yield_now().await;
+        let calls = media.calls().await;
+        assert!(
+            calls.iter().any(|c| matches!(c, MediaCall::AttachLive(_))),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&MediaCall::DetachLive),
+            "cut right after attach: {calls:?}"
+        );
+        assert_eq!(sr.stop_count().await, 1, "teardown paired with detach");
+        // BatteryProtect: a new pulse starts nothing.
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 1);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    /// Each activation costs 15 s of quota even when the session itself is
+    /// short, so wake/idle churn drains the quota, not the camera.
+    #[tokio::test(start_paused = true)]
+    async fn activation_surcharge_makes_short_sessions_spend_quota() {
+        // 20 s quota: the first activation charges 15 (5 left, session runs),
+        // the second charges 15 more (30 > 20, cut at once), the third is refused.
+        let cfg = camera_cfg_budget(1, 300, 20);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer()), Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 1);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            media.calls().await.contains(&MediaCall::DetachLive),
+            "cooldown ended it"
+        );
+
+        send(&tx, motion()).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sr.call_count().await,
+            2,
+            "5 s left: the second pulse still activates"
+        );
+        assert!(
+            media.calls().await.contains(&MediaCall::DetachLive),
+            "and is cut by the surcharge"
+        );
+
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 2, "BatteryProtect refuses the third");
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_wake_is_refused_right_after_a_session() {
+        let cfg = camera_cfg(1, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer()), Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, admin_tx, token) = build_with_admin(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(media.calls().await.contains(&MediaCall::DetachLive));
+
+        let wake = |admin_tx: &mpsc::Sender<crate::admin::AdminCommand>| {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let tx = admin_tx.clone();
+            async move {
+                tx.send(crate::admin::AdminCommand::ManualWake { reply })
+                    .await
+                    .unwrap();
+                rx.await.unwrap()
+            }
+        };
+        let outcome = wake(&admin_tx).await;
+        assert!(
+            matches!(outcome, WakeOutcome::TooSoon { retry_in } if retry_in <= ADMIN_WAKE_MIN_INTERVAL),
+            "{outcome:?}"
+        );
+        assert_eq!(sr.call_count().await, 1, "refused wake negotiates nothing");
+
+        tokio::time::advance(ADMIN_WAKE_MIN_INTERVAL + Duration::from_secs(1)).await;
+        assert_eq!(wake(&admin_tx).await, WakeOutcome::Accepted);
+        tokio::task::yield_now().await;
+        assert_eq!(sr.call_count().await, 2, "accepted wake activates");
+
+        token.cancel();
+        handle.await.unwrap();
+    }
 
     #[tokio::test(start_paused = true)]
     async fn offline_while_idle_recovers_after_the_backoff() {

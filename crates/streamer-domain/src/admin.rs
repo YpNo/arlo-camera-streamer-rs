@@ -38,6 +38,11 @@ pub enum AdminError {
     /// Catch-all for unexpected internal errors. Use sparingly.
     #[error("internal admin error: {0}")]
     Internal(String),
+
+    /// The command was refused to protect the camera's battery: a wake
+    /// too soon after the previous session. Retry after the given time.
+    #[error("rate limited: {0}")]
+    RateLimited(String),
 }
 
 /// Snapshot of one camera's runtime state. JSON-serializable for the

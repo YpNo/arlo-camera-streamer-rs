@@ -47,6 +47,18 @@ use crate::system::MAILBOX_CAPACITY;
 /// iterations) — the timeout guards against a permanently stuck task.
 const ADMIN_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The orchestrator's answer to a manual wake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeOutcome {
+    /// Taken; it goes through the same guards as a motion pulse.
+    Accepted,
+    /// Refused: the previous session ended too recently.
+    TooSoon {
+        /// How long until a wake is accepted again.
+        retry_in: std::time::Duration,
+    },
+}
+
 /// Admin command sent from the [`AdminControlActor`] to a per-camera
 /// orchestrator over its inbound admin mailbox.
 #[derive(Debug)]
@@ -61,10 +73,11 @@ pub enum AdminCommand {
         /// One-shot acknowledgement channel.
         reply: oneshot::Sender<()>,
     },
-    /// Inject a synthetic motion event (subject to the budget tracker).
+    /// Inject a synthetic motion event (subject to the budget tracker and
+    /// the re-activation interval).
     ManualWake {
-        /// One-shot acknowledgement channel.
-        reply: oneshot::Sender<()>,
+        /// Whether the wake was taken or refused.
+        reply: oneshot::Sender<WakeOutcome>,
     },
 }
 
@@ -194,10 +207,17 @@ impl AdminControl for AdminControlActor {
         let (tx, rx) = oneshot::channel();
         self.send(route, AdminCommand::ManualWake { reply: tx })
             .await?;
-        timeout(ADMIN_REPLY_TIMEOUT, rx)
+        let outcome = timeout(ADMIN_REPLY_TIMEOUT, rx)
             .await
             .map_err(|_| AdminError::Unavailable("manual-wake timeout".to_string()))?
-            .map_err(|_| AdminError::Unavailable("orchestrator dropped reply".to_string()))
+            .map_err(|_| AdminError::Unavailable("orchestrator dropped reply".to_string()))?;
+        match outcome {
+            WakeOutcome::Accepted => Ok(()),
+            WakeOutcome::TooSoon { retry_in } => Err(AdminError::RateLimited(format!(
+                "last session ended too recently; retry in {} s",
+                retry_in.as_secs()
+            ))),
+        }
     }
 }
 
@@ -341,7 +361,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<AdminCommand>(8);
         tokio::spawn(async move {
             if let Some(AdminCommand::ManualWake { reply }) = rx.recv().await {
-                let _ = reply.send(());
+                let _ = reply.send(WakeOutcome::Accepted);
             }
         });
         let mut routes = HashMap::new();
@@ -369,5 +389,35 @@ mod tests {
         );
         let s = format!("{actor:?}");
         assert!(s.contains("cameras"));
+    }
+
+    #[tokio::test]
+    async fn manual_wake_refusal_maps_to_rate_limited() {
+        let (tx, mut rx) = mpsc::channel::<AdminCommand>(8);
+        tokio::spawn(async move {
+            if let Some(AdminCommand::ManualWake { reply }) = rx.recv().await {
+                let _ = reply.send(WakeOutcome::TooSoon {
+                    retry_in: Duration::from_secs(12),
+                });
+            }
+        });
+        let mut routes = HashMap::new();
+        routes.insert(
+            CameraId::new("CAM"),
+            AdminRoute {
+                stream_name: StreamName::parse("cam").unwrap(),
+                sender: tx,
+            },
+        );
+        let actor = AdminControlActor::new(
+            routes,
+            "test",
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let err = actor.manual_wake(&CameraId::new("CAM")).await.unwrap_err();
+        assert!(
+            matches!(err, AdminError::RateLimited(ref m) if m.contains("12 s")),
+            "{err}"
+        );
     }
 }

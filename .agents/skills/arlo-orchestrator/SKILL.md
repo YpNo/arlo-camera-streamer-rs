@@ -40,7 +40,7 @@ them.
 | `UserViewStarted` / `UserViewEnded` / `UserViewUnavailable` | Relay of the app view (ADR 0007): `Idle → Activating`, `Live → Idle`, `Activating → Idle` without backoff |
 | `UserViewProbe` | The relay lets go (`Live → Idle`) to let the camera report `idle`; `probe_until` arms a 2 s grace in `Idle`, after which `UserViewStarted` relays again unless the report came |
 | `Failure(reason)` | `→ Failed` from any state; `process_signals` arms `failed_deadline` on **every** entry (an `Offline` while idle used to strand the camera), exponential backoff, then `BackoffElapsed → Idle`; an `Online` report in `Failed` emits `BackoffElapsed` at once |
-| `BudgetExhausted` / `BudgetReset` | `→ BatteryProtect` / back to `Idle` |
+| `BudgetExhausted` / `BudgetReset` | `→ BatteryProtect` / back to `Idle`. Emitted on a motion pulse **and** from `handle_deadline` while `Live`: `next_deadline` takes `min(debouncer, now + budget.remaining())`, so a session is cut when the quota runs out. Every `Idle → Activating` for motion charges `ACTIVATION_SURCHARGE_SECS` (15) through `budget.charge`. The budget is wall-clock (chrono): paused-clock tests cannot move its in-flight time, so test it with quotas the surcharge exhausts |
 
 The metric `signal` label is `signal_label(&StateTransition)`; `LiveLost` carries its
 reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix row,
@@ -86,7 +86,9 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   still only in `Idle|BatteryProtect|Failed` — the states where the still is on screen.
 - **Admin commands** (wake, force-idle) are acked when dequeued, before acting: the reply
   timeout is 2 s and a WebRTC negotiation takes longer. Manual wake goes through
-  `motion_signal()` like a real motion.
+  `motion_signal()` like a real motion, and is refused (`WakeOutcome::TooSoon` →
+  `AdminError::RateLimited` → HTTP 429) within `ADMIN_WAKE_MIN_INTERVAL` (30 s) of
+  `last_session_end`, set in `detach_and_refresh`.
 
 ## Attach flow and its failures
 

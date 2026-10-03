@@ -310,3 +310,15 @@ Changed:  Relay TLS: chain verification via system roots with hostname waiver
           (48 findings; 29 confirmed; items 3–9 open).
 Tests:    Media 118 + 13, app 128, infra-arlo 76; clippy/doc/deny clean.
 Open:     Live gate of the TLS chain (trusted or pin); remaining sweep items.
+
+## 2026-10-03 — Security sweep items 3 and 4
+Changed:  Config: `deny_unknown_fields` on every table, `StreamerConfig::validate`
+          (duplicate ids/stream names, cooldown ranges) called by the loader
+          and `StreamerSystem::spawn`; `TimeDelta::try_seconds` for the budget.
+          Budget: `remaining()`/`charge()`; live deadline = min(debouncer,
+          budget); `handle_deadline` emits BudgetExhausted mid-session;
+          15 s activation surcharge; manual wake refused within 30 s of the
+          last session (`WakeOutcome`, `AdminError::RateLimited`, HTTP 429).
+Tests:    App 133, domain 59, ops 38 (+429 mapping untested at HTTP level: the
+          actor mapping is), workspace green, release built.
+Open:     Sweep items 5–9.

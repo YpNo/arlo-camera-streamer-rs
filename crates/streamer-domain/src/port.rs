@@ -326,7 +326,8 @@ pub trait AdminControl: Send + Sync {
     /// # Errors
     ///
     /// Returns [`AdminError::UnknownCamera`] if `camera` is not
-    /// configured, or [`AdminError::Unavailable`] on a control-plane
-    /// transport failure.
+    /// configured, [`AdminError::RateLimited`] when the previous session
+    /// ended too recently, or [`AdminError::Unavailable`] on a
+    /// control-plane transport failure.
     async fn manual_wake(&self, camera: &CameraId) -> Result<(), AdminError>;
 }

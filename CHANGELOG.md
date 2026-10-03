@@ -20,6 +20,17 @@ First release: the daemon as validated on the owner's camera and box.
 - A failing thumbnail fetch no longer puts the presigned URL into the
   error text and the warning log.
 
+### Changed
+- The configuration is validated at boot: unknown keys are errors
+  (`deny_unknown_fields` on every table), duplicate `arlo_device_id` or
+  `stream_name` entries are refused, and the cooldown values must be in
+  range (1 to 86400 s for `debounce_secs` and `max_continuous_live`, 0 to
+  86400 s for `daily_live_budget` and `user_view_probe_secs`).
+- A live session is cut the moment the daily budget runs out (the quota
+  used to be checked only when motion arrived), and every activation
+  charges 15 s of quota on top of the live time. `POST /admin/cameras/{id}/wake`
+  answers `429` within 30 s of the previous session's end.
+
 ### Fixed
 - A camera reported `Offline` while idle entered `Failed` without a
   backoff deadline and stayed there until a restart; every entry into

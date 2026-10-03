@@ -129,9 +129,13 @@ docker build -t arlo-camera-streamer:dev .
 ## Configuration
 
 Copy [`config/streamer.example.toml`](./config/streamer.example.toml)
-to `/etc/arlo-streamer/streamer.toml` (or another prefered location) and edit the marked sections.
+to `/etc/arlo-streamer/streamer.toml` (or another preferred location) and edit the marked sections.
 **Secrets never live in this file** — only the *names* of env vars
-holding the values.
+holding the values. The file is checked before anything starts: an
+unknown key (a typo) is an error, two cameras may not share an
+`arlo_device_id` or a `stream_name`, and the cooldown values must be in
+range (`debounce_secs` and `max_continuous_live` 1 to 86400 s; the
+budget and probe 0 to 86400 s).
 
 | Section / key                       | Type           | Default              | Notes                                                    |
 |-------------------------------------|----------------|----------------------|----------------------------------------------------------|
@@ -256,7 +260,7 @@ Stream URL pattern: `rtsp://<host>:<rtsp.bind>/<cameras.stream_name>`.
 | `GET /readyz`  (port 9090)            | None     | Ready iff started **and** Arlo bus connected. |
 | `GET /admin/state` (port 9091)        | Bearer   | System snapshot (JSON).                |
 | `GET /admin/cameras/{id}` (port 9091) | Bearer   | Per-camera snapshot.                   |
-| `POST /admin/cameras/{id}/wake` (port 9091) | Bearer | Inject a synthetic motion event. |
+| `POST /admin/cameras/{id}/wake` (port 9091) | Bearer | Inject a synthetic motion event; `429` within 30 s of the previous session's end. Each activation also costs 15 s of the daily budget. |
 | `POST /admin/cameras/{id}/idle` (port 9091) | Bearer | Force the camera back to `Idle`. |
 
 ```bash
