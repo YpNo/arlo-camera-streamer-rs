@@ -761,17 +761,30 @@ fn spawn_aac_pump(
 }
 
 /// Set the AAC `appsrc`'s caps from the relayed stream's format.
+/// Built with the typed builder, not parsed from text: the SDP-derived
+/// values are field *values* and can never become field separators. The
+/// SDP-derived fields are strings in GStreamer's RTP caps
+/// (`rtpmp4gdepay` reads them with `gst_structure_get_string`).
 fn apply_aac_caps(appsrc: &gst_app::AppSrc, format: &AacRtpFormat) {
-    let caps = format.caps_string(LIVE_RTP_AAC_PT);
-    match caps.parse::<gst::Caps>() {
-        Ok(caps) => {
-            appsrc.set_caps(Some(&caps));
-            debug!(
-                clock_rate = format.clock_rate,
-                channels = format.channels,
-                "AAC appsrc caps set from the relayed stream"
-            );
-        }
-        Err(e) => warn!(error = %e, "AAC caps rejected; the relayed audio keeps the default caps"),
-    }
+    let caps = gst::Caps::builder("application/x-rtp")
+        .field("media", "audio")
+        .field("encoding-name", "MPEG4-GENERIC")
+        .field(
+            "clock-rate",
+            i32::try_from(format.clock_rate).unwrap_or(i32::MAX),
+        )
+        .field("encoding-params", format.channels.to_string())
+        .field("payload", LIVE_RTP_AAC_PT)
+        .field("mode", "AAC-hbr")
+        .field("config", format.config.as_str())
+        .field("sizelength", format.size_length.to_string())
+        .field("indexlength", format.index_length.to_string())
+        .field("indexdeltalength", format.index_delta_length.to_string())
+        .build();
+    appsrc.set_caps(Some(&caps));
+    debug!(
+        clock_rate = format.clock_rate,
+        channels = format.channels,
+        "AAC appsrc caps set from the relayed stream"
+    );
 }

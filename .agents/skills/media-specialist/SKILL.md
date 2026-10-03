@@ -109,7 +109,10 @@ Arlo-specific behaviour with the `live-validation` skill.
 - TLS: chain verified against the system roots (`rustls-native-certs`), hostname waived
   (raw-IP host) — `WatchAlongVerifier` maps only `NotValidForName*` to accepted; or a
   SHA-256 certificate pin from `arlo.watch_along_cert_sha256`. Server text is bounded:
-  `MAX_LINE_BYTES`, `MAX_HEADERS`, `MAX_MESSAGE_BODY` (`read_text_line`, `body_length`).
+  `MAX_LINE_BYTES`, `MAX_HEADERS`, `MAX_MESSAGE_BODY` (`read_text_line`, `body_length`);
+  the AAC `config` must be hex (`valid_aac_config`), channel pairs distinct and disjoint
+  (`channel_pairs_disjoint`), every write `timed_write`-bounded, the read task held in
+  `AbortOnDrop`. AAC caps are built with `gst::Caps::builder`, never parsed from text.
 - Both legs (`LiveLeg::{Webrtc, Relay}`) go through `arm_live`; the stall watchdog and
   `report_loss` live in `live_watch.rs`.
 - Test source: `Stack::install_source("/mount", launch)` on the crate's own RTSP server.

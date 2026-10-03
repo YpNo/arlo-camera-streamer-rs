@@ -426,11 +426,16 @@ impl Client {
             .request("SETUP", &base.video_control, &[("Transport", &transport)])
             .await?;
         let answered = response.header("Transport").unwrap_or_default();
-        self.link.channels.video =
-            interleaved_channels(answered).unwrap_or((RTP_CHANNEL, RTCP_CHANNEL));
+        let pair = interleaved_channels(answered).unwrap_or((RTP_CHANNEL, RTCP_CHANNEL));
+        if pair.0 == pair.1 {
+            return Err(MediaError::Relay(
+                "server assigned one interleaved channel to both RTP and RTCP".into(),
+            ));
+        }
+        self.link.channels.video = pair;
         debug!(
             transport = answered,
-            rtp_channel = self.link.channels.video.0,
+            rtp_channel = pair.0,
             "video track set up"
         );
         Ok(())
@@ -451,6 +456,13 @@ impl Client {
                 let answered = response.header("Transport").unwrap_or_default();
                 let pair = interleaved_channels(answered)
                     .unwrap_or((AUDIO_RTP_CHANNEL, AUDIO_RTCP_CHANNEL));
+                if !channel_pairs_disjoint(self.link.channels.video, pair) {
+                    warn!(
+                        transport = answered,
+                        "audio channels overlap the video's; relaying the video only"
+                    );
+                    return;
+                }
                 self.link.channels.audio = Some(pair);
                 debug!(
                     transport = answered,
@@ -485,9 +497,12 @@ async fn run(
     let Client { reader, mut link } = client;
     let (acks, mut pending_acks) = mpsc::channel(ACK_QUEUE);
     let channels = link.channels;
-    let mut reading = tokio::spawn(read_loop(
+    // Abort-on-drop: if this task is itself aborted (the shutdown grace
+    // timer) while a write below blocks, the read half must not live on
+    // with the socket.
+    let mut reading = AbortOnDrop(tokio::spawn(read_loop(
         reader, channels, sinks, aac_bare, activity, first_rtp, acks,
-    ));
+    )));
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     let mut rtcp = tokio::time::interval(RTCP_INTERVAL);
     keepalive.tick().await;
@@ -495,32 +510,50 @@ async fn run(
     let end = loop {
         let sent = tokio::select! {
             _ = &mut stop => break None,
-            ended = &mut reading => break Some(read_loop_outcome(ended)),
-            _ = keepalive.tick() => link
-                .send("GET_PARAMETER", &aggregate, &[])
-                .await
-                .map_err(|e| format!("keep-alive: {e}")),
-            _ = rtcp.tick() => link
-                .send_rtcp_receiver_report()
-                .await
-                .map_err(|e| format!("rtcp: {e}")),
+            ended = &mut reading.0 => break Some(read_loop_outcome(ended)),
+            _ = keepalive.tick() => {
+                timed_write("keep-alive", link.send("GET_PARAMETER", &aggregate, &[])).await
+            }
+            _ = rtcp.tick() => timed_write("rtcp", link.send_rtcp_receiver_report()).await,
             ack = pending_acks.recv() => match ack {
-                Some(cseq) => link.ack(&cseq).await.map_err(|e| format!("ack: {e}")),
+                Some(cseq) => timed_write("ack", link.ack(&cseq)).await,
                 // The read loop is over; collect its outcome.
-                None => break Some(read_loop_outcome((&mut reading).await)),
+                None => break Some(read_loop_outcome((&mut reading.0).await)),
             },
         };
         if let Err(why) = sent {
             break Some((LiveLossReason::PeerDisconnected, why));
         }
     };
-    reading.abort();
+    drop(reading);
     match end {
         Some((reason, why)) => {
             warn!(%why, "watch-along relay ended");
             report_loss(&notifier, reason);
         }
         None => teardown(&mut link, &aggregate).await,
+    }
+}
+
+/// A write to the server bounded by `REQUEST_TIMEOUT`: a peer that stops
+/// reading must not hold the writer (and with it the relay) forever.
+async fn timed_write(
+    what: &str,
+    write: impl std::future::Future<Output = std::io::Result<()>>,
+) -> Result<(), String> {
+    match tokio::time::timeout(REQUEST_TIMEOUT, write).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("{what}: {e}")),
+        Err(_) => Err(format!("{what}: write timed out after {REQUEST_TIMEOUT:?}")),
+    }
+}
+
+/// Aborts the task when dropped, so a cancelled owner takes it along.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -1254,12 +1287,32 @@ fn audio_track(sdp: &str) -> Option<AudioTrack> {
         format: AacRtpFormat {
             clock_rate,
             channels,
-            config: param("config")?,
+            config: valid_aac_config(param("config")?)?,
             size_length: width("sizelength", AAC_HBR_SIZE_LENGTH),
             index_length: width("indexlength", AAC_HBR_INDEX_LENGTH),
             index_delta_length: width("indexdeltalength", AAC_HBR_INDEX_LENGTH),
         },
     })
+}
+
+/// Longest `config=` (`AudioSpecificConfig` hex) accepted from an SDP.
+const MAX_AAC_CONFIG_HEX: usize = 256;
+
+/// The `config=` value only if it is what the caps expect — hex of an
+/// `AudioSpecificConfig` — so a server cannot smuggle caps syntax
+/// (`,`, `;`, quotes) through it.
+fn valid_aac_config(config: String) -> Option<String> {
+    let ok = !config.is_empty()
+        && config.len().is_multiple_of(2)
+        && config.len() <= MAX_AAC_CONFIG_HEX
+        && config.bytes().all(|b| b.is_ascii_hexdigit());
+    ok.then_some(config)
+}
+
+/// Whether two interleaved channel pairs can coexist: each pair uses two
+/// distinct channels and the pairs share none.
+fn channel_pairs_disjoint(a: (u8, u8), b: (u8, u8)) -> bool {
+    a.0 != a.1 && b.0 != b.1 && a.0 != b.0 && a.0 != b.1 && a.1 != b.0 && a.1 != b.1
 }
 
 /// `(clock rate, channels)` of an `rtpmap` value naming `MPEG4-GENERIC`.
@@ -1497,6 +1550,15 @@ mod tests {
     }
 
     #[test]
+    fn channel_pairs_must_be_distinct_and_disjoint() {
+        assert!(channel_pairs_disjoint((0, 1), (2, 3)));
+        assert!(!channel_pairs_disjoint((0, 0), (2, 3)));
+        assert!(!channel_pairs_disjoint((0, 1), (1, 2)));
+        assert!(!channel_pairs_disjoint((0, 1), (3, 0)));
+        assert!(!channel_pairs_disjoint((0, 1), (2, 2)));
+    }
+
+    #[test]
     fn interleaved_channels_reads_the_servers_transport_answer() {
         assert_eq!(
             interleaved_channels("RTP/AVP/TCP;unicast;interleaved=2-3;ssrc=1A2B"),
@@ -1698,6 +1760,14 @@ mod tests {
     #[test]
     fn audio_track_needs_a_config_and_the_hbr_mode() {
         assert!(audio_track(&SDP.replace(";config=1408", "")).is_none());
+        // The config is hex or nothing: caps syntax cannot ride in it.
+        assert!(audio_track(&SDP.replace("config=1408", "config=1408,media=video")).is_none());
+        assert!(audio_track(&SDP.replace("config=1408", "config=140")).is_none());
+        assert!(audio_track(&SDP.replace("config=1408", "config=zz08")).is_none());
+        assert!(
+            audio_track(&SDP.replace("config=1408", &format!("config={}", "ab".repeat(129))))
+                .is_none()
+        );
         assert!(audio_track(&SDP.replace("mode=AAC-hbr", "mode=AAC-lbr")).is_none());
         assert!(audio_track(&SDP.replace("MPEG4-GENERIC", "opus")).is_none());
         assert!(audio_track("v=0\r\nm=video 0 RTP/AVP 96\r\n").is_none());
