@@ -375,8 +375,8 @@ changes do not run it, the weekly schedule runs cargo-deny only, and
 Renovate's PRs skip coverage and SonarCloud. After every gate, a push to
 `main` whose `Cargo.toml` version has no release yet gets a GitHub release
 tagged `v<version>`, then the container image for that version: built per
-platform on native runners, pushed by digest, scanned with Trivy (a
-fixable CRITICAL finding stops the release), and tagged
+platform on native runners, each platform scanned with Trivy (a fixable
+CRITICAL finding stops the release), pushed by digest, and tagged
 `ghcr.io/ypno/arlo-camera-streamer-rs:v<version>`, `:latest` and
 `:sha-<commit>`. A push without a version bump publishes nothing.
 

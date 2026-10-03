@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
 # ----------------------------------------------------------------------
 # Stage 1 — build
@@ -7,14 +7,16 @@
 # stage exactly (debian:bookworm-slim ships GStreamer 1.22). The build
 # stage carries the dev headers; runtime carries only the .so files.
 # ----------------------------------------------------------------------
-FROM rust:1.98-slim-bookworm AS builder
+FROM rust:1.98.1-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730 AS builder
 
 # System packages required to build the gstreamer-rs crates against
 # system GStreamer, plus what arlo-rs's transport needs: `wreq` links
 # BoringSSL (`btls-sys`), whose build.rs runs `git init` in its source
 # tree, then cmake and bindgen (libclang), and assembles with nasm.
-# Pinned via debian's own version selection — apt is deterministic per
-# snapshot.
+# Base images are pinned by digest (Renovate bumps them); the apt packages
+# are not version-pinned, so two builds of one commit can differ by a
+# Debian point update. Rebuild on a cadence or pin sources.list to a
+# snapshot.debian.org date if byte-identical rebuilds ever matter.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
@@ -62,7 +64,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # the same isolation by running as a non-root user and stripping the
 # binary at build time.
 # ----------------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 
 # GHCR links the package to the repository through this label; the
 # release workflow adds version, revision and dates.

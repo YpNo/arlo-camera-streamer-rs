@@ -19,6 +19,13 @@ First release: the daemon as validated on the owner's camera and box.
   line, header count and `Content-Length` from the server.
 - A failing thumbnail fetch no longer puts the presigned URL into the
   error text and the warning log.
+- The relay accepts the SDP's AAC `config` only as hex, builds the
+  appsrc caps with the typed builder rather than from text, refuses
+  interleaved channel pairs that overlap, bounds every write to the
+  server by the request timeout, and takes its read task down with it
+  when the writer is aborted.
+- The container image is scanned per platform before any digest is
+  tagged; the base images and the BuildKit frontend are pinned by digest.
 
 ### Changed
 - The configuration is validated at boot: unknown keys are errors
@@ -37,6 +44,10 @@ First release: the daemon as validated on the owner's camera and box.
   `Failed` now arms the backoff, and an `Online` report ends it early.
 - `[webrtc] ice_address_family = "ipv4"` panicked on the first activation
   (webrtcbin's property is `ice-agent`, not `ice`).
+- A second push to `main` during a release could cancel the image build
+  after the tag existed; pushes to `main` are no longer cancelled, the
+  image jobs key on "no image for this version yet" so a re-run
+  publishes it, and every CI job has a timeout.
 
 ### Added
 - The container image is published to GitHub's registry on every release

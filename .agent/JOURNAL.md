@@ -322,3 +322,13 @@ Changed:  Config: `deny_unknown_fields` on every table, `StreamerConfig::validat
 Tests:    App 133, domain 59, ops 38 (+429 mapping untested at HTTP level: the
           actor mapping is), workspace green, release built.
 Open:     Sweep items 5–9.
+
+## 2026-10-03 — Security sweep items 5 and 6
+Changed:  Relay: hex-only AAC `config`, typed caps builder, distinct/disjoint
+          channel pairs, `timed_write` on every server write, `AbortOnDrop`
+          read task. CI: cancel-in-progress for PRs only, `image_missing`
+          output (docker manifest inspect) gates the image jobs, Trivy per
+          platform inside `image`, timeouts on every job. Dockerfile: base
+          images and frontend pinned by digest (Renovate maintains them).
+Tests:    Media 119 + 13; workspace green; actionlint clean; release built.
+Open:     Sweep items 7–9.

@@ -34,15 +34,18 @@ env:
 permissions:
   contents: read
 
-# A new push to the same PR/branch supersedes the running workflow.
+# A new push to the same PR supersedes the running workflow. Pushes to
+# main are never cancelled: a release run cut after the tag but before the
+# image left a version without an image.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   format:
     name: Check Formatting
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     # Root of the build chain: the weekly schedule is for the audit only,
     # and every build job below `needs` this one.
     if: github.event_name != 'schedule'
@@ -58,6 +61,7 @@ jobs:
   clippy:
     name: Lint with Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [format]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -79,6 +83,7 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [clippy] # same build, warmed by clippy's cache; a lint failure skips it
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -107,6 +112,7 @@ jobs:
   security:
     name: Security & License Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
@@ -116,6 +122,7 @@ jobs:
   doc:
     name: Documentation Check
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [clippy]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -137,6 +144,7 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [test]
     # The costliest job (instrumented rebuild + the GStreamer integration
     # tests, ~9 min): not for a dependency bump — the tests already ran.
@@ -206,6 +214,7 @@ jobs:
   sonarqube:
     name: SonarQube
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [test]
     if: github.actor != 'renovate[bot]' # a bump carries no code to analyse
     # Secrets are not readable in a job-level `if`, so the token is mapped
@@ -232,15 +241,18 @@ jobs:
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: [format, clippy, test, security, doc, coverage]
     if: >-
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     permissions:
       contents: write
+      packages: read
     outputs:
       version: ${{ steps.version.outputs.version }}
       created: ${{ steps.exists.outputs.created }}
+      image_missing: ${{ steps.image.outputs.missing }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -266,6 +278,25 @@ jobs:
             echo "created=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # The image jobs key on this, not on `created`: a run cancelled or
+      # failed after the tag can be re-run and still publish the image.
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Is the image for this version published?
+        id: image
+        env:
+          REF: ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+        run: |
+          if docker manifest inspect "$REF" >/dev/null 2>&1; then
+            echo "Image $REF exists."
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create Release
         if: steps.exists.outputs.created == 'true'
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
@@ -287,7 +318,7 @@ jobs:
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     timeout-minutes: 90
     needs: [release]
-    if: needs.release.outputs.created == 'true'
+    if: needs.release.outputs.image_missing == 'true'
     strategy:
       fail-fast: true
       matrix:
@@ -322,6 +353,23 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
           outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+      # Every platform's image is scanned before its digest can be tagged:
+      # report HIGH and CRITICAL, stop on a fixable CRITICAL.
+      - name: Vulnerability report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+      - name: Vulnerability gate
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
       - name: Keep the digest for the manifest job
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -338,7 +386,7 @@ jobs:
           retention-days: 1
 
   image-publish:
-    name: Scan and tag the image
+    name: Tag the image
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [release, image]
@@ -357,28 +405,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Pick the digest to scan
-        id: scan_ref
-        run: |
-          FIRST=$(ls /tmp/digests | head -1)
-          echo "ref=ghcr.io/${{ github.repository }}@sha256:${FIRST}" >> "$GITHUB_OUTPUT"
-      # Report everything, then gate on fixable CRITICAL findings only:
-      # the release stops before any tag points at a vulnerable image.
-      - name: Vulnerability report
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ steps.scan_ref.outputs.ref }}
-          format: table
-          severity: CRITICAL,HIGH
-          exit-code: '0'
-      - name: Vulnerability gate
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ steps.scan_ref.outputs.ref }}
-          format: table
-          severity: CRITICAL
-          ignore-unfixed: true
-          exit-code: '1'
       - name: Tag the manifest list
         env:
           IMAGE: ghcr.io/${{ github.repository }}
