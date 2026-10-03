@@ -219,13 +219,16 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
     #[instrument(skip(self), fields(camera = %camera))]
     async fn register(&self, camera: &CameraId) -> Result<(), DomainError> {
         let stream_name = self.stream_name(camera)?.clone();
-        // Held across the registry call so two concurrent registrations
-        // of one camera cannot both pass the check.
-        let mut registered = self.registered.write().await;
-        // Idempotent fast path: already up.
-        if registered.contains(camera) {
-            debug!("camera already registered; idempotent no-op");
-            return Ok(());
+        // Claim the camera under a short lock, so a concurrent registration
+        // of the same id is a no-op and the other cameras' calls are not
+        // held up by the registry's work; a failure releases the claim.
+        {
+            let mut registered = self.registered.write().await;
+            if registered.contains(camera) {
+                debug!("camera already registered; idempotent no-op");
+                return Ok(());
+            }
+            registered.insert(camera.clone());
         }
         let outputs = build_output_branches(&stream_name, &self.output);
         let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -233,18 +236,16 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         let idle = select_idle_source(None, &stream_name, &timestamp);
         match self.registry.register(camera, idle, outputs).await {
             Ok(()) => {
-                registered.insert(camera.clone());
                 info!("camera registered with idle pipeline");
                 Ok(())
             }
             Err(MediaError::AlreadyRegistered(_)) => {
-                // Adapter saw it first; we still record locally (the
-                // write guard is already held — never lock it again here).
-                registered.insert(camera.clone());
+                // Adapter saw it first; the local claim already stands.
                 debug!("registry reported already-registered; recording locally");
                 Ok(())
             }
             Err(e) => {
+                self.registered.write().await.remove(camera);
                 warn!(error = %e, "register failed");
                 Err(e.into())
             }

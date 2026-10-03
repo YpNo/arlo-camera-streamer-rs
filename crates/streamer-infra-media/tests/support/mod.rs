@@ -110,7 +110,10 @@ impl Stack {
             output,
             webrtc,
             &cameras,
-            streamer_infra_media::RelayTls::from_config(None).expect("system roots"),
+            // The harness relays from its own plaintext RTSP server.
+            streamer_infra_media::RelayTls::from_config(None)
+                .expect("system roots")
+                .allowing_plaintext_to_loopback(),
         );
         Self {
             media,

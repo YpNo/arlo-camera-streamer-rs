@@ -75,7 +75,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, trace, warn};
 
 use streamer_domain::admin::CameraSnapshot;
-use streamer_domain::camera::CameraId;
+use streamer_domain::camera::{CameraId, StreamName};
 use streamer_domain::config::CameraConfig;
 use streamer_domain::error::DomainError;
 use streamer_domain::event::CameraEvent;
@@ -122,6 +122,8 @@ const ACTIVATION_SURCHARGE_SECS: i64 = 15;
 /// Per-camera state-machine task.
 pub struct CameraOrchestrator {
     camera_id: CameraId,
+    /// The configured output stream name, reported in the snapshot.
+    stream_name: StreamName,
     state: CameraState,
     debouncer: MotionDebouncer,
     budget: LiveBudgetTracker,
@@ -218,21 +220,19 @@ impl CameraOrchestrator {
         let now = Local::now().naive_local();
         let debouncer = MotionDebouncer::new(&config.cooldown);
         let budget = LiveBudgetTracker::new(&config.cooldown, now)?;
-        // Placeholder until the first `publish_snapshot` below; the
-        // watch channel needs an initial value before `self` exists.
-        let initial = CameraSnapshot {
-            id: config.arlo_device_id.clone(),
-            stream_name: config.stream_name.clone(),
-            state: String::new(),
-            live_secs_today: 0,
-            daily_budget_secs: 0,
-            live_source: None,
-            last_failure: None,
-            retries: 0,
-            user_view: false,
-        };
+        // The watch channel needs its first value before `self` exists:
+        // the same builder `snapshot()` uses, on the initial state.
+        let initial = build_snapshot(
+            &config.arlo_device_id,
+            &config.stream_name,
+            &CameraState::Idle,
+            &budget,
+            None,
+            false,
+        );
         let this = Self {
             camera_id: config.arlo_device_id.clone(),
+            stream_name: config.stream_name.clone(),
             state: CameraState::Idle,
             debouncer,
             budget,
@@ -259,7 +259,6 @@ impl CameraOrchestrator {
             snapshots: watch::Sender::new(initial),
             shutdown,
         };
-        this.publish_snapshot();
         Ok(this)
     }
 
@@ -451,46 +450,14 @@ impl CameraOrchestrator {
     /// Published after every committed transition and at the top of the
     /// loop (deadline-driven changes, budget time).
     fn snapshot(&self) -> CameraSnapshot {
-        let state_label = match &self.state {
-            CameraState::Idle => "idle",
-            CameraState::Activating => "activating",
-            CameraState::Live => "live",
-            CameraState::BatteryProtect { .. } => "battery-protect",
-            CameraState::Failed { .. } => "failed",
-        };
-        let (last_failure, retries) = match &self.state {
-            CameraState::Failed { reason, retries } => (Some(reason.clone()), *retries),
-            _ => (None, 0),
-        };
-        CameraSnapshot {
-            id: self.camera_id.clone(),
-            stream_name: self.stream_name(),
-            state: state_label.to_string(),
-            live_secs_today: self.budget.spent_secs_today(),
-            daily_budget_secs: self.budget.daily_budget_secs(),
-            live_source: (self.state == CameraState::Live)
-                .then_some(self.session_source)
-                .flatten()
-                .map(|s| s.as_label().to_string()),
-            last_failure,
-            retries,
-            user_view: self.user_view_active(),
-        }
-    }
-
-    /// Stream name is captured from config at construction; rebuilt
-    /// here from `camera_id` because we don't currently store it.
-    /// Kept as a separate function so the small workaround is visible.
-    fn stream_name(&self) -> streamer_domain::camera::StreamName {
-        // Best-effort fallback when the camera id is also a valid
-        // stream name — otherwise the snapshot still serializes but
-        // the stream name is left as the camera id. The orchestrator
-        // does not strictly own the stream name today; future work can
-        // pass it in via the config.
-        streamer_domain::camera::StreamName::parse(self.camera_id.as_str()).unwrap_or_else(|_| {
-            streamer_domain::camera::StreamName::parse("unknown")
-                .expect("'unknown' is a valid stream name")
-        })
+        build_snapshot(
+            &self.camera_id,
+            &self.stream_name,
+            &self.state,
+            &self.budget,
+            self.session_source,
+            self.user_view_active(),
+        )
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -1195,6 +1162,43 @@ fn backoff_duration(retries: u32) -> Duration {
         _ => 60,
     };
     Duration::from_secs(secs)
+}
+
+/// The admin-facing view of one camera's state. A free function so the
+/// orchestrator's constructor and its `snapshot()` share one field list.
+fn build_snapshot(
+    camera_id: &CameraId,
+    stream_name: &StreamName,
+    state: &CameraState,
+    budget: &LiveBudgetTracker,
+    session_source: Option<LiveSource>,
+    user_view: bool,
+) -> CameraSnapshot {
+    let state_label = match state {
+        CameraState::Idle => "idle",
+        CameraState::Activating => "activating",
+        CameraState::Live => "live",
+        CameraState::BatteryProtect { .. } => "battery-protect",
+        CameraState::Failed { .. } => "failed",
+    };
+    let (last_failure, retries) = match state {
+        CameraState::Failed { reason, retries } => (Some(reason.clone()), *retries),
+        _ => (None, 0),
+    };
+    CameraSnapshot {
+        id: camera_id.clone(),
+        stream_name: stream_name.clone(),
+        state: state_label.to_string(),
+        live_secs_today: budget.spent_secs_today(),
+        daily_budget_secs: budget.daily_budget_secs(),
+        live_source: (*state == CameraState::Live)
+            .then_some(session_source)
+            .flatten()
+            .map(|s| s.as_label().to_string()),
+        last_failure,
+        retries,
+        user_view,
+    }
 }
 
 /// Convenience: wall-clock now used by callers.
@@ -2458,6 +2462,11 @@ mod tests {
         let snapshots = orch.snapshots();
         let handle = tokio::spawn(orch.run());
 
+        assert_eq!(
+            snapshots.borrow().stream_name,
+            cfg.stream_name,
+            "the configured stream name, not one derived from the id"
+        );
         send(&tx, motion()).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(

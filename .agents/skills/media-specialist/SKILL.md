@@ -80,9 +80,7 @@ Arlo-specific behaviour with the `live-validation` skill.
 - The three live appsrcs are bounded by `bound_appsrc` (`block=false` **and**
   `leaky-type=downstream`, `max-bytes`, `max-buffers`): `block=false` alone lets the
   queue grow without limit while the live branch is not consuming.
-- `register` holds the registry's write lock from the check to the insert and arms a
-  `MountGuard` after `install_factory_with_media_hook`: any later failure removes the
-  mount again. The multiplexer takes the live leg out of its lock and stops it in
+- The multiplexer takes the live leg out of its lock and stops it in
   `spawn_blocking` (the `Null` transition blocks). `set_state(Playing)` in `build_offer`
   stays **inline**: `start` is raced and dropped at any await, and a blocking task
   cannot be cancelled — it would set Playing after `Drop` set Null and orphan the
@@ -92,8 +90,16 @@ Arlo-specific behaviour with the `live-validation` skill.
   webrtcbin's reason instead of surfacing as a splice timeout.
 - HLS: `prepare_dir` refuses a symlink at the stream dir and a dir not directly under
   `HlsBranchConfig::root`; `%` in the root is escaped in the segment pattern only.
-- The relay dials plaintext `rtsp://` only to loopback (`is_loopback_host`) — the
-  integration tests' server; a remote host must be `rtsps://`.
+- The relay refuses plaintext `rtsp://` unless the `RelayTls` policy was built with
+  `allowing_plaintext_to_loopback()` (the test harness does), and then only to loopback
+  (`is_loopback_host`), with a warning per dial; production never allows it.
+- `register` claims the camera under a short write lock (entry inserted with `_hls: None`),
+  runs the slow part in `bring_up` without the lock (HLS dir, mount with its hook,
+  segmenter), then completes or removes the entry; `MountGuard` removes the mount on a
+  failure after install (unit-tested through the `RemoveMount` trait and a spy: a real
+  `RtspServer` in the lib tests deadlocks on GLib's default main context with the other
+  tests). The multiplexer's
+  `registered` set follows the same claim-then-work shape.
 
 ## HLS output (ADR 0006)
 

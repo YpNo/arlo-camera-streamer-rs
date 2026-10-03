@@ -276,45 +276,44 @@ impl GstPipelineRegistry {
     }
 }
 
-#[async_trait]
-impl PipelineRegistry for GstPipelineRegistry {
-    #[instrument(skip(self, idle, outputs), fields(camera = %camera))]
-    async fn register(
+/// The per-camera handles the `media-configure` hook writes to or reads.
+struct MediaHooks {
+    wiring: WiringSlot,
+    live_active: Arc<AtomicBool>,
+    caption: CaptionSlot,
+    thumbnail_path: PathBuf,
+}
+
+impl GstPipelineRegistry {
+    /// The slow half of a registration, run without the registry lock:
+    /// prepare the HLS directory, install the mount with its hook, start
+    /// the segmenter. A failure after the mount is installed removes it
+    /// again ([`MountGuard`]).
+    async fn bring_up(
         &self,
         camera: &CameraId,
-        idle: IdleKind,
+        idle: &IdleKind,
+        launch: &str,
         outputs: OutputBranches,
-    ) -> Result<(), MediaError> {
-        // The write lock is held from the check to the insert, so two
-        // concurrent registrations of one camera cannot both pass the
-        // check and install two factories (the hook callbacks run on the
-        // GLib thread and never take this lock).
-        let mut state = self.state.write().await;
-        if state.contains_key(camera) {
-            return Err(MediaError::AlreadyRegistered(camera.to_string()));
-        }
-        // Refresh the standby clock so the very first frame after
-        // register reflects the current time.
-        let idle = Self::refresh_overlay_timestamp(&idle);
-        let launch = combined_launch_string(&idle, self.video_encoder);
-        debug!(camera = %camera, launch_string = %launch, "combined launch string");
-
+        hooks: MediaHooks,
+    ) -> Result<Option<HlsSegmenter>, MediaError> {
         let hls_url = match &outputs.hls {
             Some(hls) => Some(self.prepare_hls(&outputs.rtsp_mount_path, hls).await?),
             None => None,
         };
-
-        let wiring: WiringSlot = Arc::new(StdMutex::new(None));
-        let live_active = Arc::new(AtomicBool::new(false));
-        let caption: CaptionSlot = Arc::new(StdMutex::new(None));
-        let caption_for_cb = caption.clone();
-        let wiring_for_cb = wiring.clone();
-        let live_for_cb = live_active.clone();
+        let MediaHooks {
+            wiring,
+            live_active,
+            caption,
+            thumbnail_path: thumb_path_for_cb,
+        } = hooks;
+        let caption_for_cb = caption;
+        let wiring_for_cb = wiring;
+        let live_for_cb = live_active;
         let cam_for_cb = camera.clone();
-        let thumb_path_for_cb = self.thumbnail_file_path(camera);
         self.server.install_factory_with_media_hook(
             &outputs.rtsp_mount_path,
-            &launch,
+            launch,
             move |media: &RTSPMedia| {
                 match build_live_wiring(media) {
                     Ok(w) => {
@@ -371,22 +370,71 @@ impl PipelineRegistry for GstPipelineRegistry {
                  reject, and never deletes them (ADR 0006); use [output.hls]"
             );
         }
-
-        state.insert(
-            camera.clone(),
-            CameraEntry {
-                mount_path: outputs.rtsp_mount_path,
-                idle,
-                last_thumbnail: None,
-                wiring,
-                live_active,
-                session: None,
-                caption,
-                _hls: hls,
-            },
-        );
         mount.disarm();
-        Ok(())
+        Ok(hls)
+    }
+}
+
+#[async_trait]
+impl PipelineRegistry for GstPipelineRegistry {
+    #[instrument(skip(self, idle, outputs), fields(camera = %camera))]
+    async fn register(
+        &self,
+        camera: &CameraId,
+        idle: IdleKind,
+        outputs: OutputBranches,
+    ) -> Result<(), MediaError> {
+        // Refresh the standby clock so the very first frame after
+        // register reflects the current time.
+        let idle = Self::refresh_overlay_timestamp(&idle);
+        let launch = combined_launch_string(&idle, self.video_encoder);
+        debug!(camera = %camera, launch_string = %launch, "combined launch string");
+
+        let wiring: WiringSlot = Arc::new(StdMutex::new(None));
+        let live_active = Arc::new(AtomicBool::new(false));
+        let caption: CaptionSlot = Arc::new(StdMutex::new(None));
+        // Claim the camera under a short write lock: a concurrent
+        // registration of the same id stops at the entry, and the other
+        // cameras' attach/detach/thumbnail calls are not held up by the
+        // slow part below (directories, factory, segmenter thread). The
+        // entry is completed on success and removed on failure.
+        {
+            let mut state = self.state.write().await;
+            if state.contains_key(camera) {
+                return Err(MediaError::AlreadyRegistered(camera.to_string()));
+            }
+            state.insert(
+                camera.clone(),
+                CameraEntry {
+                    mount_path: outputs.rtsp_mount_path.clone(),
+                    idle: idle.clone(),
+                    last_thumbnail: None,
+                    wiring: wiring.clone(),
+                    live_active: live_active.clone(),
+                    session: None,
+                    caption: caption.clone(),
+                    _hls: None,
+                },
+            );
+        }
+        let hooks = MediaHooks {
+            wiring,
+            live_active,
+            caption,
+            thumbnail_path: self.thumbnail_file_path(camera),
+        };
+        match self.bring_up(camera, &idle, &launch, outputs, hooks).await {
+            Ok(hls) => {
+                if let Some(entry) = self.state.write().await.get_mut(camera) {
+                    entry._hls = hls;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.state.write().await.remove(camera);
+                Err(e)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(camera = %camera))]
@@ -637,17 +685,29 @@ fn bound_appsrc(src: &gst_app::AppSrc) {
     src.set_property_from_str("leaky-type", "downstream");
 }
 
+/// What a [`MountGuard`] needs from the server, so the guard's drop
+/// semantics are testable without GStreamer.
+trait RemoveMount {
+    fn remove_mount(&self, mount_path: &str);
+}
+
+impl RemoveMount for Arc<RtspServer> {
+    fn remove_mount(&self, mount_path: &str) {
+        RtspServer::remove_mount(self, mount_path);
+    }
+}
+
 /// Removes a freshly installed mount unless disarmed: registration can
 /// still fail after `install_factory_with_media_hook`, and the mount
 /// must not outlive the failed registration.
-struct MountGuard {
-    server: Arc<RtspServer>,
+struct MountGuard<S: RemoveMount> {
+    server: S,
     mount_path: String,
     armed: bool,
 }
 
-impl MountGuard {
-    fn new(server: Arc<RtspServer>, mount_path: String) -> Self {
+impl<S: RemoveMount> MountGuard<S> {
+    fn new(server: S, mount_path: String) -> Self {
         Self {
             server,
             mount_path,
@@ -660,7 +720,7 @@ impl MountGuard {
     }
 }
 
-impl Drop for MountGuard {
+impl<S: RemoveMount> Drop for MountGuard<S> {
     fn drop(&mut self) {
         if self.armed {
             warn!(mount = %self.mount_path, "registration failed after the mount was installed; removing it");
@@ -920,4 +980,41 @@ fn apply_aac_caps(appsrc: &gst_app::AppSrc, format: &AacRtpFormat) {
         channels = format.channels,
         "AAC appsrc caps set from the relayed stream"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records the mounts removed through it. The real server needs a
+    /// `GLib` main loop, which unit tests must not share across threads.
+    #[derive(Clone, Default)]
+    struct RemovalSpy(Arc<StdMutex<Vec<String>>>);
+
+    impl RemoveMount for RemovalSpy {
+        fn remove_mount(&self, mount_path: &str) {
+            lock(&self.0).push(mount_path.to_string());
+        }
+    }
+
+    /// A registration that fails after the mount is installed must take
+    /// the mount down again; a successful one keeps it.
+    #[test]
+    fn mount_guard_removes_the_mount_unless_disarmed() {
+        let spy = RemovalSpy::default();
+        {
+            let _armed = MountGuard::new(spy.clone(), "/guarded".to_string());
+        }
+        assert_eq!(*lock(&spy.0), vec!["/guarded".to_string()]);
+
+        {
+            let mut guard = MountGuard::new(spy.clone(), "/kept".to_string());
+            guard.disarm();
+        }
+        assert_eq!(
+            *lock(&spy.0),
+            vec!["/guarded".to_string()],
+            "a disarmed guard leaves the mount"
+        );
+    }
 }

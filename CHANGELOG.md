@@ -43,13 +43,13 @@ First release: the daemon as validated on the owner's camera and box.
   forge a log line. Text that arrives from the cloud or a library is
   stripped of control characters and bounded at 256 bytes before it
   reaches the `Failed` state, the admin API or the logs.
-- The ops and admin listeners run with a 10 s header-read timeout and a
-  cap of 64 open connections each; the RTSP server keeps at most 64
-  sessions. `STREAMER_ADMIN_TOKEN` must be at least 16 bytes, is held as
+- The ops and admin listeners speak HTTP/1 only, with a 10 s header-read
+  timeout and a cap of 64 open connections each; the RTSP server keeps at
+  most 64 sessions. `STREAMER_ADMIN_TOKEN` must be at least 16 bytes, is held as
   a secret zeroed on drop and compared with `subtle`. The Arlo and IMAP
   passwords are moved into the client, never copied.
-- The app-view relay refuses a plaintext `rtsp://` URL to a remote host
-  (the egress token would travel in clear); the redacted URL no longer
+- The app-view relay refuses a plaintext `rtsp://` URL (the egress token
+  would travel in clear); the redacted URL no longer
   shows user info and the scheme error no longer echoes the input. The
   TURN credential is redacted from `Debug` output.
 - The session cache directory is created owner-only (`0700`) and the boot
@@ -106,7 +106,8 @@ First release: the daemon as validated on the owner's camera and box.
   async runtime and outside the multiplexer's lock. Registering a camera
   holds its lock from the check to the insert.
 - An admin command no longer waits on a full mailbox; the request is
-  answered `503` at once, as documented.
+  answered `503` at once, as documented. The admin snapshot reports the
+  configured `stream_name` (it used to echo the camera id).
 - ICE servers are filtered case-insensitively (`TURNS`, `TCP`), the admin
   `WWW-Authenticate` header is a constant, the configuration file is read
   without blocking the runtime, and a poisoned device-cache lock is

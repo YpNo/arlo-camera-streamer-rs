@@ -57,7 +57,7 @@ async fn fetch_status(target: SocketAddr) -> Result<u16> {
         .with_context(|| format!("connect to {target}"))?;
     let request = format!(
         "GET {PATH} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        target.ip()
+        host_header(target.ip())
     );
     sock.write_all(request.as_bytes())
         .await
@@ -68,6 +68,15 @@ async fn fetch_status(target: SocketAddr) -> Result<u16> {
         .await
         .context("read answer")?;
     parse_status(&reply).context("malformed HTTP answer")
+}
+
+/// The `Host` value for `ip`: an IPv6 address goes in brackets (RFC 7230
+/// §5.4), or the server rejects the request line as malformed.
+fn host_header(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
 }
 
 /// The status code of an HTTP/1.x status line.
@@ -94,6 +103,12 @@ mod tests {
         assert_eq!(loopback_target(any6).to_string(), "[::1]:9090");
         let fixed: SocketAddr = "10.0.0.5:9090".parse().unwrap();
         assert_eq!(loopback_target(fixed), fixed);
+    }
+
+    #[test]
+    fn host_header_brackets_ipv6() {
+        assert_eq!(host_header("127.0.0.1".parse().unwrap()), "127.0.0.1");
+        assert_eq!(host_header("::1".parse().unwrap()), "[::1]");
     }
 
     #[test]

@@ -68,8 +68,8 @@ audit/deny, Sonar, GitGuardian. Clippy is pedantic: functions over
   bytes), never through `AdapterTransport(format!(..))` directly.
 - Ids from a trust boundary (config, HTTP path, event bus) go through `CameraId::parse`
   (`[A-Za-z0-9_-]{1,64}`); `CameraId::new` is for trusted values and tests only.
-- HTTP listeners go through `streamer_infra_ops::serve::serve` (header-read timeout,
-  connection cap), never bare `axum::serve`.
+- HTTP listeners go through `streamer_infra_ops::serve::serve` (HTTP/1 only, header-read
+  timeout, connection cap), never bare `axum::serve`.
 
 ## Testing
 

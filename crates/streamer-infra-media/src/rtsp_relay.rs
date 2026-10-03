@@ -352,12 +352,17 @@ impl Client {
             .ok_or_else(|| MediaError::Relay("watch-along URL has no host".into()))?
             .to_string();
         let tls = parsed.scheme() == "rtsps";
-        // The URL carries the egress token: in clear only on this machine
-        // (the integration tests' own server), never across a network.
-        if !tls && !is_loopback_host(&host) {
-            return Err(MediaError::Relay(
-                "watch-along URL is plaintext rtsp to a remote host; refused".into(),
-            ));
+        // The URL carries the egress token: plaintext is refused unless
+        // the policy allows it, and then only to this machine's loopback.
+        if !tls {
+            if !(tls_policy.plaintext_loopback && is_loopback_host(&host)) {
+                return Err(MediaError::Relay(
+                    "watch-along URL is plaintext rtsp; refused (rtsps:// expected)".into(),
+                ));
+            }
+            warn!(
+                "dialing plaintext rtsp to loopback; the egress token travels in clear on this host"
+            );
         }
         let port = parsed.port().unwrap_or(if tls { 443 } else { 554 });
         let tcp = tokio::time::timeout(REQUEST_TIMEOUT, TcpStream::connect((host.as_str(), port)))
@@ -1031,12 +1036,17 @@ async fn tls_handshake(
 pub struct RelayTls {
     chain: Arc<WebPkiServerVerifier>,
     pinned: Option<[u8; 32]>,
+    /// Whether a plaintext `rtsp://` URL may be dialed when its host is
+    /// this machine's loopback. Off in production; the integration tests
+    /// relay from the crate's own server.
+    plaintext_loopback: bool,
 }
 
 impl fmt::Debug for RelayTls {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RelayTls")
             .field("pinned", &self.pinned.map(fingerprint_hex))
+            .field("plaintext_loopback", &self.plaintext_loopback)
             .finish_non_exhaustive()
     }
 }
@@ -1066,7 +1076,20 @@ impl RelayTls {
         let chain = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.into())
             .build()
             .map_err(|e| MediaError::Relay(format!("TLS verifier: {e}")))?;
-        Ok(Self { chain, pinned })
+        Ok(Self {
+            chain,
+            pinned,
+            plaintext_loopback: false,
+        })
+    }
+
+    /// Allow a plaintext `rtsp://` URL whose host is loopback. For tests
+    /// and a local relay only: the URL carries the egress token, which
+    /// then travels in clear on this host. Every such dial is logged.
+    #[must_use]
+    pub fn allowing_plaintext_to_loopback(mut self) -> Self {
+        self.plaintext_loopback = true;
+        self
     }
 
     fn verifier(&self) -> WatchAlongVerifier {
@@ -1937,10 +1960,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_refuses_plaintext_rtsp_to_a_remote_host() {
-        let url = WatchAlongUrl::parse("rtsp://192.0.2.1:554/live/x?egressToken=t").unwrap();
-        let tls = RelayTls::from_config(None).unwrap();
-        let Err(err) = Client::connect(&url, &tls).await else {
+    async fn connect_refuses_plaintext_rtsp_unless_the_policy_allows_loopback() {
+        let policy = RelayTls::from_config(None).unwrap();
+        for url in [
+            "rtsp://192.0.2.1:554/live/x?egressToken=t",
+            "rtsp://127.0.0.1:1/live/x?egressToken=t",
+        ] {
+            let url = WatchAlongUrl::parse(url).unwrap();
+            let Err(err) = Client::connect(&url, &policy).await else {
+                panic!("plaintext rtsp was accepted by the default policy");
+            };
+            assert!(err.to_string().contains("plaintext"), "{err}");
+        }
+        // The loopback allowance reaches the socket (refused: nothing
+        // listens on port 1); a remote host stays refused before it.
+        let allowing = policy.allowing_plaintext_to_loopback();
+        let local = WatchAlongUrl::parse("rtsp://127.0.0.1:1/live/x?egressToken=t").unwrap();
+        let Err(err) = Client::connect(&local, &allowing).await else {
+            panic!("nothing listens on port 1");
+        };
+        assert!(!err.to_string().contains("plaintext"), "{err}");
+        let remote = WatchAlongUrl::parse("rtsp://192.0.2.1:554/live/x?egressToken=t").unwrap();
+        let Err(err) = Client::connect(&remote, &allowing).await else {
             panic!("plaintext rtsp to a remote host was accepted");
         };
         assert!(err.to_string().contains("plaintext"), "{err}");

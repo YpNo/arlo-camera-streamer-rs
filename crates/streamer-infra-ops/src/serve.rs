@@ -4,9 +4,11 @@
 //! timeout never fires and a peer that opens a connection and sends
 //! nothing holds it for ever; it also accepts without bound. This loop
 //! runs hyper with a timer and [`ServeLimits::header_read_timeout`], and
-//! refuses connections past [`ServeLimits::max_connections`]. Both
-//! listeners bind loopback by default; the limits matter the day one is
-//! exposed.
+//! refuses connections past [`ServeLimits::max_connections`]. It speaks
+//! HTTP/1 only: the header-read timeout covers every connection then,
+//! whereas an HTTP/2 preface followed by silence would hold a permit
+//! with no timeout at all, and nothing here needs HTTP/2. Both listeners
+//! bind loopback by default; the limits matter the day one is exposed.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -65,12 +67,11 @@ pub(crate) async fn serve(
     let addr: SocketAddr = listener.local_addr().map_err(OpsError::Serve)?;
     info!(%addr, server = name, "HTTP server listening");
 
-    let mut builder = auto::Builder::new(TokioExecutor::new());
+    let mut builder = auto::Builder::new(TokioExecutor::new()).http1_only();
     builder
         .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(limits.header_read_timeout);
-    builder.http2().timer(TokioTimer::new());
     let graceful = GracefulShutdown::new();
     let permits = Arc::new(Semaphore::new(limits.max_connections));
 
@@ -176,6 +177,29 @@ mod tests {
             reply.is_empty() || String::from_utf8_lossy(&reply).contains("408"),
             "{:?}",
             String::from_utf8_lossy(&reply)
+        );
+        shutdown.cancel();
+    }
+
+    /// An HTTP/2 connection preface must not open a timeout-free session:
+    /// the listener is HTTP/1 only, so the preface is a bad request line
+    /// and the connection is answered or closed within the header timeout.
+    #[tokio::test]
+    async fn serve_does_not_keep_an_http2_preface_open() {
+        let limits = ServeLimits {
+            header_read_timeout: Duration::from_millis(300),
+            ..ServeLimits::default()
+        };
+        let (addr, shutdown) = start(limits).await;
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let _reply = read_to_end(&mut sock).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the connection must end, not idle"
         );
         shutdown.cancel();
     }

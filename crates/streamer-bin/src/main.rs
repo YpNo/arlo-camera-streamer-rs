@@ -184,8 +184,14 @@ async fn run(config: StreamerConfig) -> Result<()> {
     // Idle thumbnails live beside the session cache (owner-only), never
     // in the shared temp directory where another user could plant one.
     let thumbnail_dir = thumbnail_dir(&config);
-    streamer_infra_media::prepare_thumbnail_dir(&thumbnail_dir)
-        .with_context(|| format!("thumbnail directory {}", thumbnail_dir.display()))?;
+    {
+        // Filesystem work stays off the runtime's worker threads.
+        let dir = thumbnail_dir.clone();
+        tokio::task::spawn_blocking(move || streamer_infra_media::prepare_thumbnail_dir(&dir))
+            .await
+            .context("thumbnail directory task")?
+            .with_context(|| format!("thumbnail directory {}", thumbnail_dir.display()))?;
+    }
     let pipeline_registry = Arc::new(GstPipelineRegistry::new(
         rtsp_server.clone(),
         video_encoder,
