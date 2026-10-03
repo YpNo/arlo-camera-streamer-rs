@@ -72,6 +72,8 @@ const ADMIN_TOKEN_ENV: &str = "STREAMER_ADMIN_TOKEN";
 /// (e.g. a WebRTC WS close that never acks) can never wedge process
 /// exit. Generous enough for a clean drain under normal conditions.
 const SHUTDOWN_STAGE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Subdirectory beside the session cache that holds the idle thumbnails.
+const THUMBNAIL_DIR_NAME: &str = "thumbnails";
 
 mod list_devices;
 
@@ -170,7 +172,16 @@ async fn run(config: StreamerConfig) -> Result<()> {
     // working backend, an explicit one must work or the boot fails here.
     let video_encoder = streamer_infra_media::encoder::resolve(config.output.video_encoder)
         .context("no usable H.264 encoder")?;
-    let pipeline_registry = Arc::new(GstPipelineRegistry::new(rtsp_server.clone(), video_encoder));
+    // Idle thumbnails live beside the session cache (owner-only), never
+    // in the shared temp directory where another user could plant one.
+    let thumbnail_dir = thumbnail_dir(&config);
+    streamer_infra_media::prepare_thumbnail_dir(&thumbnail_dir)
+        .with_context(|| format!("thumbnail directory {}", thumbnail_dir.display()))?;
+    let pipeline_registry = Arc::new(GstPipelineRegistry::new(
+        rtsp_server.clone(),
+        video_encoder,
+        thumbnail_dir,
+    ));
     let relay_tls =
         streamer_infra_media::RelayTls::from_config(config.arlo.watch_along_cert_sha256.as_deref())
             .context("watch-along TLS policy")?;
@@ -371,12 +382,14 @@ async fn arlo_adapters(config: &StreamerConfig) -> Result<ArloAdapters> {
     let arlo_client = boot(&config.arlo)
         .await
         .context("failed to boot arlo-rs client")?;
-    // One shared reqwest client so connection pooling kicks in across
-    // cameras when fetching presigned thumbnail URLs from S3.
-    let http = reqwest::Client::builder()
-        .user_agent(concat!("arlo-camera-streamer/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("failed to build reqwest client")?;
+    // One shared HTTP client (https only, bounded in time and redirects)
+    // so connection pooling kicks in across cameras when fetching
+    // presigned thumbnail URLs.
+    let http = streamer_infra_arlo::thumbnails::http_client(concat!(
+        "arlo-camera-streamer/",
+        env!("CARGO_PKG_VERSION")
+    ))
+    .context("failed to build the thumbnail HTTP client")?;
     // One shared device cache: stream requests resolve CameraId → Device
     // through it instead of hitting get_devices() on every live request.
     let device_registry = Arc::new(DeviceRegistry::new(arlo_client.clone()));
@@ -410,6 +423,18 @@ async fn arlo_adapters(config: &StreamerConfig) -> Result<ArloAdapters> {
         thumbnails,
         user_views,
     })
+}
+
+/// Where the idle thumbnails are written: a `thumbnails/` directory
+/// beside the session cache, which the operator already keeps private.
+fn thumbnail_dir(config: &StreamerConfig) -> std::path::PathBuf {
+    config
+        .arlo
+        .session_cache_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default()
+        .join(THUMBNAIL_DIR_NAME)
 }
 
 fn load_config(path: &std::path::Path) -> Result<StreamerConfig> {

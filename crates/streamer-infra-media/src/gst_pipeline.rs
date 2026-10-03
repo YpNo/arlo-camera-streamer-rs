@@ -194,19 +194,36 @@ pub struct GstPipelineRegistry {
     /// H.264 encoder backend resolved at boot ([`crate::encoder::resolve`]),
     /// baked into every camera's persistent launch string.
     video_encoder: EncoderBackend,
+    /// Directory holding the per-camera snapshot JPEGs the idle overlay
+    /// loads; prepared by [`prepare_thumbnail_dir`] before this exists.
+    thumbnail_dir: PathBuf,
     state: RwLock<HashMap<CameraId, CameraEntry>>,
 }
 
 impl GstPipelineRegistry {
-    /// Construct from a started RTSP server and the resolved video
-    /// encoder backend.
+    /// Construct from a started RTSP server, the resolved video encoder
+    /// backend and the directory for the idle thumbnails (see
+    /// [`prepare_thumbnail_dir`]).
     #[must_use]
-    pub fn new(server: Arc<RtspServer>, video_encoder: EncoderBackend) -> Self {
+    pub fn new(
+        server: Arc<RtspServer>,
+        video_encoder: EncoderBackend,
+        thumbnail_dir: PathBuf,
+    ) -> Self {
         Self {
             server,
             video_encoder,
+            thumbnail_dir,
             state: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Stable per-camera path where the latest snapshot JPEG is kept for
+    /// the idle `gdkpixbufoverlay` to load. The camera id is
+    /// filename-safe (Arlo device ids are `[A-Z0-9]`).
+    fn thumbnail_file_path(&self, camera: &CameraId) -> PathBuf {
+        self.thumbnail_dir
+            .join(format!("arlo-streamer-thumb-{camera}.jpg"))
     }
 
     /// Check that HLS can run for a camera about to be registered: the
@@ -291,6 +308,7 @@ impl PipelineRegistry for GstPipelineRegistry {
         let wiring_for_cb = wiring.clone();
         let live_for_cb = live_active.clone();
         let cam_for_cb = camera.clone();
+        let thumb_path_for_cb = self.thumbnail_file_path(camera);
         self.server.install_factory_with_media_hook(
             &outputs.rtsp_mount_path,
             &launch,
@@ -301,11 +319,10 @@ impl PipelineRegistry for GstPipelineRegistry {
                         // media so a rebuild between live sessions keeps
                         // showing the thumbnail rather than reverting to
                         // the black STANDBY frame.
-                        if let Some(overlay) = &w.idle_overlay {
-                            let path = thumbnail_file_path(&cam_for_cb);
-                            if path.exists() {
-                                apply_thumbnail_overlay(overlay, &path);
-                            }
+                        if let Some(overlay) = &w.idle_overlay
+                            && thumb_path_for_cb.exists()
+                        {
+                            apply_thumbnail_overlay(overlay, &thumb_path_for_cb);
                         }
                         if let (Some(text), Some(el)) =
                             (lock(&caption_for_cb).as_deref(), &w.idle_caption)
@@ -456,7 +473,7 @@ impl PipelineRegistry for GstPipelineRegistry {
         // idle branch's `gdkpixbufoverlay` at it so the STANDBY screen
         // shows the last snapshot (Phase 5). The write is atomic
         // (temp + rename) so the overlay never reads a partial file.
-        let path = thumbnail_file_path(camera);
+        let path = self.thumbnail_file_path(camera);
         write_thumbnail_atomic(&path, &jpeg).await?;
 
         let mut guard = self.state.write().await;
@@ -596,20 +613,80 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
     })
 }
 
-/// Stable per-camera path where the latest snapshot JPEG is persisted
-/// for the idle `gdkpixbufoverlay` to load. Lives under the system temp
-/// dir; the camera id is filename-safe (Arlo device ids are `[A-Z0-9]`).
-fn thumbnail_file_path(camera: &CameraId) -> PathBuf {
-    std::env::temp_dir().join(format!("arlo-streamer-thumb-{camera}.jpg"))
+/// Owner-only mode for the thumbnail directory and files: the images
+/// are loaded by gdk-pixbuf, so nobody else on the host may plant one.
+#[cfg(unix)]
+const THUMBNAIL_DIR_MODE: u32 = 0o700;
+#[cfg(unix)]
+const THUMBNAIL_FILE_MODE: u32 = 0o600;
+
+/// Create the directory the idle thumbnails are written to and restrict
+/// it to the owner. Called once at boot by the composition root, before
+/// the registry is built; the files from a previous run are kept so the
+/// first STANDBY frame already shows the last snapshot.
+///
+/// # Errors
+///
+/// [`MediaError::Pipeline`] when the directory cannot be created or is
+/// not a directory. A failure to restrict its mode is logged, not fatal:
+/// the directory may live on a filesystem without POSIX modes.
+pub fn prepare_thumbnail_dir(dir: &Path) -> Result<(), MediaError> {
+    std::fs::create_dir_all(dir).map_err(|e| {
+        MediaError::Pipeline(format!(
+            "thumbnail directory {} cannot be created: {e}",
+            dir.display()
+        ))
+    })?;
+    if !dir.is_dir() {
+        return Err(MediaError::Pipeline(format!(
+            "thumbnail path {} is not a directory",
+            dir.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) =
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(THUMBNAIL_DIR_MODE))
+        {
+            warn!(path = %dir.display(), error = %e, "could not restrict thumbnail directory to owner-only");
+        }
+    }
+    Ok(())
 }
 
-/// Atomically write `jpeg` to `path` (write a sibling temp file, then
-/// rename) so the overlay never observes a half-written image.
+/// Atomically write `jpeg` to `path`: a sibling temp file is created
+/// fresh (`create_new`, owner-only), filled, then renamed over `path`,
+/// so the overlay never observes a half-written image and a file planted
+/// at the temp path by someone else is never written through.
 async fn write_thumbnail_atomic(path: &Path, jpeg: &Bytes) -> Result<(), MediaError> {
+    use tokio::io::AsyncWriteExt;
+
     let tmp = path.with_extension("jpg.tmp");
-    tokio::fs::write(&tmp, jpeg)
+    match tokio::fs::remove_file(&tmp).await {
+        Ok(()) => debug!(path = %tmp.display(), "stale thumbnail temp file removed"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(MediaError::Pipeline(format!(
+                "stale thumbnail temp file cannot be removed: {e}"
+            )));
+        }
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(THUMBNAIL_FILE_MODE);
+    let mut file = options
+        .open(&tmp)
+        .await
+        .map_err(|e| MediaError::Pipeline(format!("thumbnail temp file create failed: {e}")))?;
+    file.write_all(jpeg)
         .await
         .map_err(|e| MediaError::Pipeline(format!("thumbnail write failed: {e}")))?;
+    file.flush()
+        .await
+        .map_err(|e| MediaError::Pipeline(format!("thumbnail flush failed: {e}")))?;
+    drop(file);
     tokio::fs::rename(&tmp, path)
         .await
         .map_err(|e| MediaError::Pipeline(format!("thumbnail rename failed: {e}")))

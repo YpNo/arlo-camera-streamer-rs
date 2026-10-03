@@ -28,7 +28,6 @@ anyhow             = { workspace = true }
 clap               = { workspace = true }
 futures            = { workspace = true }
 gstreamer          = { workspace = true }
-reqwest            = { workspace = true }
 serde              = { workspace = true }
 tokio              = { workspace = true }
 tokio-util         = { workspace = true }

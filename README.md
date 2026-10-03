@@ -141,7 +141,7 @@ budget and probe 0 to 86400 s).
 |-------------------------------------|----------------|----------------------|----------------------------------------------------------|
 | `arlo.email`                        | string         | (required)           | Arlo cloud account email.                                |
 | `arlo.password_env`                 | string         | (required)           | Env var name holding the password.                       |
-| `arlo.session_cache_path`           | path           | (required)           | Persisted session token — survives restarts.             |
+| `arlo.session_cache_path`           | path           | (required)           | Persisted session token — survives restarts. The idle thumbnails live in a `thumbnails/` directory beside it (created owner-only at boot). |
 | `arlo.watch_along_cert_sha256`      | hex string     | (unset)              | Pin the watch-along host's certificate (SHA-256) instead of verifying its chain; only when the log says the chain is not trusted (ADR 0007). |
 | `arlo.app_version`                  | string         | `6.46.0`             | Arlo app version the daemon identifies as when fetching the stream of a view you started in the app (ADR 0007). |
 | `arlo.mfa.kind`                     | `email`/`push`/`sms` | (required)     | Second factor. `email` and `push` run headless; `sms` prompts on stdin. |
@@ -389,6 +389,10 @@ Releasing is therefore: bump `version` in `Cargo.toml`, move the
 - The `/admin/*` surface refuses to start without a non-empty
   `STREAMER_ADMIN_TOKEN`. Rotate it by rotating the env var and
   restarting.
+- Thumbnails are fetched over `https` only, with timeouts, a redirect
+  limit, a 2 MiB cap and a JPEG magic check, and written owner-only
+  beside the session cache. Presigned URLs, session ids and tokens are
+  never logged.
 - TLS termination for RTSP is the deployer's responsibility — bind
   `output.rtsp.bind` to `127.0.0.1` and front it with go2rtc / nginx
   if you need encrypted RTSP.

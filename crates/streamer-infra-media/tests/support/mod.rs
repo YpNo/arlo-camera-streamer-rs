@@ -80,9 +80,13 @@ impl Stack {
 
     fn with_outputs(webrtc: WebrtcConfig, hls: Option<HlsOutput>) -> Self {
         let server = RtspServer::start("127.0.0.1:0").expect("rtsp server");
+        let thumbnails =
+            std::env::temp_dir().join(format!("streamer-it-thumbs-{}", std::process::id()));
+        streamer_infra_media::prepare_thumbnail_dir(&thumbnails).expect("thumbnail dir");
         let registry = Arc::new(GstPipelineRegistry::new(
             server.clone(),
             streamer_infra_media::encoder::EncoderBackend::X264,
+            thumbnails,
         ));
         let camera = CameraId::new(CAMERA);
         let cameras = [CameraConfig {

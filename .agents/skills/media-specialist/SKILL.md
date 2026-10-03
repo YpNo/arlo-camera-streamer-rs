@@ -68,7 +68,13 @@ Arlo-specific behaviour with the `live-validation` skill.
   pad stalls media prepare). Silent bed + live `rtpopusdepay ! opusdec` mixed, all
   pinned to **F32LE** stereo 48 kHz — `avenc_aac` rejects S16LE ("not-negotiated").
 - Idle still: `gdkpixbufoverlay name=idle_overlay` is a pass-through until a thumbnail
-  file is set; a rebuilt media re-applies it at `media-configure`.
+  file is set; a rebuilt media re-applies it at `media-configure`. The file lives in
+  the registry's `thumbnail_dir` (`GstPipelineRegistry::new` third argument; the bin
+  passes `<session_cache_path dir>/thumbnails`, prepared owner-only by
+  `prepare_thumbnail_dir` at boot), written through a `create_new` temp file and a
+  rename — never the shared temp directory (sweep finding M4). The adapter fetching
+  it (`streamer-infra-arlo/thumbnails.rs`) is https-only, bounded (10 s, 2 MiB, two
+  redirects) and checks the JPEG magic, so gdk-pixbuf only ever loads our own JPEGs.
 - Pin each branch's final caps in one capsfilter; keep launch strings as pure builders
   in `pipeline_desc.rs` with their constants beside them.
 

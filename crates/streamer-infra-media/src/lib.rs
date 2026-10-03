@@ -61,7 +61,7 @@ pub mod webrtc_pipeline;
 
 pub use codec_cache::CodecCache;
 pub use error::MediaError;
-pub use gst_pipeline::GstPipelineRegistry;
+pub use gst_pipeline::{GstPipelineRegistry, prepare_thumbnail_dir};
 pub use idle_source::{IDLE_FPS, IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH, select_idle_source};
 pub use live_rtp_sink::{
     AacFeed, AacRtpFormat, LiveAacSink, LiveRtpSink, LiveSinkReceivers, LiveSinks,

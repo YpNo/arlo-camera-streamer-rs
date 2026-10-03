@@ -17,6 +17,15 @@ use reqwest::Url;
 /// the thumbnail adapter falls back to the device list.
 pub const SNAPSHOT_URL_MAX_AGE: Duration = Duration::from_secs(600);
 
+/// Whether `url` is an absolute `https` URL with a host: the only shape
+/// a presigned snapshot URL is allowed to have, whichever way it reached
+/// us (event bus or device list). Anything else is refused before an
+/// HTTP client ever sees it.
+#[must_use]
+pub fn is_https_with_host(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some())
+}
+
 /// Per-camera latest snapshot URL. Shared by the event and thumbnail
 /// adapters behind an `Arc`.
 #[derive(Default)]
@@ -28,7 +37,7 @@ impl SnapshotUrlCache {
     /// Record `url` for `device_id` as of `now`. Only `https` URLs with a
     /// host are accepted; anything else is ignored and `false` returned.
     pub fn record(&self, device_id: &str, url: &str, now: Instant) -> bool {
-        let valid = Url::parse(url).is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some());
+        let valid = is_https_with_host(url);
         if valid {
             self.lock()
                 .insert(device_id.to_string(), (url.to_string(), now));
@@ -70,6 +79,18 @@ mod tests {
     use super::*;
 
     const URL: &str = "https://arlos3-prod-z1.s3.amazonaws.com/x/last.jpg?X-Amz-Signature=s";
+
+    #[test]
+    fn is_https_with_host_accepts_only_absolute_https_urls() {
+        assert!(is_https_with_host(URL));
+        assert!(!is_https_with_host("http://arlos3.example/last.jpg"));
+        assert!(!is_https_with_host("https://"));
+        // The WHATWG parser folds extra slashes: this one *has* a host.
+        assert!(is_https_with_host("https:///last.jpg"));
+        assert!(!is_https_with_host("file:///etc/passwd"));
+        assert!(!is_https_with_host("/relative/last.jpg"));
+        assert!(!is_https_with_host(""));
+    }
 
     #[test]
     fn record_then_fresh_returns_the_url() {

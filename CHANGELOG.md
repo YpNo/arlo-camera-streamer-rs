@@ -26,6 +26,15 @@ First release: the daemon as validated on the owner's camera and box.
   when the writer is aborted.
 - The container image is scanned per platform before any digest is
   tagged; the base images and the BuildKit frontend are pinned by digest.
+- The thumbnail fetch treats the storage endpoint as untrusted: `https`
+  only (the device-list URL is checked like the bus URL), 10 s request
+  and 5 s connect timeouts, at most two redirects, a 2 MiB body cap read
+  chunk by chunk, and the bytes must start with the JPEG magic before
+  they reach the image loader.
+- Idle thumbnails are written to a `thumbnails/` directory beside the
+  session cache (created owner-only at boot) instead of the shared
+  system temp directory, through a freshly created temp file; another
+  user on the host can no longer plant or block them.
 
 ### Changed
 - The configuration is validated at boot: unknown keys are errors

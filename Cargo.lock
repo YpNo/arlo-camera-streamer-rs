@@ -120,7 +120,6 @@ dependencies = [
  "clap",
  "futures",
  "gstreamer",
- "reqwest",
  "serde",
  "streamer-app",
  "streamer-domain",
