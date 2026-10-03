@@ -448,6 +448,8 @@ impl CameraOrchestrator {
     }
 
     /// Build a [`CameraSnapshot`] from the current orchestrator state.
+    /// Published after every committed transition and at the top of the
+    /// loop (deadline-driven changes, budget time).
     fn snapshot(&self) -> CameraSnapshot {
         let state_label = match &self.state {
             CameraState::Idle => "idle",
@@ -868,6 +870,11 @@ impl CameraOrchestrator {
                 self.metrics
                     .record_budget(&self.camera_id, BudgetDecision::Reset);
             }
+            // The admin layer must see the committed state during the side
+            // effect that follows (a negotiation takes seconds); the
+            // loop-top publish alone would show the previous state until
+            // this signal is fully handled.
+            self.publish_snapshot();
             let follow_ups = self.apply_state_change(&from, &to).await?;
             for f in follow_ups {
                 signals.push_back(f);
@@ -1261,6 +1268,43 @@ mod tests {
         }
         async fn teardown(&self, _camera: &CameraId) -> Result<(), DomainError> {
             *self.stops.lock().await += 1;
+            Ok(())
+        }
+    }
+
+    /// A signaler that holds the negotiation until `release` is called,
+    /// so a test can observe the orchestrator mid-activation.
+    struct HeldSignaler {
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl HeldSignaler {
+        fn new() -> (Arc<Self>, tokio::sync::oneshot::Sender<()>) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (
+                Arc::new(Self {
+                    release: Mutex::new(Some(rx)),
+                }),
+                tx,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl WebrtcSignaler for HeldSignaler {
+        async fn negotiate(
+            &self,
+            _camera: &CameraId,
+            offer: &mut dyn streamer_domain::port::OfferBuilder,
+        ) -> Result<SignalingAnswer, DomainError> {
+            offer.build_offer(&[]).await?;
+            let gate = self.release.lock().await.take();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            Ok(ok_answer())
+        }
+        async fn teardown(&self, _camera: &CameraId) -> Result<(), DomainError> {
             Ok(())
         }
     }
@@ -2398,6 +2442,35 @@ mod tests {
             !calls.contains(&MediaCall::DetachLive),
             "stale live_since would have tripped the cap immediately"
         );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    /// The snapshot used to be published only at the top of the loop, so
+    /// a camera inside a negotiation (seconds) still reported `idle`.
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_shows_activating_while_the_negotiation_is_in_flight() {
+        let cfg = camera_cfg(60, 300);
+        let (sr, release) = HeldSignaler::new();
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr, media.clone());
+        let snapshots = orch.snapshots();
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            snapshots.borrow().state,
+            "activating",
+            "committed state is visible during the side effect"
+        );
+        assert_eq!(snapshots.borrow().live_source, None);
+
+        let _ = release.send(());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(snapshots.borrow().state, "live");
+        assert_eq!(snapshots.borrow().live_source.as_deref(), Some("motion"));
 
         token.cancel();
         handle.await.unwrap();

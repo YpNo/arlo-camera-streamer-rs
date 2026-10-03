@@ -16,7 +16,10 @@ const TCP: &str = "tcp";
 /// `turn` and `turns`, whatever the case: both carry credentials and
 /// both are refused over TCP.
 fn is_turn(kind: &str) -> bool {
-    kind.len() >= TURN.len() && kind[..TURN.len()].eq_ignore_ascii_case(TURN)
+    // `get`, never a slice: `kind` is cloud input and a byte index inside
+    // a multibyte character would panic the negotiation.
+    kind.get(..TURN.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(TURN))
 }
 
 fn is_tcp(transport: Option<&str>) -> bool {
@@ -97,6 +100,17 @@ mod tests {
     #[test]
     fn usable_ice_servers_empty_list_is_empty() {
         assert!(usable_ice_servers(&servers(r#"{"data":[]}"#)).is_empty());
+    }
+
+    #[test]
+    fn is_turn_never_panics_on_non_ascii_kinds() {
+        assert!(is_turn("turn"));
+        assert!(is_turn("TURNS"));
+        assert!(!is_turn("stun"));
+        assert!(!is_turn("tur"));
+        // Byte 4 falls inside the second `\u{e9}`: a slice would panic.
+        assert!(!is_turn("a\u{e9}\u{e9}"));
+        assert!(!is_turn("\u{e9}\u{e9}\u{e9}"));
     }
 
     #[test]

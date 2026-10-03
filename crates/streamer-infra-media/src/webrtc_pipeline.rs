@@ -322,12 +322,15 @@ struct OfferGathering<'a> {
 impl OfferBuilder for OfferGathering<'_> {
     async fn build_offer(&mut self, ice_servers: &[IceServer]) -> Result<String, DomainError> {
         apply_ice(self.webrtcbin, ice_servers);
-        // A state change blocks until the elements have changed state;
-        // keep that off the async runtime's worker threads.
-        let pipeline = self.pipeline.clone();
-        tokio::task::spawn_blocking(move || pipeline.set_state(gst::State::Playing))
-            .await
-            .map_err(|e| MediaError::Pipeline(format!("pipeline → Playing task: {e}")))?
+        // Inline on purpose: `start` is raced against the loss signal and
+        // may be dropped at any await. A `spawn_blocking` here could not
+        // be cancelled, and would set Playing *after* `Drop` set Null,
+        // leaving an owner-less pipeline running. For a live pipeline the
+        // call returns `Async` at once, so nothing is kept off the runtime
+        // worth the race; the slow transition (`Null`) runs in the
+        // multiplexer's `spawn_blocking` on detach.
+        self.pipeline
+            .set_state(gst::State::Playing)
             .map_err(|e| MediaError::Pipeline(format!("pipeline → Playing: {e}")))?;
         spawn_bus_watch(self.pipeline, self.notifier.clone());
         let offer_sdp = tokio::time::timeout(OFFER_TIMEOUT, self.offer_rx.recv())

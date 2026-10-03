@@ -82,8 +82,11 @@ Arlo-specific behaviour with the `live-validation` skill.
   queue grow without limit while the live branch is not consuming.
 - `register` holds the registry's write lock from the check to the insert and arms a
   `MountGuard` after `install_factory_with_media_hook`: any later failure removes the
-  mount again. `set_state` calls run in `spawn_blocking`; the multiplexer takes the live
-  leg out of its lock before stopping it.
+  mount again. The multiplexer takes the live leg out of its lock and stops it in
+  `spawn_blocking` (the `Null` transition blocks). `set_state(Playing)` in `build_offer`
+  stays **inline**: `start` is raced and dropped at any await, and a blocking task
+  cannot be cancelled — it would set Playing after `Drop` set Null and orphan the
+  pipeline.
 - `set-remote-description` / `set-local-description` get a `Promise::with_change_func`
   (`sdp_outcome`): a rejected answer fails the attach within `SDP_APPLY_TIMEOUT` with
   webrtcbin's reason instead of surfacing as a splice timeout.

@@ -102,9 +102,9 @@ First release: the daemon as validated on the owner's camera and box.
   consume; they now drop past 4 MiB or 2048 packets (`leaky-type`).
 - An answer webrtcbin rejects is reported at once with its reason instead
   of as a splice timeout 20 s later; a failed local description is logged.
-- Pipeline state changes run off the async runtime, and the live leg is
-  stopped outside the multiplexer's lock. Registering a camera holds its
-  lock from the check to the insert.
+- The live leg's teardown (the pipeline's `Null` transition) runs off the
+  async runtime and outside the multiplexer's lock. Registering a camera
+  holds its lock from the check to the insert.
 - An admin command no longer waits on a full mailbox; the request is
   answered `503` at once, as documented.
 - ICE servers are filtered case-insensitively (`TURNS`, `TCP`), the admin

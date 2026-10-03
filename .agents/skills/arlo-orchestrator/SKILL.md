@@ -90,8 +90,10 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   under `supervised()`: an exit or panic while the token is live cancels the token,
   the composition root exits non-zero. An upstream bus end is fatal the same way
   (`EventRouter` cancels the shared token, so it gets `shutdown.clone()`, not a child).
-- **Snapshots are published, not requested**: `publish_snapshot()` at the top of every
-  loop iteration pushes a `CameraSnapshot` on a `watch` channel (`send_if_modified`);
+- **Snapshots are published, not requested**: `publish_snapshot()` right after a
+  transition is committed in `process_signals` (before its side effect awaits) and at
+  the top of every loop iteration pushes a `CameraSnapshot` on a `watch` channel
+  (`send_if_modified`);
   `AdminRoute.snapshots` reads it with `borrow()`. `AdminCommand` has no `Snapshot`
   variant any more — a camera inside a negotiation used to time out and report
   `unresponsive`. Tests read `orch.snapshots()` and `sleep` a few ms between reads.
