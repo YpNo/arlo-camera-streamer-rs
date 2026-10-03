@@ -113,15 +113,26 @@ jobs:
     name: Security & License Audit
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # On pull_request events gitleaks lists the PR's commits through the
+    # API, which needs pull-requests: read (the restricted default token
+    # carries contents and packages only). Comments are off so write access
+    # is never required; findings fail the job and show in the log.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # gitleaks scans the whole history, not the checked-out tree only.
           fetch-depth: 0
       - name: Secret scan
+        # Rules and allow-list live in .gitleaks.toml. No license key is
+        # needed for a personal-account repository.
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_COMMENTS: "false"
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check

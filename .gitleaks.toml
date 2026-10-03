@@ -1,0 +1,42 @@
+# gitleaks configuration — the security CI job runs it over the pushed
+# or PR commit range; `gitleaks detect --log-opts=--all` runs it over the
+# whole history locally.
+title = "arlo-camera-streamer-rs"
+
+[extend]
+useDefault = true
+
+# Arlo-specific shapes the default rules do not know.
+[[rules]]
+id = "arlo-session-cache"
+description = "Committed arlo-rs session cache (access token / cookie jar)"
+path = '''(^|/)(\.arlo[-_]streamer[-_])?session[^/]*\.json$'''
+
+[[rules]]
+id = "arlo-presigned-s3-url"
+description = "Presigned S3 URL (a bearer capability) in a committed file"
+regex = '''X-Amz-Signature=[0-9a-f]{16,}'''
+
+[[rules]]
+id = "arlo-egress-token"
+description = "Watch-along egress token (a bearer capability) in a committed file"
+regex = '''egressToken=[A-Za-z0-9%._-]{16,}'''
+
+[[rules]]
+id = "streamer-admin-token-env"
+description = "A real admin token written next to its env var name"
+regex = '''STREAMER_ADMIN_TOKEN=["\']?[A-Za-z0-9+/=_-]{32,}'''
+
+[allowlist]
+description = "Documented placeholders and synthetic fixtures"
+paths = [
+  '''^config/streamer\.example\.toml$''',
+  '''^\.security/''',
+  '''^docs/banner''',
+]
+regexes = [
+  '''X-Amz-Signature=(s|SECRET)\b''',
+  '''egressToken=(t|T|SECRET)\b''',
+  '''secret-token-of-sixteen-bytes-or-more''',
+  '''openssl rand -hex 32''',
+]
