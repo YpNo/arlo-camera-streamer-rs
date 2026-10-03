@@ -25,12 +25,13 @@ mod support;
 
 use std::time::Duration;
 
-use streamer_domain::config::{HlsOutput, WebrtcConfig};
+use streamer_domain::config::{HlsOutput, VideoEncoder, WebrtcConfig};
 use streamer_domain::error::DomainError;
 use streamer_domain::port::{MediaMultiplexer, WebrtcSignaler};
 use streamer_domain::state::LiveLossReason;
 use streamer_domain::stream::WatchAlongUrl;
 
+use streamer_infra_media::encoder::{self, EncoderBackend};
 use streamer_infra_media::pipeline_desc::HLS_SEGMENTS_BEYOND_PLAYLIST;
 use support::gateway::FakeGateway;
 use support::probe::{RtspProbe, eventually};
@@ -510,4 +511,45 @@ fn segments(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         .unwrap_or_default();
     found.sort();
     found
+}
+
+/// `auto` must land on a backend whose dry run passed on this host; in
+/// CI and most dev boxes that is x264, with the VA plugins present but no
+/// render node — the fallback the probe exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encoder_auto_resolves_to_a_working_backend() {
+    let _serial = SERIAL.lock().await;
+    if !gstreamer_ready() {
+        return;
+    }
+    let backend = encoder::resolve(VideoEncoder::Auto).expect("some encoder works, x264 at least");
+    assert!(EncoderBackend::AUTO_ORDER.contains(&backend));
+    // The pipeline built from it is the one the daemon would run.
+    assert!(
+        encoder::resolve(VideoEncoder::X264).is_ok(),
+        "x264 always passes its dry run"
+    );
+}
+
+/// An explicit backend that cannot work here is refused at resolve time,
+/// not at the first client. Skipped when every backend happens to work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encoder_explicit_unavailable_backend_is_refused() {
+    let _serial = SERIAL.lock().await;
+    if !gstreamer_ready() {
+        return;
+    }
+    for config in [
+        VideoEncoder::Nvenc,
+        VideoEncoder::V4l2,
+        VideoEncoder::Va,
+        VideoEncoder::Vaapi,
+    ] {
+        if let Err(e) = encoder::resolve(config) {
+            let text = e.to_string();
+            assert!(text.contains("is not usable on this host"), "{text}");
+            return;
+        }
+    }
+    eprintln!("every hardware backend works here; nothing to refuse");
 }

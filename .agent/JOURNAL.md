@@ -264,3 +264,16 @@ Changed:  Third audiomixer input (`live_aac_rtp_src`, rtpmp4gdepay →
 Tests:    Media 110 unit + 11 integration (new: tone through the relay heard
           by the probe's `level`); workspace green; release built.
 Open:     — (audio heard in VLC and the probe's resume path seen live on 2026-10-02; grace cut to 2 s).
+
+## 2026-10-03 — ADR 0008: encoder selection; MFA skill validated
+Changed:  `VideoEncoder::{Auto (default), X264, Va, Vaapi, V4l2, Nvenc}`;
+          media `encoder.rs` (`EncoderBackend`, segments, `resolve` with a
+          dry run per backend); main resolves at boot; Dockerfile carries
+          vaapi + VA drivers; README/config/ADR 0008. MFA skill corrected
+          from a fresh login (9261 for a new device id → arlo-rs
+          fix/untrusted-9261). arlo-rs refactor/examples-common.
+Tests:    Media 113 unit + 13 integration (auto resolves on a box with VA
+          elements but no /dev/dri → x264; explicit unavailable refused);
+          domain 57; workspace green; release built.
+Open:     Hardware backends (va, v4l2, nvenc) unseen on hardware; Frigate
+          box deployment pending.

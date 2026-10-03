@@ -181,22 +181,29 @@ const fn default_push_timeout_secs() -> u64 {
     120
 }
 
-/// H.264 encoder for the unified splice pipeline.
+/// H.264 encoder for the unified splice pipeline (ADR 0008).
 ///
 /// The encoder runs continuously per connected camera (see the README
-/// "Performance" section), so it dominates CPU. `x264` is portable
-/// software encoding; `vaapi` offloads to an Intel/AMD GPU
-/// (QuickSync/VAAPI), cutting the per-camera cost to near-zero — but it
-/// requires the `gstreamer1.0-vaapi` plugin and a working `/dev/dri`
-/// render node on the host.
+/// "Performance" section), so it dominates CPU. `auto` probes the host
+/// at boot and takes the first working backend, hardware first; the
+/// explicit names pin one and fail the boot when it does not work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoEncoder {
-    /// Software `x264enc` (default; works everywhere).
+    /// Probe at boot: NVIDIA, Intel/AMD (`va`, then `vaapi`), V4L2, x264.
     #[default]
+    Auto,
+    /// Software `x264enc`; works everywhere (the Raspberry Pi 5 has no
+    /// H.264 hardware encoder and ends up here).
     X264,
-    /// Hardware `vaapih264enc` (Intel/AMD GPU via VAAPI).
+    /// Intel/AMD GPU through the `va` plugin (`vah264enc`).
+    Va,
+    /// Intel/AMD GPU through the older `vaapi` plugin (`vaapih264enc`).
     Vaapi,
+    /// V4L2 memory-to-memory (`v4l2h264enc`): Raspberry Pi 4 / Zero 2 / CM4.
+    V4l2,
+    /// NVIDIA GPU (`nvh264enc`).
+    Nvenc,
 }
 
 /// All output-side configuration: stream endpoints + ops sockets.
@@ -412,23 +419,29 @@ mod tests {
     }
 
     #[test]
-    fn video_encoder_parses_lowercase_and_defaults_to_x264() {
+    fn video_encoder_parses_lowercase_and_defaults_to_auto() {
         #[derive(Deserialize)]
         struct W {
             #[serde(default)]
             e: VideoEncoder,
         }
-        assert_eq!(VideoEncoder::default(), VideoEncoder::X264);
-        assert_eq!(toml::from_str::<W>("").unwrap().e, VideoEncoder::X264);
-        assert_eq!(
-            toml::from_str::<W>("e = \"x264\"").unwrap().e,
-            VideoEncoder::X264
-        );
-        assert_eq!(
-            toml::from_str::<W>("e = \"vaapi\"").unwrap().e,
-            VideoEncoder::Vaapi
-        );
-        assert!(toml::from_str::<W>("e = \"nvenc\"").is_err());
+        assert_eq!(VideoEncoder::default(), VideoEncoder::Auto);
+        assert_eq!(toml::from_str::<W>("").unwrap().e, VideoEncoder::Auto);
+        for (name, want) in [
+            ("auto", VideoEncoder::Auto),
+            ("x264", VideoEncoder::X264),
+            ("va", VideoEncoder::Va),
+            ("vaapi", VideoEncoder::Vaapi),
+            ("v4l2", VideoEncoder::V4l2),
+            ("nvenc", VideoEncoder::Nvenc),
+        ] {
+            assert_eq!(
+                toml::from_str::<W>(&format!("e = \"{name}\"")).unwrap().e,
+                want
+            );
+        }
+        assert!(toml::from_str::<W>("e = \"qsv\"").is_err());
+        assert!(toml::from_str::<W>("e = \"X264\"").is_err());
     }
 
     #[test]

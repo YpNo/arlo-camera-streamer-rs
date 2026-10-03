@@ -31,7 +31,9 @@ use std::path::Path;
 
 use crate::live_rtp_sink::AacRtpFormat;
 use streamer_domain::camera::StreamName;
-use streamer_domain::config::{DashOutput, HlsOutput, OutputConfig, VideoEncoder};
+use streamer_domain::config::{DashOutput, HlsOutput, OutputConfig};
+
+use crate::encoder::EncoderBackend;
 
 use crate::idle_source::{IDLE_FPS, IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH};
 
@@ -264,7 +266,7 @@ fn format_dir(root: &Path, name: &StreamName) -> String {
 ///   after the content switch.
 /// - Clients see one continuous H.264 stream with stable SPS/PPS.
 #[must_use]
-pub fn combined_launch_string(idle: &IdleKind, encoder: VideoEncoder) -> String {
+pub fn combined_launch_string(idle: &IdleKind, encoder: EncoderBackend) -> String {
     // `queue` before every selector sink pad: decouples per-branch
     // streaming threads and prevents an initially-quiet branch (the
     // live appsrc before any RTP arrives) from blocking downstream
@@ -287,41 +289,12 @@ pub fn combined_launch_string(idle: &IdleKind, encoder: VideoEncoder) -> String 
             ! rtpmp4apay name=pay1 pt=97 )",
         idle_raw = idle_raw_chain(idle),
         live_decode = live_decode_chain(),
-        video_enc = video_encoder_segment(encoder),
+        video_enc = encoder.segment(),
         idle_audio = idle_audio_raw_chain(),
         live_audio = live_audio_decode_chain(),
         live_aac = live_aac_decode_chain(),
         aenc = UNIFIED_AUDIO_ENCODER_NAME,
     )
-}
-
-/// The downstream H.264 encoder segment, selected by [`VideoEncoder`].
-/// Both variants are named [`UNIFIED_ENCODER_NAME`] (so
-/// [`crate::gst_pipeline`] can force-key-unit them at each splice) and
-/// end in the same `byte-stream,alignment=au` caps, so the downstream
-/// `h264parse ! rtph264pay` is identical either way.
-///
-/// The VAAPI path inserts `vaapipostproc` to upload the raw I420 to a
-/// VA surface. It requires `gstreamer1.0-vaapi` and a `/dev/dri` render
-/// node; validate on the target host (no software fallback here — if the
-/// element is missing the media fails to construct, surfaced on the
-/// pipeline bus).
-fn video_encoder_segment(encoder: VideoEncoder) -> String {
-    let name = UNIFIED_ENCODER_NAME;
-    let gop = UNIFIED_GOP;
-    let kbps = VIDEO_BITRATE_KBPS;
-    match encoder {
-        VideoEncoder::X264 => format!(
-            "x264enc name={name} tune=zerolatency speed-preset=superfast \
-                      bitrate={kbps} key-int-max={gop} \
-             ! video/x-h264,stream-format=byte-stream,alignment=au"
-        ),
-        VideoEncoder::Vaapi => format!(
-            "vaapipostproc \
-             ! vaapih264enc name={name} rate-control=cbr bitrate={kbps} keyframe-period={gop} \
-             ! video/x-h264,stream-format=byte-stream,alignment=au"
-        ),
-    }
 }
 
 /// Idle producer normalized to the **unified raw caps** (Phase 7).
@@ -426,7 +399,7 @@ fn escape_gst_text(s: &str) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use streamer_domain::config::{DashOutput, HlsOutput, OutputConfig, RtspOutput};
+    use streamer_domain::config::{DashOutput, HlsOutput, OutputConfig, RtspOutput, VideoEncoder};
 
     fn name() -> StreamName {
         StreamName::parse("front_door").unwrap()
@@ -529,7 +502,7 @@ mod tests {
             stream_name: name(),
             overlay: r#"say "hi" \ bye"#.to_string(),
         };
-        let desc = combined_launch_string(&idle, VideoEncoder::X264);
+        let desc = combined_launch_string(&idle, EncoderBackend::X264);
         assert!(desc.contains(r#"text="say \"hi\" \\ bye""#), "{desc}");
     }
 
@@ -552,7 +525,7 @@ mod tests {
 
     #[test]
     fn combined_launch_string_has_idle_and_live_video_branches_into_selector() {
-        let s = combined_launch_string(&synth_idle(), VideoEncoder::X264);
+        let s = combined_launch_string(&synth_idle(), EncoderBackend::X264);
         assert!(s.contains("sel.sink_0"));
         assert!(s.contains("appsrc name=live_rtp_src"));
         assert!(s.contains("rtph264depay"));
@@ -566,7 +539,7 @@ mod tests {
         // Phase-7 contract: one downstream video encoder produces the
         // whole H.264 stream so VLC never sees an SPS/PPS change at
         // the splice.
-        let s = combined_launch_string(&synth_idle(), VideoEncoder::X264);
+        let s = combined_launch_string(&synth_idle(), EncoderBackend::X264);
         assert_eq!(s.matches("x264enc").count(), 1);
         assert!(s.contains(&format!("name={UNIFIED_ENCODER_NAME}")));
         assert_eq!(s.matches("rtph264pay").count(), 1);
@@ -576,7 +549,7 @@ mod tests {
 
     #[test]
     fn combined_launch_string_x264_is_default_software_encoder() {
-        let s = combined_launch_string(&synth_idle(), VideoEncoder::X264);
+        let s = combined_launch_string(&synth_idle(), EncoderBackend::X264);
         assert!(s.contains(&format!("x264enc name={UNIFIED_ENCODER_NAME}")));
         assert!(s.contains(&format!("bitrate={VIDEO_BITRATE_KBPS}")));
         assert!(!s.contains("vaapi"));
@@ -587,8 +560,12 @@ mod tests {
         // VAAPI backend: vaapipostproc uploads to a VA surface, then the
         // hardware encoder (same name, so force-key-unit still works) and
         // the *same* downstream h264parse → rtph264pay.
-        let s = combined_launch_string(&synth_idle(), VideoEncoder::Vaapi);
+        let s = combined_launch_string(&synth_idle(), EncoderBackend::Vaapi);
         assert!(s.contains(&format!("vaapih264enc name={UNIFIED_ENCODER_NAME}")));
+        let v4l2 = combined_launch_string(&synth_idle(), EncoderBackend::V4l2);
+        assert!(v4l2.contains(&format!("v4l2h264enc name={UNIFIED_ENCODER_NAME}")));
+        let nvenc = combined_launch_string(&synth_idle(), EncoderBackend::Nvenc);
+        assert!(nvenc.contains(&format!("nvh264enc name={UNIFIED_ENCODER_NAME}")));
         assert!(s.contains("vaapipostproc"));
         assert!(s.contains(&format!("bitrate={VIDEO_BITRATE_KBPS}")));
         assert!(!s.contains("x264enc"));
@@ -598,7 +575,7 @@ mod tests {
 
     #[test]
     fn combined_launch_string_decodes_live_via_avdec_h264() {
-        let s = combined_launch_string(&synth_idle(), VideoEncoder::X264);
+        let s = combined_launch_string(&synth_idle(), EncoderBackend::X264);
         assert!(s.contains("avdec_h264"));
         assert!(s.contains("videoscale"));
         assert!(s.contains("videorate"));
@@ -609,7 +586,7 @@ mod tests {
         // Phase 5: the synthetic idle branch has an inline
         // gdkpixbufoverlay (named for runtime capture) sized to the
         // full frame, sitting after the STANDBY textoverlay.
-        let s = combined_launch_string(&synth_idle(), VideoEncoder::X264);
+        let s = combined_launch_string(&synth_idle(), EncoderBackend::X264);
         assert!(s.contains(&format!("gdkpixbufoverlay name={IDLE_OVERLAY_NAME}")));
         // Sizing is applied at runtime (see gst_pipeline::apply_thumbnail_overlay)
         // because gdkpixbufoverlay ignores construction-time overlay-width/height
@@ -625,7 +602,7 @@ mod tests {
 
     #[test]
     fn combined_launch_string_pins_unified_raw_caps_on_both_video_branches() {
-        let s = combined_launch_string(&synth_idle(), VideoEncoder::X264);
+        let s = combined_launch_string(&synth_idle(), EncoderBackend::X264);
         let expected = format!(
             "format=I420,width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1"
         );
@@ -638,7 +615,7 @@ mod tests {
     #[test]
     fn combined_launch_string_emits_single_audio_pay1() {
         // One silent bed + one live Opus branch mix into one AAC pay1.
-        let s = combined_launch_string(&synth_idle(), VideoEncoder::X264);
+        let s = combined_launch_string(&synth_idle(), EncoderBackend::X264);
         assert!(s.contains("audiotestsrc"));
         assert!(s.contains("wave=silence"));
         assert_eq!(s.matches("rtpmp4apay").count(), 1);
@@ -651,7 +628,7 @@ mod tests {
         // Phase 8b: live audio uses an audiomixer (never a second
         // input-selector, which stalls gst-rtsp-server prepare). The
         // silent bed feeds sink_0, the decoded Opus feeds sink_1.
-        let s = combined_launch_string(&synth_idle(), VideoEncoder::X264);
+        let s = combined_launch_string(&synth_idle(), EncoderBackend::X264);
         assert!(s.contains("audiomixer name=amix"));
         assert!(s.contains("amix.sink_0"));
         assert!(s.contains("amix.sink_1"));
@@ -672,7 +649,7 @@ mod tests {
     #[test]
     fn combined_launch_string_pins_live_h264_pt_103() {
         assert_eq!(LIVE_RTP_H264_PT, 103);
-        let s = combined_launch_string(&synth_idle(), VideoEncoder::X264);
+        let s = combined_launch_string(&synth_idle(), EncoderBackend::X264);
         assert!(s.contains("payload=103"));
         assert!(s.contains("encoding-name=H264"));
     }
@@ -683,7 +660,7 @@ mod tests {
             &IdleKind::JpegStill {
                 jpeg: bytes::Bytes::from_static(&[0]),
             },
-            VideoEncoder::X264,
+            EncoderBackend::X264,
         );
         assert!(s.contains("appsrc name=idle_jpeg_src"));
         assert!(s.contains("jpegdec"));
@@ -694,13 +671,13 @@ mod tests {
 
     #[test]
     fn combined_launch_string_payloader_has_rtp_level_safety_net() {
-        let s = combined_launch_string(&synth_idle(), VideoEncoder::X264);
+        let s = combined_launch_string(&synth_idle(), EncoderBackend::X264);
         assert!(s.contains("rtph264pay name=pay0 pt=96 config-interval=1"));
     }
 
     #[test]
     fn combined_launch_string_encoder_uses_unified_gop() {
-        let s = combined_launch_string(&synth_idle(), VideoEncoder::X264);
+        let s = combined_launch_string(&synth_idle(), EncoderBackend::X264);
         assert!(s.contains(&format!("key-int-max={UNIFIED_GOP}")));
         assert!(s.contains("tune=zerolatency"));
         assert!(s.contains("speed-preset=superfast"));

@@ -83,8 +83,8 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, instrument, warn};
 
 use streamer_domain::camera::CameraId;
-use streamer_domain::config::VideoEncoder;
 
+use crate::encoder::EncoderBackend;
 use crate::error::MediaError;
 use crate::hls::{HlsSegmenter, prepare_dir};
 use crate::idle_source::{IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH, standby_caption};
@@ -191,17 +191,17 @@ fn lock<T>(m: &StdMutex<T>) -> MutexGuard<'_, T> {
 /// GStreamer-backed [`PipelineRegistry`].
 pub struct GstPipelineRegistry {
     server: Arc<RtspServer>,
-    /// H.264 encoder backend (software `x264` or GPU `vaapi`) baked into
-    /// every camera's persistent launch string.
-    video_encoder: VideoEncoder,
+    /// H.264 encoder backend resolved at boot ([`crate::encoder::resolve`]),
+    /// baked into every camera's persistent launch string.
+    video_encoder: EncoderBackend,
     state: RwLock<HashMap<CameraId, CameraEntry>>,
 }
 
 impl GstPipelineRegistry {
-    /// Construct from a started RTSP server and the configured video
+    /// Construct from a started RTSP server and the resolved video
     /// encoder backend.
     #[must_use]
-    pub fn new(server: Arc<RtspServer>, video_encoder: VideoEncoder) -> Self {
+    pub fn new(server: Arc<RtspServer>, video_encoder: EncoderBackend) -> Self {
         Self {
             server,
             video_encoder,

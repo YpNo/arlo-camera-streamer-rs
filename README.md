@@ -48,6 +48,7 @@ to see the contracts. The ADRs document the load-bearing decisions:
 - [docs/adr/0003-seamless-input-selector-splice.md](./docs/adr/0003-seamless-input-selector-splice.md)
 - [ADR 0004 — Live-loss feedback](./docs/adr/0004-live-lost-feedback.md): a dead live source returns the camera to idle within the stall timeout instead of the debounce or the continuous-live cap.
 - [ADR 0006 — HLS output](./docs/adr/0006-hls-output-via-loopback-segmenter.md): HLS is written by a loopback RTSP client of each camera, without re-encoding; DASH is not supported.
+- [ADR 0008 — Choosing the H.264 encoder per host](./docs/adr/0008-video-encoder-selection.md): `video_encoder = "auto"` dry-runs NVIDIA, Intel/AMD, V4L2 and x264 at boot and keeps the first that works.
 - [ADR 0007 — Relay the user's app view](./docs/adr/0007-relay-the-users-app-view.md): a live view started in the Arlo app is relayed from the RTSPS stream Arlo hands the app identity; no cooldown, no budget charge; picture and sound; the relay lets go of the stream every `user_view_probe_secs` so the camera can report whether the app still views.
 
 ## Prerequisites
@@ -61,7 +62,7 @@ to see the contracts. The ADRs document the load-bearing decisions:
   - `gstreamer1.0-libav` (`avdec_h264`, `avenc_aac`)
   - **`gstreamer1.0-nice`** — libnice ICE for `webrtcbin`. **Required for live streaming.** Without it, live fails at motion with `pipeline error: webrtcbin has no sink request pad` (the idle stream still works, which makes it easy to miss).
   - the `gst-rtsp-server` library (Debian: `libgstrtspserver-1.0-0`).
-  - *Optional* `gstreamer1.0-vaapi` — Intel/AMD hardware H.264 encode (QuickSync/VAAPI); big CPU win for multi-camera (see [Performance](#performance)).
+  - *Optional* GPU encoding plugins — Intel/AMD: `gstreamer1.0-vaapi` plus the VA drivers (`intel-media-va-driver` / `mesa-va-drivers`; the newer `va` plugin ships in `gstreamer1.0-plugins-bad`); Raspberry Pi 4 family: `v4l2h264enc` from `gstreamer1.0-plugins-good`; NVIDIA: `nvh264enc` from `gstreamer1.0-plugins-bad` with the driver libraries. `video_encoder = "auto"` picks whatever works (see [Performance](#performance), [ADR 0008](./docs/adr/0008-video-encoder-selection.md)).
 - An Arlo cloud account with at least one camera.
 - An IMAP mailbox you can poll for the Arlo MFA OTP, or be ready to
   type the OTP on stdin (cold-start only).
@@ -131,7 +132,7 @@ holding the values.
 | `arlo.mfa.poll_interval_secs` / `.timeout_secs` | u64  | `3` / `120`          | Approval polling for `kind = "push"`.                    |
 | `webrtc.ice_address_family`         | `dual`/`ipv4`  | `dual`               | ICE candidate gathering; `ipv4` when IPv6 to Arlo is broken. |
 | `webrtc.live_stall_timeout_secs`    | u64            | `10` (floor 4)       | Seconds without inbound video before the live source is declared lost and the output returns to idle (ADR 0004). |
-| `output.video_encoder`              | `x264`/`vaapi` | `x264`               | Software or Intel/AMD GPU H.264 encode (see Performance). |
+| `output.video_encoder`              | `auto`/`x264`/`va`/`vaapi`/`v4l2`/`nvenc` | `auto` | `auto` probes the host at boot (NVIDIA, Intel/AMD, V4L2, then x264); an explicit name fails the boot when it does not work (see Performance, ADR 0008). |
 | `output.rtsp.bind`                  | `host:port`    | `0.0.0.0:8554`       | Embedded RTSP server.                                    |
 | `output.metrics_bind`               | `host:port`    | `127.0.0.1:9090`     | Prometheus + healthchecks.                               |
 | `output.admin_bind`                 | `host:port`    | `127.0.0.1:9091`     | `/admin/*` write API.                                    |
@@ -203,6 +204,12 @@ docker run -d \
   -e STREAMER_ADMIN_TOKEN \
   arlo-camera-streamer:dev
 ```
+
+Add the encoder device your box has, and `video_encoder = "auto"` will
+use it: `--device /dev/dri` for an Intel/AMD GPU, `--device /dev/video11`
+on a Raspberry Pi 4 / Zero 2 / CM4, `--gpus all` with the NVIDIA
+container toolkit for NVENC. A Raspberry Pi 5 has no H.264 hardware
+encoder; it runs x264 in software.
 
 ### Frigate integration
 
@@ -296,11 +303,26 @@ therefore scales with the number of **connected** cameras, not with how
 many are live. On a 4-core box that is a ceiling of roughly **6 idle /
 4–5 concurrently live** cameras.
 
-For more cameras, offload H.264 encoding to the GPU. Set
-`[output] video_encoder = "vaapi"` to use the Intel/AMD QuickSync encoder
-(`vaapih264enc`) instead of software `x264enc` — it drops the ~0.6
-core/camera to near-zero. Requires the `gstreamer1.0-vaapi` plugin and a
-`/dev/dri` render node (pass `--device /dev/dri` to the container).
+For more cameras, let the GPU encode. With the default
+`[output] video_encoder = "auto"` the daemon probes the host at boot and
+takes the first encoder that works, in this order:
+
+| Backend | Hardware | Element | Needs |
+|---|---|---|---|
+| `nvenc` | NVIDIA | `nvh264enc` | NVIDIA driver, container toolkit (`--gpus all`) |
+| `va` | Intel / AMD | `vah264enc` | `/dev/dri`, VA drivers (in the image) |
+| `vaapi` | Intel / AMD, older stacks | `vaapih264enc` | same as `va` |
+| `v4l2` | Raspberry Pi 4 / Zero 2 / CM4 | `v4l2h264enc` | `/dev/video11` |
+| `x264` | any CPU | `x264enc` | nothing; ~0.6 core per camera |
+
+A probe is a short dry run, so a plugin whose device is missing (VA
+without a render node) is skipped rather than chosen. The log says which
+one won: `video encoder (auto) encoder=va`. Name a backend explicitly to
+pin it; then the boot fails if it does not work on that host. The
+Raspberry Pi 5 has no H.264 hardware encoder and runs x264 (one or two
+cameras at 720p15 are fine). A Google Coral accelerates Frigate's
+detection, not this daemon's encoding. Details and the measured paths:
+[ADR 0008](./docs/adr/0008-video-encoder-selection.md).
 
 > The `gupnp … 1900: Address already in use` warnings at live start are
 > harmless — libnice's UPnP probe colliding with local bridge

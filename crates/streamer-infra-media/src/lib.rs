@@ -45,6 +45,7 @@
 #![forbid(unsafe_code)]
 
 pub mod codec_cache;
+pub mod encoder;
 pub mod error;
 pub mod gst_pipeline;
 mod hls;

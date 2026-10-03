@@ -50,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   battery-protect, failed) each new snapshot refreshes it at once; at the
   end of a session the refresh uses the cached snapshot and saves a cloud
   round-trip.
+- `output.video_encoder = "auto"` (new default) probes the host at boot
+  and keeps the first working H.264 encoder: NVIDIA (`nvenc`), Intel/AMD
+  (`va`, then `vaapi`), Raspberry Pi 4 family (`v4l2`), then software
+  `x264`. Explicit names fail the boot when the encoder does not work on
+  that host (ADR 0008). The Docker image carries the VA plugin and drivers.
 - A live view you start in the Arlo app is relayed, picture and sound,
   to the RTSP and HLS outputs (ADR 0007; the relay's RTSP client tolerates the unframed
   RTCP and keep-alive packets Arlo's server sends between interleaved

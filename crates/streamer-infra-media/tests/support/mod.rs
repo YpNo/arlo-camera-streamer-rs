@@ -80,7 +80,10 @@ impl Stack {
 
     fn with_outputs(webrtc: WebrtcConfig, hls: Option<HlsOutput>) -> Self {
         let server = RtspServer::start("127.0.0.1:0").expect("rtsp server");
-        let registry = Arc::new(GstPipelineRegistry::new(server.clone(), VideoEncoder::X264));
+        let registry = Arc::new(GstPipelineRegistry::new(
+            server.clone(),
+            streamer_infra_media::encoder::EncoderBackend::X264,
+        ));
         let camera = CameraId::new(CAMERA);
         let cameras = [CameraConfig {
             arlo_device_id: camera.clone(),

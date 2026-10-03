@@ -166,10 +166,11 @@ async fn run(config: StreamerConfig) -> Result<()> {
     // -- Media adapter --
     let rtsp_server =
         RtspServer::start(&config.output.rtsp.bind).context("failed to start RTSP server")?;
-    let pipeline_registry = Arc::new(GstPipelineRegistry::new(
-        rtsp_server.clone(),
-        config.output.video_encoder,
-    ));
+    // The encoder is probed on this host (ADR 0008): `auto` takes the first
+    // working backend, an explicit one must work or the boot fails here.
+    let video_encoder = streamer_infra_media::encoder::resolve(config.output.video_encoder)
+        .context("no usable H.264 encoder")?;
+    let pipeline_registry = Arc::new(GstPipelineRegistry::new(rtsp_server.clone(), video_encoder));
     let media: Arc<dyn streamer_domain::port::MediaMultiplexer> =
         Arc::new(GstMediaMultiplexer::new(
             pipeline_registry.clone(),

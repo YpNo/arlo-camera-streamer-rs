@@ -137,4 +137,9 @@ so a session can start with no media or outlive it.
   segmenter is always that first client). It is a GLib `g_warning`, not silenced by
   `GST_DEBUG`; reproduced 2026-09-29 (TCP client, then UDP client). Only TCP-only RTSP
   would avoid it, at the cost of UDP-only clients.
-- VAAPI needs `/dev/dri` in the container.
+- Encoder backends (ADR 0008, `encoder.rs`): `EncoderBackend::{X264, Va, Vaapi, V4l2, Nvenc}`,
+  each segment named `video_enc` and ending in `byte-stream,alignment=au`. `resolve(config)`
+  dry-runs (10 frames, 3 s) because element registration lies: the dev box has the VA
+  elements and no `/dev/dri`. Adding a backend = enum variant, `elements()`, `segment()`,
+  a place in `AUTO_ORDER`, a config name, README table row. Devices: `/dev/dri` (VA),
+  `/dev/video11` (Pi 4 V4L2), NVIDIA toolkit (nvenc); the Pi 5 has no H.264 encoder.

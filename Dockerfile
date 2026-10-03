@@ -83,6 +83,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gstreamer1.0-rtsp \
         gstreamer1.0-nice \
         gstreamer1.0-tools \
+        gstreamer1.0-vaapi \
+        mesa-va-drivers \
+    # GPU encoding (ADR 0008): the `va` plugin is in plugins-bad, `vaapi`
+    # above, the V4L2 encoder in plugins-good, `nvh264enc` in plugins-bad
+    # (its libraries come from the NVIDIA container toolkit at run time).
+    # The Intel media driver exists on amd64 only.
+    && if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+         apt-get install -y --no-install-recommends intel-media-va-driver; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user: uid 10001 keeps us out of the typical host uid space.

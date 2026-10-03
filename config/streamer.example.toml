@@ -73,12 +73,19 @@ live_stall_timeout_secs = 10
 [output]
 # H.264 encoder for the live/idle pipeline. This encoder runs continuously
 # per connected camera, so it dominates CPU (see the README "Performance"
-# section).
-#   "x264"  — software encoding, works everywhere (default).
-#   "vaapi" — Intel/AMD GPU (QuickSync/VAAPI); near-zero CPU per camera.
-#             Requires the `gstreamer1.0-vaapi` plugin and a `/dev/dri`
-#             render node on the host.
-video_encoder = "x264"
+# section and docs/adr/0008-video-encoder-selection.md).
+#   "auto"  — probe the host at boot and take the first working backend,
+#             in this order: nvenc, va, vaapi, v4l2, x264 (default).
+#   "x264"  — software encoding, works everywhere; what a Raspberry Pi 5
+#             gets, since it has no H.264 hardware encoder.
+#   "va"    — Intel/AMD GPU through the `va` plugin (`vah264enc`).
+#   "vaapi" — Intel/AMD GPU through the older `vaapi` plugin.
+#             Both need a `/dev/dri` render node and the VA drivers.
+#   "v4l2"  — V4L2 memory-to-memory (`v4l2h264enc`): Raspberry Pi 4,
+#             Zero 2, CM4; needs `/dev/video11`.
+#   "nvenc" — NVIDIA GPU (`nvh264enc`); needs the NVIDIA container toolkit.
+# An explicit name fails the boot when that encoder does not work here.
+video_encoder = "auto"
 # Prometheus /metrics endpoint (per-camera state, transitions, live seconds).
 metrics_bind = "127.0.0.1:9090"
 # Operational /admin HTTP endpoint (force-wake, force-idle, state snapshot).
