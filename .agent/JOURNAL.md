@@ -292,3 +292,10 @@ Changed:  ci.yml: `release` exposes version/created; `image` (per-platform,
 Tests:    Workspace green on the refreshed lockfile; actionlint clean.
 Open:     First image build runs on the merge; arm64 leg needs the
           IMAGE_PLATFORMS variable and a billed arm64 runner.
+
+## 2026-10-03 — Docs restructure
+Changed:  `docs/adr/HANDOFF.md` → `.agent/HANDOFF.md` (an AI handoff, not an
+          ADR); its status table → `docs/VALIDATION.md` (human validation
+          record, live gates by feature); `docs/adr/README.md` index;
+          ADR 0005 renamed to its title (`user-views-observe-never-compete`);
+          README ADR list uniform; CLAUDE.md points at index, record, memory.

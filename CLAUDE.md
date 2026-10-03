@@ -26,6 +26,9 @@
 
 ## Architecture Decision Records
 
+- Index: `docs/adr/README.md` (one file per decision, superseded ones kept).
+- What ran against a real camera: `docs/VALIDATION.md` — update after a live gate.
+- Agent handoff and memory: `.agent/HANDOFF.md`, `.agent/CONTEXT.md`, `.agent/JOURNAL.md`.
 
 ---
 

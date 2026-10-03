@@ -43,13 +43,15 @@ streamer-bin           — composition root (the daemon binary)
 Read [`crates/streamer-domain/src/port.rs`](./crates/streamer-domain/src/port.rs)
 to see the contracts. The ADRs document the load-bearing decisions:
 
-- [docs/adr/0001-factory-restart-splice.md](./docs/adr/0001-factory-restart-splice.md) — *superseded by 0003*
-- [docs/adr/0002-rtsp-only-output-v1.md](./docs/adr/0002-rtsp-only-output-v1.md) — *superseded by 0006 for HLS*
-- [docs/adr/0003-seamless-input-selector-splice.md](./docs/adr/0003-seamless-input-selector-splice.md)
-- [ADR 0004 — Live-loss feedback](./docs/adr/0004-live-lost-feedback.md): a dead live source returns the camera to idle within the stall timeout instead of the debounce or the continuous-live cap.
-- [ADR 0006 — HLS output](./docs/adr/0006-hls-output-via-loopback-segmenter.md): HLS is written by a loopback RTSP client of each camera, without re-encoding; DASH is not supported.
+- [ADR index](./docs/adr/README.md) and the [validation record](./docs/VALIDATION.md) of what has run against a real camera.
+- [ADR 0001 — Factory-restart splice](./docs/adr/0001-factory-restart-splice.md): *superseded by 0003*.
+- [ADR 0002 — RTSP-only output for v1](./docs/adr/0002-rtsp-only-output-v1.md): *superseded by 0006 for HLS*; DASH stays out.
+- [ADR 0003 — Seamless input-selector splice](./docs/adr/0003-seamless-input-selector-splice.md): one persistent pipeline per camera, idle and live swapped at a frame boundary, clients never disconnect.
+- [ADR 0004 — Live-loss feedback](./docs/adr/0004-live-lost-feedback.md): a dead live source returns the camera to idle through the state machine, with its reason.
+- [ADR 0005 — User views: observe, never compete](./docs/adr/0005-user-views-observe-never-compete.md): no WebRTC session of ours while the app views; Arlo's 14001 is handled without backoff.
+- [ADR 0006 — HLS output](./docs/adr/0006-hls-output-via-loopback-segmenter.md): HLS is written by a loopback RTSP client of each camera, no re-encode.
+- [ADR 0007 — Relay the user's app view](./docs/adr/0007-relay-the-users-app-view.md): a live view started in the Arlo app is relayed, picture and sound, from the RTSPS stream Arlo hands the app identity; no cooldown, no budget charge; the relay lets go of the stream every `user_view_probe_secs` so the camera can report whether the app still views.
 - [ADR 0008 — Choosing the H.264 encoder per host](./docs/adr/0008-video-encoder-selection.md): `video_encoder = "auto"` dry-runs NVIDIA, Intel/AMD, V4L2 and x264 at boot and keeps the first that works.
-- [ADR 0007 — Relay the user's app view](./docs/adr/0007-relay-the-users-app-view.md): a live view started in the Arlo app is relayed from the RTSPS stream Arlo hands the app identity; no cooldown, no budget charge; picture and sound; the relay lets go of the stream every `user_view_probe_secs` so the camera can report whether the app still views.
 
 ## Prerequisites
 

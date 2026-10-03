@@ -59,5 +59,5 @@ media already playing (for instance after the HLS segmenter).
   event-driven.
 - Never log or paste presigned URLs, egress tokens, cookies or credentials. Event capture
   (`RUST_LOG=streamer_infra_arlo::events=debug`) logs property **keys** only.
-- Record each validated path in `docs/adr/HANDOFF.md` and `.agent/JOURNAL.md` with the
+- Record each validated path in `docs/VALIDATION.md` (humans) and `.agent/JOURNAL.md` with the
   date and the log evidence; say plainly which paths were only unit-tested.

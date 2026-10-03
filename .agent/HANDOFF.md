@@ -2,7 +2,9 @@
 
 > **For the next AI assistant.** Point-in-time snapshot of the project, the
 > open design work and the agreed plan. Verify against `git log`, the ADRs
-> and the code before acting on any claim below.
+> (`docs/adr/`, index in `docs/adr/README.md`) and the code before acting on
+> any claim below. What has run against a real camera is recorded for
+> humans in `docs/VALIDATION.md`; this file is the agent's memory.
 
 ---
 
@@ -22,7 +24,7 @@ event-driven push:
 
 The splice runs inside **one persistent RTSP pipeline per camera** with an
 `input-selector` on raw video and an `audiomixer` on audio, so connected
-clients never disconnect ([ADR 0003](./0003-seamless-input-selector-splice.md)).
+clients never disconnect ([ADR 0003](../docs/adr/0003-seamless-input-selector-splice.md)).
 
 ---
 
@@ -67,7 +69,7 @@ of each event is unchanged, which is why `event_mapper.rs` still works.
 - `0002-rtsp-only-output-v1` — superseded by 0006 for HLS.
 - `0003-seamless-input-selector-splice` — accepted; production splice.
 - `0004-live-lost-feedback` — accepted; `LiveSession` handle + `LiveLost` transition.
-- `0005-manual-stream-piggyback` — accepted for its rules (no WebRTC attach of ours during a view, motion suppressed, 14001 → `CameraBusy` without backoff, the idle-frame notice); superseded by 0007 for what the NVR shows during a view.
+- `0005-user-views-observe-never-compete` — accepted for its rules (no WebRTC attach of ours during a view, motion suppressed, 14001 → `CameraBusy` without backoff, the idle-frame notice); superseded by 0007 for what the NVR shows during a view.
 - `0006-hls-output-via-loopback-segmenter` — accepted; HLS from a loopback RTSP client of each camera, no re-encode; DASH unsupported (stock dashsink writes only TS, never prunes).
 - `0008-video-encoder-selection` — accepted 2026-10-03; `video_encoder = "auto"` dry-runs nvenc → va → vaapi → v4l2 → x264 at boot and keeps the first that works; explicit names fail the boot when unusable. Seen live: x264 (owner's box); the hardware segments are unverified until someone runs them.
 - `0007-relay-the-users-app-view` — accepted 2026-10-01; the app's view relayed from the RTSPS stream Arlo hands the iOS-app identity (`rtsp_relay.rs`, own RTSP client, TLS validation off). Needs arlo-rs `get_stream_url_as` (0.2.2, on crates.io since 2026-10-02). **Validated live 2026-10-01**: VLC showed the app's view; Arlo's server sends bare RTCP and the AAC audio RTP unframed (the client resyncs); the relay keeps the camera streaming after the app closes, so it probes (`user_view_probe_secs`) and otherwise caps at `max_continuous_live`.
@@ -150,19 +152,10 @@ per-camera `SipInfo` cache were folded into one `negotiate` call on
 
 ---
 
-## 5. Known gaps
+## 5. Known gaps and validation record
 
-| Item | Notes |
-|---|---|
-| Coverage gate | 86 % (measured 88.25 % on 2026-09-28, GStreamer files counted since the integration tests). Still excluded: `streamer-bin` and the infra-arlo network wrappers (`boot`, `events`, `stream_requester`, `thumbnails`). |
-| Release 0.1.0 | Prepared 2026-10-03: changelog cut, lockfile refreshed (166 crates), licence metadata aligned to the MIT file, SECURITY.md rewritten for this project, image publishing added to `ci.yml` (GHCR, per-version, Trivy-gated, arm64 opt-in via `IMAGE_PLATFORMS`). The tag and the image appear on the merge to `main`. |
-| Encoder selection | ADR 0008 (2026-10-03): `encoder::resolve` with a dry run per backend; integration-tested on the dev box (VA elements present, no render node → x264). Hardware backends `va`, `v4l2`, `nvenc` written from element docs, not yet run on hardware; `vaapi` ran before 2026-09-28. |
-| MFA login skill | `.agents/skills/arlo-mfa-login`, validated 2026-10-03 on a fresh cache path (IMAP factor, 13 s, file 0600; Arlo answers 9261 "Invalid factor data" to the trusted-browser probe of a new device id). |
-| App-view relay | Built and **gated live 2026-10-01** (ADR 0007): VLC shows the relayed view, SPS/PPS arrive in-band (no caps work needed), the hard cap ends the relay at 300 s and the camera idles within a second of our TEARDOWN. The relay probes every `user_view_probe_secs` (60 s): release, 5 s for the camera's `idle` report, resume if none — so the camera stops within a minute of the app and a view may last longer than the cap. Gated 2026-10-02 for the stop path (release at 60 s, `idle` 340 ms later, no re-attach); the resume path gated 2026-10-02 (no `idle` in the grace → relayed again, Live 0.5 s later); grace cut to 2 s since the report takes 0.3–0.8 s. Audio relayed since 2026-10-02 (AAC track `SETUP` + bare-packet fallback, third mixer input; gated 2026-10-02: with the track set up Arlo frames the audio on channel 2, no bare packets; the owner heard the room in VLC). |
-| HLS / DASH | HLS wired 2026-09-28 (ADR 0006, `hls.rs`), integration-tested (live picture in a segment, retention, cleanup); run on the owner's box 2026-10-02 (idle → relayed view → idle over HLS in VLC); a VLC connection error seen once on 2026-09-30 with HLS on did not recur and is closed. DASH unsupported: parsed, warned, ignored. |
-| Integration test vs a real gateway | `tests/live_session.rs` (2026-09-28) replaces the planned recorded-session fixture: DTLS keys are per call, so a recording cannot be replayed; a local `webrtcbin` answers instead. It proves negotiation, the splice seen by a client, mid-session join, stall and setup loss. Arlo-specific quirks (TURN, SDP shape drift) still need the Frigate box. |
-| Live session vs RTSP client lifecycle | **Fixed 2026-09-28.** The pumps push into the *current* media's appsrc (slot set at `media-configure`, cleared at `unprepared`), discard while none exists, and a media built during a live session gets its switch armed. Validated live 2026-09-28: VLC disconnected and reconnected mid-session and got the live video back ("media built during a live session; live switch armed"). |
-| Dependency currency | `mockall` 0.15 and `rstest` 0.27 adopted 2026-09-28; everything else within one minor of latest on 2026-09-27. |
+Moved to `docs/VALIDATION.md` (what ran live, what is only tested, with
+dates and log evidence). Update that file, not this section, after a gate.
 
 ---
 
@@ -191,11 +184,13 @@ Verified in production; do not rediscover:
 
 ## 7. Parked ideas
 
-1. A `.claude/skills/arlo-otp/` skill codifying the MFA ceremony.
+1. ~~An MFA login skill~~ — done 2026-10-02 (`.agents/skills/arlo-mfa-login`).
 2. A reverse-engineering write-up: SDP shape, `sessionDisconnected` quirks,
-   TURN UDP-only observation.
+   TURN UDP-only observation, the User-Agent-keyed stream format and the
+   unframed packets of ADR 0007.
 3. Auto-populate `[[cameras]]` from the device inventory when the section is
    empty (follow-up to item 5 above).
+4. Per-camera encoder or bitrate; MQTT state publishing for Home Assistant.
 
 ---
 
