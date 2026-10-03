@@ -14,7 +14,8 @@ returns a full token with no OTP). Deleting or corrupting the file costs one mor
 **The agent never runs the login.** The tool shell has no terminal, no second factor and
 no mailbox; it prepares the commands and reads the log the owner pastes back. Facts below
 come from `crates/streamer-infra-arlo/src/boot.rs` and arlo-rs `client/auth/{flow,push}.rs`,
-`client/auth_imap.rs`, `client/mfa.rs` (read 2026-10-02).
+`client/auth_imap.rs`, `client/mfa.rs` (read 2026-10-02) and were checked against a fresh
+IMAP login on 2026-10-03 (13 s from cold start to `authentication complete`).
 
 ## Choosing the factor (`[arlo.mfa] kind`)
 
@@ -64,12 +65,12 @@ docker run --rm -it -e ARLO_PASSWORD -e ARLO_IMAP_PASSWORD \
 | Path | Lines, in order |
 |---|---|
 | Cache valid | `arlo-rs session restored from cache` — nothing else; the daemon starts. |
-| Cold start | `no valid cached session — running MFA cold-start` (or, for an expired token, `Cached token rejected by Arlo; re-authenticating`), then one of the rows below, then `arlo-rs authentication complete`. First time on a machine: `created session cache directory`. |
-| Paired device | `Trusted browser accepted by Arlo — no OTP required`. |
-| Not paired yet | `Browser not trusted by Arlo; running the OTP ceremony` (Arlo 9204), then the factor's own lines. |
-| Email over IMAP | `Captured IMAP baseline` (debug) … then complete; `ignoring unseen mail: From address is not Arlo's` is a skipped unrelated mail. |
-| Push | `Awaiting push approval in the Arlo mobile app` → approve on the phone → complete. |
-| Stdin | the prompt on the terminal; type the code. |
+| Cold start | `no valid cached session — running MFA cold-start` (or, for an expired token, `Cached token rejected by Arlo; re-authenticating`) → `Preparing MFA handler before OTP dispatch` → one of the rows below → `Browser paired with Arlo; future logins can skip the OTP` → `arlo-rs authentication complete`. First time on a machine: `created session cache directory` comes first. |
+| Paired device | `Trusted browser accepted by Arlo — no OTP required`; no pairing line. |
+| Not paired yet | `Browser not trusted by Arlo; running the OTP ceremony error=API Error [400/9261]: Invalid factor data` (9261 on a fresh device id; 9204 on a known but untrusted one), then the factor's own lines. |
+| Email over IMAP | `Awaiting OTP from MFA handler provider=EMAIL`, ~10 s of silence at `info` (the inbox poll logs at `debug`: `Captured IMAP baseline`; a skipped unrelated mail logs `ignoring unseen mail: From address is not Arlo's` at `warn`), then the pairing line. |
+| Push | `Awaiting push approval in the Arlo mobile app` → approve on the phone → the pairing line. |
+| Stdin | `Awaiting OTP from MFA handler provider=…`, then the prompt on the terminal; type the code. |
 | Transient | `Cached token could not be validated; keeping it for a retry`: network, 5xx or 429. The token is kept, no OTP is spent; retry later. |
 
 **Verification:** `ls -l <session_cache_path>` shows `-rw-------`; a second `list-devices`
