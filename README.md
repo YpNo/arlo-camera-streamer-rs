@@ -102,6 +102,16 @@ for e in webrtcbin nicesrc dtlssrtpenc srtpenc; do \
 
 ### From source
 
+Building needs the GStreamer development headers on top of the runtime
+plugins above, plus a C toolchain and libclang for the bindings
+(Debian/Ubuntu names; the `Dockerfile` builder stage is the reference list):
+
+```bash
+sudo apt-get install -y build-essential pkg-config cmake nasm libclang-dev libssl-dev \
+  libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev
+```
+
 ```bash
 cargo build --release --package arlo-camera-streamer
 sudo install -m 0755 target/release/arlo-camera-streamer /usr/local/bin/
@@ -165,16 +175,29 @@ budget and probe 0 to 86400 s).
 | `cameras.cooldown.daily_live_budget` | u64           | `0`                  | `0` = unlimited; otherwise total live secs/day.          |
 | `cameras.cooldown.budget_reset`     | `HH:MM`        | `00:00`              | Local-clock reset.                                       |
 
-### Required environment variables
+### Environment variables
 
 | Variable | Purpose |
 |----------|---------|
-| `ARLO_PASSWORD` (or whatever you put in `arlo.password_env`) | Arlo cloud password. |
-| `ARLO_IMAP_PASSWORD` (or whatever you put in `arlo.mfa.password_env`) | IMAP password. |
-| `STREAMER_ADMIN_TOKEN` | **Required.** Bearer token for `/admin/*`, at least 16 bytes (`openssl rand -hex 32`). |
-| `RUST_LOG` | (optional) Tracing filter, e.g. `info,arlo_camera_streamer=debug`. |
+| `ARLO_PASSWORD` (or whatever you put in `arlo.password_env`) | **Required.** Arlo cloud password. |
+| `ARLO_IMAP_PASSWORD` (or whatever you put in `arlo.mfa.password_env`) | IMAP password, when `arlo.mfa.kind = "email"` uses a mailbox. |
+| `STREAMER_ADMIN_TOKEN` | **Required** by `run`. Bearer token for `/admin/*`, at least 16 bytes (`openssl rand -hex 32`). |
+| `RUST_LOG` | Optional. Log filter, default `info,arlo_camera_streamer=debug`; see [Logging and debugging](#logging-and-debugging). |
+| `GST_DEBUG` | Optional. GStreamer's own debug output, off by default; see [GStreamer debugging](#gstreamer-debugging). |
 
 ## Usage
+
+### Quick start
+
+1. Install the GStreamer plugins ([Prerequisites](#prerequisites)) and the binary or the image ([Installation](#installation)).
+2. Copy `config/streamer.example.toml` to `/etc/arlo-streamer/streamer.toml`; fill in `[arlo]` (email, the password env var name, the second factor) and leave `[[cameras]]` for step 4.
+3. Export `ARLO_PASSWORD` (and `ARLO_IMAP_PASSWORD` for email MFA) and run `list-devices` once ([below](#first-run-find-your-device-ids)). It signs in, pairs the second factor and prints a `[[cameras]]` block per camera.
+4. Paste the blocks into the config, choose a `stream_name` per camera.
+5. Export `STREAMER_ADMIN_TOKEN` and start the daemon ([Run the daemon](#run-the-daemon)). The log ends its boot with `daemon ready; waiting for shutdown signal`.
+6. Open `rtsp://<host>:8554/<stream_name>` in VLC: the idle frame shows at once; walk in front of the camera and the picture goes live within a few seconds.
+7. Point Frigate (or any NVR) at the same URL ([Frigate integration](#frigate-integration)).
+
+Something not as described? [Logging and debugging](#logging-and-debugging) says which lines to look for.
 
 ### First run: find your device ids
 
@@ -190,11 +213,22 @@ export ARLO_IMAP_PASSWORD="…"
 arlo-camera-streamer list-devices --config /etc/arlo-streamer/streamer.toml
 ```
 
+With the image, keep the same state volume you will give the daemon
+(the pairing lives in `session_cache_path`); `-it` is needed only when
+the OTP is typed on stdin:
+
+```bash
+docker run --rm -it -e ARLO_PASSWORD -e ARLO_IMAP_PASSWORD \
+  -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
+  -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \
+  ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.0 list-devices --config /etc/arlo-streamer/streamer.toml
+```
+
 It also warns about configured `arlo_device_id` values the account does
 not have, which is how typos show up. Logs go to stderr, the report to
-stdout. The factor choice, the Docker form of this command, the log lines
-that prove the pairing and what to do when a restart asks for a code again
-are in the login runbook, [`.agents/skills/arlo-mfa-login/SKILL.md`](./.agents/skills/arlo-mfa-login/SKILL.md).
+stdout. The factor choice, the log lines that prove the pairing and what
+to do when a restart asks for a code again are in the login runbook,
+[`.agents/skills/arlo-mfa-login/SKILL.md`](./.agents/skills/arlo-mfa-login/SKILL.md).
 
 ### Run the daemon
 
@@ -227,11 +261,26 @@ docker run -d \
   ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.0
 ```
 
+Two things the image cannot do for you:
+
+- **The state directory must be writable by uid 10001**, the user the
+  image runs as. A host bind mount keeps the host's ownership, so run
+  `sudo chown -R 10001:10001 /var/lib/arlo-streamer` once (a named volume
+  needs nothing). Otherwise the boot fails on the session cache directory.
+- **`metrics_bind` and `admin_bind` default to `127.0.0.1`**, which inside
+  the container is unreachable from the host even with `-p`. To scrape
+  metrics or call `/admin/*` from outside, set them to `0.0.0.0:9090` and
+  `0.0.0.0:9091` in the container's config and publish the ports; keep
+  the admin port off any untrusted network.
+
 Add the encoder device your box has, and `video_encoder = "auto"` will
 use it: `--device /dev/dri` for an Intel/AMD GPU, `--device /dev/video11`
 on a Raspberry Pi 4 / Zero 2 / CM4, `--gpus all` with the NVIDIA
 container toolkit for NVENC. A Raspberry Pi 5 has no H.264 hardware
-encoder; it runs x264 in software.
+encoder; it runs x264 in software. The image sets
+`RUST_LOG=info,arlo_camera_streamer=info`; pass `-e RUST_LOG=…` to change
+it. The container `HEALTHCHECK` runs the binary's own `healthcheck`
+subcommand against `metrics_bind`.
 
 ### Frigate integration
 
@@ -285,6 +334,141 @@ curl -H "Authorization: Bearer $STREAMER_ADMIN_TOKEN" \
 | `streamer_splice_attempts_total`    | counter    | `camera`, `outcome`             |
 | `streamer_splice_latency_ms`        | histogram  | `camera`, `outcome`             |
 | `streamer_retries_total`            | counter    | `camera`                        |
+
+## Logging and debugging
+
+Logs go to **stderr** (stdout is reserved for `list-devices`' report),
+one line per event with its level and its target, the Rust module that
+emitted it. The format is text only; there is no JSON mode. Nothing
+sensitive is ever logged: no password, token, session id, cookie or
+presigned URL, by design.
+
+### `RUST_LOG`
+
+A [`tracing` filter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html):
+a default level, then `target=level` overrides, comma-separated. Levels
+are `error`, `warn`, `info`, `debug`, `trace`. Unset, the daemon uses
+`info,arlo_camera_streamer=debug`; the Docker image sets
+`info,arlo_camera_streamer=info`.
+
+| Target | What it logs | Turn up for |
+|---|---|---|
+| `arlo_camera_streamer` | Boot sequence, encoder choice, shutdown stages, the connection watcher. | Boot problems. |
+| `streamer_app::orchestrator` | Every state transition (`from`, `to`, `signal`), activations, budget decisions, user-view handling. `debug` adds absorbed motion pulses and suppressed events. | Why a camera did or did not go live. |
+| `streamer_app::router` | Event fan-out; `trace` shows events for cameras not in the config. | Events that seem to vanish. |
+| `streamer_infra_arlo::boot` | Login, session cache, MFA cold start. | A code asked at restart. |
+| `streamer_infra_arlo::events` | The Arlo event bus. `debug` logs each event's **property keys** (never values). | What Arlo actually sends on motion. |
+| `streamer_infra_arlo::stream_requester` | WebRTC signaling with Arlo (`sipInfo`, answer, teardown). | Activation stuck before any video. |
+| `streamer_infra_arlo::user_view` | The watch-along stream of a view started in the app. | App views not relayed. |
+| `streamer_infra_arlo::thumbnails` | Idle snapshot fetches. | A black idle frame. |
+| `streamer_infra_media::rtsp` | The embedded RTSP server: `rtsp server started`, each client's media prepared / unprepared. | Clients that cannot connect or get no picture. |
+| `streamer_infra_media::gst_pipeline` | Per-camera pipeline: `camera registered`, live ingestion armed / released, the idle thumbnail, pumps. | Picture frozen on idle while the camera is live. |
+| `streamer_infra_media::webrtc_pipeline` | The WebRTC leg: offer, answer, ICE, first RTP, stall watchdog, bus errors. | Live sessions that never show video. |
+| `streamer_infra_media::rtsp_relay` | The app-view relay (ADR 0007): RTSP exchange with Arlo's server, TLS verdict, framing. | A relayed view with no picture or no sound. |
+| `streamer_infra_media::hls` | The HLS segmenter per camera. | Playlists that do not advance. |
+| `streamer_infra_media::encoder` | The boot-time encoder dry runs (`encoder skipped` at `debug`). | `auto` picking the wrong backend. |
+| `streamer_infra_ops` | HTTP listeners, rejected admin requests. | 401s, unreachable endpoints. |
+| `arlo_rs` | The Arlo client library (HTTP, MQTT, login steps). | Cloud-side errors. |
+
+Ready-made filters:
+
+```bash
+# Everything a bug report needs, without flooding
+RUST_LOG=info,streamer_app=debug,streamer_infra_media=debug,streamer_infra_arlo=debug
+```
+
+```bash
+# Only the RTSP server and the per-camera pipelines
+RUST_LOG=warn,streamer_infra_media::rtsp=debug,streamer_infra_media::gst_pipeline=debug
+```
+
+```bash
+# What Arlo sends on the event bus (keys only) and what the state machine does with it
+RUST_LOG=info,streamer_infra_arlo::events=debug,streamer_app::orchestrator=debug
+```
+
+```bash
+# The app-view relay, framing included
+RUST_LOG=info,streamer_infra_media::rtsp_relay=debug,streamer_infra_arlo::user_view=debug
+```
+
+### What a healthy run logs
+
+| Moment | Lines, in order |
+|---|---|
+| Boot | `GStreamer initialized` → `video encoder (auto) encoder=<name>` → `arlo-rs session restored from cache` (or `no valid cached session — running MFA cold-start` → `arlo-rs authentication complete`) → `rtsp server started` → `camera registered` per camera → `daemon ready; waiting for shutdown signal`. |
+| A client connects | `RTSPMedia prepared (pipeline reached PLAYING)`; the idle frame plays. After the last client leaves, `RTSPMedia unprepared (pipeline torn down)` — no client, no encoder running. |
+| Motion session | `state transition … to=Activating` → `webrtcbin offer ready; negotiating with Arlo` → `answer applied; awaiting first RTP` → `live webrtcbin ready; first RTP flowing` → `live ingestion armed (video + audio)` → `to=Live` → after `debounce_secs` of quiet, `to=Idle` and `live ingestion released; idle restored`. |
+| Live source dies | `no inbound video RTP; live source stalled` after `live_stall_timeout_secs` → `signal=LiveLost(…)` → `to=Idle`. |
+| View started in the Arlo app | `signal=UserViewStarted` → `watch-along stream playing; awaiting first video RTP` → `relaying the user's live view from the Arlo app` → `to=Live`; every `user_view_probe_secs` the relay lets go and resumes (`no idle report after the probe; the app still views, relaying again`). |
+| Budget | `daily live budget exhausted mid-session; releasing the camera` → `to=BatteryProtect`; back to `Idle` at `budget_reset`. |
+| Shutdown | `Ctrl-C received; initiating graceful shutdown` → one `shutdown stage complete` per stage → `graceful shutdown complete`. `the streamer system stopped on its own` instead means a failure: the process exits non-zero after the same drain. |
+
+The full matrix, path by path, is the live-validation runbook,
+[`.agents/skills/live-validation/SKILL.md`](./.agents/skills/live-validation/SKILL.md).
+
+### GStreamer debugging
+
+The daemon does not touch GStreamer's debug system, so its standard
+environment variables apply unchanged
+([reference](https://gstreamer.freedesktop.org/documentation/gstreamer/running.html)).
+`GST_DEBUG` takes `category:level` pairs (levels `1` error to `9` memdump;
+`4` info and `5` debug are the useful ones), `*` matches every category.
+Output goes to stderr next to the daemon's log; `GST_DEBUG_FILE=<path>`
+sends it to a file instead and `GST_DEBUG_NO_COLOR=1` strips the colours.
+
+| Question | `GST_DEBUG` |
+|---|---|
+| Why does a client get no stream / a 404 / a 503? | `rtspserver:4,rtspclient:4,rtspmedia:4,rtspsession:4` — the server logs each request, the mount lookup and the media state changes. Add `rtspstream:5` for the RTP/RTCP transport per client. |
+| Why is the pipeline not reaching PLAYING? | `GST_DEBUG=3` first (every warning and error from every element), then the element named in the message at `:5`. |
+| What does the camera really send over WebRTC? | `webrtcbin:5,nicesrc:4,nicesink:4,dtlssrtpdec:4,rtpjitterbuffer:4`; libnice's own ICE log is a separate switch, `NICE_DEBUG=all`. |
+| Is the encoder the problem? | The element's category, normally its name: `x264enc:4`, `vah264enc:4`, `vaapih264enc:4`, `v4l2h264enc:4`, `nvh264enc:4`. |
+| HLS segments missing? | `rtspsrc:4,hlssink2:5,splitmuxsink:4` (the segmenter is an RTSP client of the camera's own mount). |
+
+`GST_DEBUG_DUMP_DOT_DIR=<dir>` makes GStreamer write a Graphviz `.dot` of
+each pipeline at every state change; `dot -Tpng` turns it into a picture
+of what was actually built. Two warnings are known to be harmless:
+`gupnp … 1900: Address already in use` at live start (libnice's UPnP
+probe) and `Sticky event misordering, got 'segment' before 'caps'` when a
+UDP client joins a media that already plays for another client.
+
+### Checking the RTSP output from outside
+
+```bash
+# Describe the stream without playing it (ffmpeg)
+ffprobe -rtsp_transport tcp rtsp://<host>:8554/<stream_name>
+```
+
+```bash
+# Play it with GStreamer over TCP, with the RTSP client's own log
+GST_DEBUG=rtspsrc:4 gst-launch-1.0 rtspsrc location=rtsp://<host>:8554/<stream_name> protocols=tcp latency=200 \
+  ! decodebin ! autovideosink
+```
+
+```bash
+# VLC over TCP (the GUI equivalent is Preferences → Input / Codecs → RTP over RTSP (TCP))
+vlc --rtsp-tcp rtsp://<host>:8554/<stream_name>
+```
+
+Use TCP when UDP is filtered between you and the host.
+While a client is connected, `GET /admin/state` is the quickest view of
+what the daemon thinks each camera is doing, and `streamer_camera_state`
+on `/metrics` the same for a dashboard.
+
+### Troubleshooting
+
+| Symptom | Look for | Usual cause |
+|---|---|---|
+| Boot stops at the session cache | `session_cache_path directory … cannot be created` | Directory not writable by the daemon user (uid 10001 in the image). |
+| A code is asked at every restart | the login runbook's symptom table | Session cache on a non-persistent path, or the Arlo password changed. |
+| Boot stops on the encoder | `is not usable on this host` | An explicit `video_encoder` whose device or plugin is missing; use `auto` or install the plugin. |
+| VLC connects, idle frame shows, never goes live | `to=Activating` then `attach_live failed …` | Read the reason: `webrtcbin has no sink request pad` is the missing `gstreamer1.0-nice`; `camera busy` is the Arlo app viewing; `splice timeout` is no RTP from Arlo (firewall on UDP, try `ice_address_family = "ipv4"`). |
+| Live starts and drops after ~10 s | `live source stalled` | UDP to Arlo's TURN blocked after the handshake, or the camera's own network. |
+| Motion in front of the camera, nothing in the log | `camera trigger pulse` at `streamer_infra_arlo::events=debug`; `event for unconfigured camera` at `streamer_app::router=trace` | Motion detection or the armed mode is off in the Arlo app, or the camera's `arlo_device_id` is not in `[[cameras]]`. |
+| Idle frame is the synthetic STANDBY screen, never a photo | `thumbnail fetch failed` (or no `thumbnail applied to idle overlay`) | Arlo has no snapshot for the camera yet (one appears after the first motion), or the fetch failed for the reason logged. |
+| `/metrics` or `/admin/*` unreachable from another host | nothing: the listener bound loopback | `metrics_bind` / `admin_bind` are `127.0.0.1` by default; see [Docker run](#docker-run). |
+| `401` on `/admin/*` | `admin: rejected unauthenticated request route=…` | Wrong or rotated `STREAMER_ADMIN_TOKEN`, or a missing `Bearer ` prefix. |
+| Relayed app view has no sound or no picture | `watch-along relay ended why=…` with a hex dump | Paste that line as it is in a bug report; it holds no secret. |
 
 ## Operational warnings
 
