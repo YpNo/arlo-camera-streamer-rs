@@ -129,7 +129,7 @@ docker build -t arlo-camera-streamer:dev .
 ## Configuration
 
 Copy [`config/streamer.example.toml`](./config/streamer.example.toml)
-to `/etc/arlo-streamer/streamer.toml` and edit the marked sections.
+to `/etc/arlo-streamer/streamer.toml` (or another prefered location) and edit the marked sections.
 **Secrets never live in this file** — only the *names* of env vars
 holding the values.
 
@@ -138,6 +138,7 @@ holding the values.
 | `arlo.email`                        | string         | (required)           | Arlo cloud account email.                                |
 | `arlo.password_env`                 | string         | (required)           | Env var name holding the password.                       |
 | `arlo.session_cache_path`           | path           | (required)           | Persisted session token — survives restarts.             |
+| `arlo.watch_along_cert_sha256`      | hex string     | (unset)              | Pin the watch-along host's certificate (SHA-256) instead of verifying its chain; only when the log says the chain is not trusted (ADR 0007). |
 | `arlo.app_version`                  | string         | `6.46.0`             | Arlo app version the daemon identifies as when fetching the stream of a view you started in the app (ADR 0007). |
 | `arlo.mfa.kind`                     | `email`/`push`/`sms` | (required)     | Second factor. `email` and `push` run headless; `sms` prompts on stdin. |
 | `arlo.mfa.host` / `.provider` / `.user` / `.password_env` / `.port` | strings | (port: 993) | IMAP mailbox for `kind = "email"`; without them the OTP is prompted on stdin. |

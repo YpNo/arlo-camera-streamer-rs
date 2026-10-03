@@ -34,8 +34,8 @@ stream. Captures on 2026-09-30:
   PLAY all 200, RTP flowing; the app's view is unaffected;
 - GStreamer's `rtspsrc` is refused at SETUP (403) for a reason not
   identified — not the token: SETUP without it is accepted;
-- the server's certificate cannot match a raw IP, so validation must be
-  off for that host;
+- the server's certificate cannot name a raw IP, so the hostname check
+  cannot pass for that host;
 - (2026-10-01, first gates) the server sends some packets **without**
   the interleaved `$` framing: its periodic RTCP sender reports (only
   the first one at `PLAY` is framed), each followed by a bare 12-byte
@@ -54,8 +54,15 @@ identify as) and attaches it as the live source
 (`MediaMultiplexer::attach_user_view`): the same idle/live splice, RTSP
 clients and HLS as a motion session, with a `LiveSource::UserView` tag.
 
-- **Media:** `rtsp_relay.rs` is a hand-written RTSP client over TLS
-  (validation off, token as the access control). It forwards the video
+- **Media:** `rtsp_relay.rs` is a hand-written RTSP client over TLS.
+  The certificate chain is verified against the system roots and only
+  the hostname check is waived (revised 2026-10-03 after the security
+  sweep: the first version accepted any certificate, which let an
+  on-path party read the egress token and substitute the feed); an
+  operator can pin the end-entity certificate instead
+  (`arlo.watch_along_cert_sha256`) when the chain is not public — the log
+  prints the fingerprint to copy. Every text line, header count and
+  `Content-Length` from the server is bounded. It forwards the video
   track's RTP into the live sinks with the payload type rewritten, sends
   `GET_PARAMETER` keep-alives and RTCP receiver reports, and reports loss
   through the shared notifier (server closed → `end-of-stream`,
@@ -108,8 +115,10 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
   format on the app identity. If it stops, `UserViewSource` returns a
   non-RTSP answer, the relay is reported `user-view-unavailable`, and
   the daemon falls back to the notice, as before this ADR.
-- **No certificate validation** for the watch-along host; TLS still
-  hides the exchange and the token is single-session.
+- **Hostname check waived** for the watch-along host: a certificate
+  that chains to a public root is accepted whatever name it carries. If
+  Arlo's chain turns out not to be public, the relay refuses it until the
+  operator pins the fingerprint (fail closed, one config line).
 - **Audio depends on in-band framing or the AU header**: an AAC track
   with other AU-header widths than `AAC-hbr`'s is decoded only when the
   server frames it.

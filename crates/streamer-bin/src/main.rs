@@ -171,12 +171,16 @@ async fn run(config: StreamerConfig) -> Result<()> {
     let video_encoder = streamer_infra_media::encoder::resolve(config.output.video_encoder)
         .context("no usable H.264 encoder")?;
     let pipeline_registry = Arc::new(GstPipelineRegistry::new(rtsp_server.clone(), video_encoder));
+    let relay_tls =
+        streamer_infra_media::RelayTls::from_config(config.arlo.watch_along_cert_sha256.as_deref())
+            .context("watch-along TLS policy")?;
     let media: Arc<dyn streamer_domain::port::MediaMultiplexer> =
         Arc::new(GstMediaMultiplexer::new(
             pipeline_registry.clone(),
             config.output.clone(),
             config.webrtc.clone(),
             &config.cameras,
+            relay_tls,
         ));
 
     // -- Application layer --

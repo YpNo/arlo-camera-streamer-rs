@@ -99,6 +99,14 @@ pub struct ArloConfig {
     /// app identity the view's RTSPS stream, a browser gets DASH.
     #[serde(default = "default_app_version")]
     pub app_version: String,
+    /// SHA-256 fingerprint (64 hex digits) of the certificate Arlo's
+    /// watch-along host presents, to pin it instead of verifying its
+    /// chain against the system roots (ADR 0007). Only needed when the
+    /// log says `watch-along certificate chain not trusted`; that line
+    /// prints the fingerprint to copy here. Unset: chain verification
+    /// with the hostname check waived (the host is a raw IP).
+    #[serde(default)]
+    pub watch_along_cert_sha256: Option<String>,
     /// MFA strategy for cold-start (when session cache is missing or
     /// expired).
     pub mfa: MfaConfig,

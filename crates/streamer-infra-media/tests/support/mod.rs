@@ -101,7 +101,13 @@ impl Stack {
             metrics_bind: "127.0.0.1:0".to_string(),
             admin_bind: "127.0.0.1:0".to_string(),
         };
-        let media = GstMediaMultiplexer::new(registry, output, webrtc, &cameras);
+        let media = GstMediaMultiplexer::new(
+            registry,
+            output,
+            webrtc,
+            &cameras,
+            streamer_infra_media::RelayTls::from_config(None).expect("system roots"),
+        );
         Self {
             media,
             camera,

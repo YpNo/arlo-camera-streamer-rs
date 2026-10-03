@@ -37,7 +37,7 @@ use crate::idle_source::{IdleKind, select_idle_source, standby_caption, user_vie
 use crate::live_rtp_sink::LiveSinks;
 use crate::live_watch::setup_or_loss;
 use crate::pipeline_desc::{OutputBranches, build_output_branches};
-use crate::rtsp_relay::RtspRelay;
+use crate::rtsp_relay::{RelayTls, RtspRelay};
 use crate::webrtc_pipeline::WebrtcLive;
 
 /// Trait that the GStreamer-backed registry implements. The seam keeps
@@ -99,6 +99,8 @@ pub struct GstMediaMultiplexer<R: PipelineRegistry> {
     /// Camera → stream-name mapping captured at boot. Read-only after
     /// construction.
     cameras: HashMap<CameraId, StreamName>,
+    /// How the app-view relay authenticates Arlo's watch-along host.
+    relay_tls: RelayTls,
     /// Lazily-populated set of cameras whose pipelines have been built.
     registered: RwLock<HashSet<CameraId>>,
     /// Codec hint cache (seeded from config, updated by the registry
@@ -136,6 +138,7 @@ impl<R: PipelineRegistry> GstMediaMultiplexer<R> {
         output: OutputConfig,
         webrtc: WebrtcConfig,
         cameras: &[CameraConfig],
+        relay_tls: RelayTls,
     ) -> Self {
         let cam_map = cameras
             .iter()
@@ -150,6 +153,7 @@ impl<R: PipelineRegistry> GstMediaMultiplexer<R> {
             output,
             webrtc,
             cameras: cam_map,
+            relay_tls,
             registered: RwLock::new(HashSet::new()),
             codec_cache: Arc::new(CodecCache::with_initial(codec_seed)),
             live: tokio::sync::Mutex::new(HashMap::new()),
@@ -276,8 +280,9 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         // of the view the user watches in the app (ADR 0007): its H.264
         // into the video sink, its AAC into the AAC sink.
         let stall = self.webrtc.live_stall_timeout();
+        let tls = self.relay_tls.clone();
         self.arm_live(camera, |sinks, notifier| async move {
-            RtspRelay::start(url, sinks, stall, notifier)
+            RtspRelay::start(url, sinks, stall, notifier, &tls)
                 .await
                 .map(LiveLeg::Relay)
         })
@@ -472,7 +477,13 @@ mod tests {
     }
 
     fn mux(reg: Arc<FakeRegistry>) -> GstMediaMultiplexer<FakeRegistry> {
-        GstMediaMultiplexer::new(reg, output_config(), WebrtcConfig::default(), &cameras())
+        GstMediaMultiplexer::new(
+            reg,
+            output_config(),
+            WebrtcConfig::default(),
+            &cameras(),
+            RelayTls::from_config(None).expect("system roots"),
+        )
     }
 
     #[tokio::test]

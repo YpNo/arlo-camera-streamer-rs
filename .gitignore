@@ -36,3 +36,6 @@ tarpaulin-report.html
 # config file
 streamer.toml
 .arlo-streamer-session.json
+
+# Security sweep reports and baseline (local; see /security-sweep)
+.security/

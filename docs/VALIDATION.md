@@ -17,6 +17,7 @@ this file records whether reality agreed. Update it after every live gate
 | MFA login, IMAP factor | 2026-10-03 | fresh cache path, 13 s to `authentication complete`, file mode 0600, code 9261 on the trusted-browser probe of a new device id. |
 | Encoder `x264` (ADR 0008) | 2026-10-03 | every gate above; `auto` resolves to it on a box with VA elements and no render node. |
 | Encoder `vaapi` | before 2026-09-28 | ran on the owner's Intel box in an earlier phase. |
+| Relay TLS chain verification (ADR 0007, revised 2026-10-03) | **never** | first gate decides: a trusted chain logs `hostname check waived`, an untrusted one logs the fingerprint to pin in `arlo.watch_along_cert_sha256`. |
 | Encoders `va`, `v4l2`, `nvenc` | **never** | written from element documentation; first run on the Frigate box. |
 | Several cameras at once | **never** | per-camera actors, unit-tested only. |
 | H.265 camera | **never** | code path present, the owner's camera sends H.264. |

@@ -264,6 +264,7 @@ mod tests {
             password_env: "ARLO_PASSWORD".to_string(),
             session_cache_path: PathBuf::from("/tmp/session.json"),
             app_version: "6.46.0".to_string(),
+            watch_along_cert_sha256: None,
             mfa: MfaConfig::Email(EmailMfaConfig {
                 host: Some("imap.example.com".to_string()),
                 provider: None,

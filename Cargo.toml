@@ -45,6 +45,9 @@ tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util   = "0.7"
 tokio-rustls = "0.26"
+# Watch-along TLS (ADR 0007): system roots for chain verification, SHA-256 for the certificate pin.
+rustls-native-certs = "0.8"
+ring = "0.17"
 rustls       = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 url          = "2"
 futures      = "0.3"

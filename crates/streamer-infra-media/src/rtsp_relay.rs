@@ -21,9 +21,15 @@
 //! probe sent it, is accepted (2026-09-30), and the loop needs to own
 //! keep-alives, RTCP receiver reports and the loss signals anyway.
 //!
-//! Certificate validation is off: the URL names a raw IP no certificate
-//! can match. TLS still hides the exchange; the egress token in the URL
-//! is the access control, as it is for the app.
+//! TLS: the certificate chain is verified against the system roots, and
+//! only the hostname check is waived — the URL names a raw IP no
+//! certificate can match. An operator can pin the end-entity certificate
+//! instead (`arlo.watch_along_cert_sha256`) when Arlo's chain is not
+//! public; the relay then refuses anything else. See [`RelayTls`].
+//!
+//! The server is not trusted by the parser either: every text line,
+//! header count and `Content-Length` is bounded, and the binary framing
+//! resyncs on the quirks Arlo's server has (bare RTCP, bare AAC).
 //!
 //! ## Loss detection
 //!
@@ -36,10 +42,14 @@
 //! are unit-tested here; the connection is exercised by
 //! `tests/live_session.rs` against the crate's own RTSP server.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use rustls::client::WebPkiServerVerifier;
+use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf,
     WriteHalf,
@@ -73,6 +83,12 @@ const ACK_QUEUE: usize = 8;
 const FIRST_FRAMES_LOGGED: u64 = 4;
 /// Bytes shown in a desync report.
 const DESYNC_DUMP_BYTES: usize = 24;
+/// Longest RTSP text line accepted from the server (status, header).
+const MAX_LINE_BYTES: usize = 8 * 1024;
+/// Most header lines accepted in one RTSP message.
+const MAX_HEADERS: usize = 64;
+/// Largest message body accepted (`Content-Length`); an SDP is < 2 KiB.
+const MAX_MESSAGE_BODY: usize = 64 * 1024;
 /// RTCP packet types (RFC 3550 §12.1): SR, RR, SDES, BYE, APP.
 const RTCP_PT_FIRST: u8 = 200;
 const RTCP_PT_LAST: u8 = 204;
@@ -131,8 +147,9 @@ impl RtspRelay {
         sinks: LiveSinks,
         stall_timeout: Duration,
         notifier: LiveLossNotifier,
+        tls: &RelayTls,
     ) -> Result<Self, MediaError> {
-        let mut client = Client::connect(url).await?;
+        let mut client = Client::connect(url, tls).await?;
         let base = client.describe(url.as_str()).await?;
         client.setup_video(&base).await?;
         if let Some(audio) = &base.audio {
@@ -315,7 +332,7 @@ struct Client {
 }
 
 impl Client {
-    async fn connect(url: &WatchAlongUrl) -> Result<Self, MediaError> {
+    async fn connect(url: &WatchAlongUrl, tls_policy: &RelayTls) -> Result<Self, MediaError> {
         let parsed = url::Url::parse(url.as_str())
             .map_err(|e| MediaError::Relay(format!("watch-along URL: {e}")))?;
         let host = parsed
@@ -329,7 +346,7 @@ impl Client {
             .map_err(|_| MediaError::Relay(format!("connect to {host}:{port} timed out")))?
             .map_err(|e| MediaError::Relay(format!("connect to {host}:{port}: {e}")))?;
         let io: Box<dyn Io> = if tls {
-            Box::new(tls_handshake(tcp, &host).await?)
+            Box::new(tls_handshake(tcp, &host, tls_policy).await?)
         } else {
             Box::new(tcp)
         };
@@ -816,32 +833,16 @@ fn frame_header_at(window: &[u8], channels: Channels, rtp_pt: Option<u8>) -> Opt
 /// keep-alive, or a request from the server.
 async fn read_message(io: &mut Reader, first: u8, stats: &FrameStats) -> Result<Incoming, String> {
     let mut line = vec![first];
-    io.read_until(b'\n', &mut line)
+    read_text_line(io, &mut line)
         .await
         .map_err(|e| format!("message line: {e}"))?;
     let Ok(start) = String::from_utf8(line.clone()) else {
         return Err(desync_report(first, &line[1..], stats));
     };
-    let mut cseq = None;
-    let mut content_length = 0usize;
-    let mut header = String::new();
-    loop {
-        header.clear();
-        io.read_line(&mut header)
-            .await
-            .map_err(|e| format!("message header: {e}"))?;
-        let h = header.trim_end();
-        if h.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = h.split_once(':') {
-            if k.eq_ignore_ascii_case("CSeq") {
-                cseq = Some(v.trim().to_string());
-            } else if k.eq_ignore_ascii_case("Content-Length") {
-                content_length = v.trim().parse().unwrap_or(0);
-            }
-        }
-    }
+    let headers = read_headers(io)
+        .await
+        .map_err(|e| format!("message header: {e}"))?;
+    let content_length = body_length(&headers)?;
     if content_length > 0 {
         let mut body = vec![0u8; content_length];
         io.read_exact(&mut body)
@@ -851,37 +852,21 @@ async fn read_message(io: &mut Reader, first: u8, stats: &FrameStats) -> Result<
     if start.starts_with("RTSP/") {
         return Ok(Incoming::Other);
     }
-    Ok(Incoming::ServerRequest {
-        cseq: cseq.unwrap_or_else(|| "0".to_string()),
-    })
+    let cseq = header_value(&headers, "CSeq").map_or_else(|| "0".to_string(), str::to_string);
+    Ok(Incoming::ServerRequest { cseq })
 }
 
 async fn read_response(io: &mut Reader) -> Result<Response, MediaError> {
-    let mut line = String::new();
-    io.read_line(&mut line)
+    let mut raw = Vec::new();
+    read_text_line(io, &mut raw)
         .await
         .map_err(|e| MediaError::Relay(format!("status line: {e}")))?;
-    let code = parse_status_code(&line)
+    let code = parse_status_code(&String::from_utf8_lossy(&raw))
         .ok_or_else(|| MediaError::Relay("malformed RTSP status line".into()))?;
-    let mut headers = Vec::new();
-    loop {
-        line.clear();
-        io.read_line(&mut line)
-            .await
-            .map_err(|e| MediaError::Relay(format!("header: {e}")))?;
-        let h = line.trim_end();
-        if h.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = h.split_once(':') {
-            headers.push((k.trim().to_string(), v.trim().to_string()));
-        }
-    }
-    let len: usize = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
-        .and_then(|(_, v)| v.parse().ok())
-        .unwrap_or(0);
+    let headers = read_headers(io)
+        .await
+        .map_err(|e| MediaError::Relay(format!("header: {e}")))?;
+    let len = body_length(&headers).map_err(MediaError::Relay)?;
     let mut body = vec![0u8; len];
     if len > 0 {
         io.read_exact(&mut body)
@@ -895,18 +880,83 @@ async fn read_response(io: &mut Reader) -> Result<Response, MediaError> {
     })
 }
 
+/// One `\n`-terminated text line appended to `buf`, at most
+/// `MAX_LINE_BYTES` long; a server that never sends the newline is cut
+/// off there instead of growing the buffer at link rate.
+async fn read_text_line(io: &mut Reader, buf: &mut Vec<u8>) -> Result<(), String> {
+    let start = buf.len();
+    let limit = u64::try_from(MAX_LINE_BYTES + 1).unwrap_or(u64::MAX);
+    (&mut *io)
+        .take(limit)
+        .read_until(b'\n', buf)
+        .await
+        .map_err(|e| format!("line read: {e}"))?;
+    if buf.len() - start > MAX_LINE_BYTES {
+        return Err(format!("RTSP line longer than {MAX_LINE_BYTES} bytes"));
+    }
+    Ok(())
+}
+
+/// Header lines up to the empty line, at most `MAX_HEADERS` of them.
+async fn read_headers(io: &mut Reader) -> Result<Vec<(String, String)>, String> {
+    let mut headers = Vec::new();
+    loop {
+        let mut raw = Vec::new();
+        read_text_line(io, &mut raw).await?;
+        if raw.is_empty() {
+            return Err("connection closed inside the headers".into());
+        }
+        let line = String::from_utf8(raw).map_err(|_| "header line is not text".to_string())?;
+        let h = line.trim_end();
+        if h.is_empty() {
+            return Ok(headers);
+        }
+        if headers.len() >= MAX_HEADERS {
+            return Err(format!("more than {MAX_HEADERS} headers"));
+        }
+        if let Some((k, v)) = h.split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// The body length a message announces, bounded: the server's number
+/// sizes an allocation, so it is never taken at face value.
+fn body_length(headers: &[(String, String)]) -> Result<usize, String> {
+    let Some(value) = header_value(headers, "Content-Length") else {
+        return Ok(0);
+    };
+    let len: usize = value
+        .parse()
+        .map_err(|_| "Content-Length is not a number".to_string())?;
+    if len > MAX_MESSAGE_BODY {
+        return Err(format!(
+            "Content-Length {len} over the {MAX_MESSAGE_BODY}-byte limit"
+        ));
+    }
+    Ok(len)
+}
+
 async fn tls_handshake(
     tcp: TcpStream,
     host: &str,
+    policy: &RelayTls,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, MediaError> {
     let provider = rustls::crypto::ring::default_provider();
-    let config = rustls::ClientConfig::builder_with_provider(provider.clone().into())
+    let config = rustls::ClientConfig::builder_with_provider(provider.into())
         .with_safe_default_protocol_versions()
         .map_err(|e| MediaError::Relay(format!("TLS config: {e}")))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
+        .with_custom_certificate_verifier(Arc::new(policy.verifier()))
         .with_no_client_auth();
-    let name = rustls::pki_types::ServerName::try_from(host.to_string())
+    let name = ServerName::try_from(host.to_string())
         .map_err(|e| MediaError::Relay(format!("TLS server name: {e}")))?;
     tokio::time::timeout(
         REQUEST_TIMEOUT,
@@ -917,57 +967,175 @@ async fn tls_handshake(
     .map_err(|e| MediaError::Relay(format!("TLS handshake: {e}")))
 }
 
-/// Accepts any certificate (see the module docs). Signatures are still
-/// verified, so the handshake is a real TLS handshake with the peer.
-#[derive(Debug)]
-struct NoVerify(rustls::crypto::CryptoProvider);
+/// How the relay authenticates the watch-along host (ADR 0007).
+///
+/// Default: the certificate chain is verified against the system roots
+/// and only the hostname check is waived, because Arlo hands out a raw
+/// IP that no certificate names. Pinned: the end-entity certificate's
+/// SHA-256 must match (`arlo.watch_along_cert_sha256`), for a chain the
+/// system does not trust; the log prints the presented fingerprint when
+/// a chain is refused, so the operator can copy it.
+#[derive(Clone)]
+pub struct RelayTls {
+    chain: Arc<WebPkiServerVerifier>,
+    pinned: Option<[u8; 32]>,
+}
 
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
+impl fmt::Debug for RelayTls {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RelayTls")
+            .field("pinned", &self.pinned.map(fingerprint_hex))
+            .finish_non_exhaustive()
+    }
+}
+
+impl RelayTls {
+    /// Chain verification with the hostname waived, or a certificate pin
+    /// when `pinned_cert_sha256` (64 hex digits) is given.
+    ///
+    /// # Errors
+    ///
+    /// [`MediaError::Relay`] when the pin is not 32 bytes of hex or the
+    /// system has no root certificates to verify against.
+    pub fn from_config(pinned_cert_sha256: Option<&str>) -> Result<Self, MediaError> {
+        let pinned = pinned_cert_sha256.map(parse_fingerprint).transpose()?;
+        let loaded = rustls_native_certs::load_native_certs();
+        for e in &loaded.errors {
+            debug!(error = %e, "a system root certificate could not be loaded");
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(loaded.certs);
+        if roots.is_empty() {
+            return Err(MediaError::Relay(
+                "no system root certificates found for the watch-along TLS".into(),
+            ));
+        }
+        let provider = rustls::crypto::ring::default_provider();
+        let chain = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.into())
+            .build()
+            .map_err(|e| MediaError::Relay(format!("TLS verifier: {e}")))?;
+        Ok(Self { chain, pinned })
+    }
+
+    fn verifier(&self) -> WatchAlongVerifier {
+        WatchAlongVerifier {
+            chain: self.chain.clone(),
+            pinned: self.pinned,
+        }
+    }
+}
+
+/// Chain-verifying certificate check with the hostname waived, or a pin.
+#[derive(Debug)]
+struct WatchAlongVerifier {
+    chain: Arc<WebPkiServerVerifier>,
+    pinned: Option<[u8; 32]>,
+}
+
+impl ServerCertVerifier for WatchAlongVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let presented = cert_sha256(end_entity);
+        if let Some(pin) = self.pinned {
+            if pin == presented {
+                return Ok(ServerCertVerified::assertion());
+            }
+            warn!(
+                sha256 = %fingerprint_hex(presented),
+                "watch-along certificate does not match arlo.watch_along_cert_sha256"
+            );
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+        match self.chain.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(verified) => Ok(verified),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName
+                | rustls::CertificateError::NotValidForNameContext { .. },
+            )) => {
+                debug!("watch-along certificate chain trusted; hostname check waived (raw IP)");
+                Ok(ServerCertVerified::assertion())
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    sha256 = %fingerprint_hex(presented),
+                    "watch-along certificate chain not trusted; set arlo.watch_along_cert_sha256 to pin it"
+                );
+                Err(e)
+            }
+        }
     }
 
     fn verify_tls12_signature(
         &self,
         message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
+        cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
+        self.chain.verify_tls12_signature(message, cert, dss)
     }
 
     fn verify_tls13_signature(
         &self,
         message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
+        cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
+        self.chain.verify_tls13_signature(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        self.chain.supported_verify_schemes()
     }
 }
 
-// ---- pure pieces -------------------------------------------------------
+/// SHA-256 of a certificate's DER, the fingerprint `openssl x509
+/// -fingerprint -sha256` prints (without the colons).
+fn cert_sha256(cert: &CertificateDer<'_>) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, cert.as_ref());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
+fn fingerprint_hex(bytes: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::with_capacity(64), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+/// 64 hex digits (colons tolerated) → 32 bytes.
+fn parse_fingerprint(text: &str) -> Result<[u8; 32], MediaError> {
+    let hex: String = text.chars().filter(|c| *c != ':').collect();
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(MediaError::Relay(
+            "arlo.watch_along_cert_sha256 must be 64 hex digits (SHA-256 of the certificate)"
+                .into(),
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| MediaError::Relay("invalid hex in arlo.watch_along_cert_sha256".into()))?;
+    }
+    Ok(out)
+}
 
 /// The text of one RTSP request.
 fn request_text(
@@ -1581,6 +1749,71 @@ mod tests {
             Ok(Incoming::Rtp(_))
         ));
         assert_eq!(stats.resyncs, 0, "no resync needed around a parsed packet");
+    }
+
+    #[tokio::test]
+    async fn response_with_an_oversized_content_length_is_refused() {
+        for header in [
+            "Content-Length: 99999999",
+            "Content-Length: 18446744073709551615",
+        ] {
+            let text = format!("RTSP/1.0 200 OK\r\nCSeq: 1\r\n{header}\r\n\r\n");
+            let mut reader = reader_fed_with(text.as_bytes());
+            let err = match read_response(&mut reader).await {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{header} must be refused"),
+            };
+            assert!(err.contains("Content-Length"), "{header}: {err}");
+        }
+        // Within the limit the body is read as before.
+        let mut reader = reader_fed_with(b"RTSP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nabc");
+        let response = read_response(&mut reader).await.expect("small body");
+        assert_eq!(response.body, b"abc");
+    }
+
+    #[tokio::test]
+    async fn overlong_lines_and_header_floods_are_refused() {
+        let mut long = b"RTSP/1.0 200 OK\r\n".to_vec();
+        long.extend(std::iter::repeat_n(b'a', MAX_LINE_BYTES + 100));
+        let mut reader = reader_fed_with(&long);
+        let err = match read_response(&mut reader).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an endless line must be refused"),
+        };
+        assert!(err.contains("longer than"), "{err}");
+
+        let mut flood = b"RTSP/1.0 200 OK\r\n".to_vec();
+        for i in 0..(MAX_HEADERS + 10) {
+            flood.extend_from_slice(format!("X-{i}: v\r\n").as_bytes());
+        }
+        flood.extend_from_slice(b"\r\n");
+        let mut reader = reader_fed_with(&flood);
+        let err = match read_response(&mut reader).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a header flood must be refused"),
+        };
+        assert!(err.contains("headers"), "{err}");
+    }
+
+    #[test]
+    fn certificate_pins_parse_as_64_hex_digits() {
+        let hex = "ab".repeat(32);
+        assert_eq!(parse_fingerprint(&hex).unwrap(), [0xab; 32]);
+        let colons = (0..32).map(|_| "AB").collect::<Vec<_>>().join(":");
+        assert_eq!(parse_fingerprint(&colons).unwrap(), [0xab; 32]);
+        assert!(parse_fingerprint("abcd").is_err());
+        assert!(parse_fingerprint(&"zz".repeat(32)).is_err());
+        assert_eq!(fingerprint_hex([0x0f; 32]), "0f".repeat(32));
+    }
+
+    #[test]
+    fn relay_tls_builds_from_the_system_roots_and_accepts_a_pin() {
+        let plain = RelayTls::from_config(None).expect("system roots");
+        assert!(plain.pinned.is_none());
+        let pinned = RelayTls::from_config(Some(&"01".repeat(32))).expect("pin");
+        assert_eq!(pinned.pinned, Some([1u8; 32]));
+        assert!(RelayTls::from_config(Some("nope")).is_err());
+        assert!(format!("{pinned:?}").contains("0101"));
     }
 
     #[tokio::test]

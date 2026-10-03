@@ -57,7 +57,7 @@ impl ArloThumbnailSourceAdapter {
             .get(url)
             .send()
             .await
-            .map_err(|e| DomainError::AdapterTransport(format!("thumbnail GET failed: {e}")))?;
+            .map_err(|e| transport_error("thumbnail GET failed", e))?;
         if !resp.status().is_success() {
             return Err(DomainError::AdapterTransport(format!(
                 "thumbnail HTTP {} for {camera}",
@@ -66,7 +66,7 @@ impl ArloThumbnailSourceAdapter {
         }
         resp.bytes()
             .await
-            .map_err(|e| DomainError::AdapterTransport(format!("thumbnail body read failed: {e}")))
+            .map_err(|e| transport_error("thumbnail body read failed", e))
     }
 
     async fn device_list_url(&self, camera: &CameraId) -> Result<Option<String>, DomainError> {
@@ -100,5 +100,42 @@ impl ArloThumbnailSource for ArloThumbnailSourceAdapter {
         let bytes = self.fetch_jpeg(&url, camera).await?;
         debug!(%camera, source = "device-list", bytes = bytes.len(), "idle snapshot fetched");
         Ok(Some(bytes))
+    }
+}
+
+/// Wrap an HTTP error without its URL: `reqwest::Error`'s `Display`
+/// appends `for url (…)`, and the URL is a presigned S3 link whose query
+/// is the credential. The error class and the source chain are kept.
+fn transport_error(what: &str, e: reqwest::Error) -> DomainError {
+    DomainError::AdapterTransport(format!("{what}: {}", e.without_url()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn transport_error_never_carries_the_presigned_url() {
+        // Connection refused on a closed local port: a transport error that
+        // reqwest decorates with the request URL.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let err = client
+            .get("http://127.0.0.1:1/thumb.jpg?X-Amz-Signature=SECRET")
+            .send()
+            .await
+            .expect_err("port 1 refuses");
+        assert!(
+            err.to_string().contains("SECRET"),
+            "precondition: reqwest echoes the URL"
+        );
+        let wrapped = transport_error("thumbnail GET failed", err).to_string();
+        assert!(
+            !wrapped.contains("SECRET") && !wrapped.contains("127.0.0.1"),
+            "{wrapped}"
+        );
+        assert!(wrapped.contains("thumbnail GET failed"), "{wrapped}");
     }
 }

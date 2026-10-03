@@ -23,6 +23,11 @@ session_cache_path = "/var/lib/arlo-streamer/session.json"
 # live view you started in the app, to relay it (ADR 0007). Arlo hands that
 # identity an RTSPS stream; a browser identity gets an unplayable DASH URL.
 # app_version = "6.46.0"
+# The relay verifies that host's certificate chain against the system roots
+# and waives only the hostname check (Arlo hands out a raw IP). If the log
+# says `watch-along certificate chain not trusted`, copy the fingerprint it
+# prints here to pin the certificate instead.
+# watch_along_cert_sha256 = "…64 hex digits…"
 
 # Second factor for the first login (and whenever the cached session is
 # rejected). Exactly one `[arlo.mfa]` block; pick a `kind`:

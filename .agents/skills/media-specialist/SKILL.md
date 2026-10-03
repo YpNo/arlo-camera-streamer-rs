@@ -106,7 +106,10 @@ Arlo-specific behaviour with the `live-validation` skill.
   (`unframed bytes skipped`, first four at debug). After `RESYNC_LIMIT` (64 KiB) the
   relay ends with `unexpected byte 0x..` + a hex dump — read that line before touching
   the parser.
-- TLS with validation **off** (raw-IP host); the egress token is the access control.
+- TLS: chain verified against the system roots (`rustls-native-certs`), hostname waived
+  (raw-IP host) — `WatchAlongVerifier` maps only `NotValidForName*` to accepted; or a
+  SHA-256 certificate pin from `arlo.watch_along_cert_sha256`. Server text is bounded:
+  `MAX_LINE_BYTES`, `MAX_HEADERS`, `MAX_MESSAGE_BODY` (`read_text_line`, `body_length`).
 - Both legs (`LiveLeg::{Webrtc, Relay}`) go through `arm_live`; the stall watchdog and
   `report_loss` live in `live_watch.rs`.
 - Test source: `Stack::install_source("/mount", launch)` on the crate's own RTSP server.

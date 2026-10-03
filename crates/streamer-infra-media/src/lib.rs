@@ -72,4 +72,5 @@ pub use pipeline_desc::{
     DashBranchConfig, HlsBranchConfig, OutputBranches, build_output_branches, rtsp_mount_path,
 };
 pub use rtsp::RtspServer;
+pub use rtsp_relay::RelayTls;
 pub use splice::{KeyframeWatcher, is_keyframe};
