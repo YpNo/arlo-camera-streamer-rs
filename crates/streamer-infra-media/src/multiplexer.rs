@@ -219,8 +219,11 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
     #[instrument(skip(self), fields(camera = %camera))]
     async fn register(&self, camera: &CameraId) -> Result<(), DomainError> {
         let stream_name = self.stream_name(camera)?.clone();
+        // Held across the registry call so two concurrent registrations
+        // of one camera cannot both pass the check.
+        let mut registered = self.registered.write().await;
         // Idempotent fast path: already up.
-        if self.registered.read().await.contains(camera) {
+        if registered.contains(camera) {
             debug!("camera already registered; idempotent no-op");
             return Ok(());
         }
@@ -230,13 +233,14 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         let idle = select_idle_source(None, &stream_name, &timestamp);
         match self.registry.register(camera, idle, outputs).await {
             Ok(()) => {
-                self.registered.write().await.insert(camera.clone());
+                registered.insert(camera.clone());
                 info!("camera registered with idle pipeline");
                 Ok(())
             }
             Err(MediaError::AlreadyRegistered(_)) => {
-                // Adapter saw it first; we still record locally.
-                self.registered.write().await.insert(camera.clone());
+                // Adapter saw it first; we still record locally (the
+                // write guard is already held — never lock it again here).
+                registered.insert(camera.clone());
                 debug!("registry reported already-registered; recording locally");
                 Ok(())
             }
@@ -300,8 +304,14 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         // session is released by the orchestrator
         // (`WebrtcSignaler::teardown`, paired with this).
         let res = self.registry.detach_live_sink(camera).await;
-        if let Some(mut leg) = self.live.lock().await.remove(camera) {
-            leg.shutdown();
+        // Take the leg out under the lock, stop it outside: the pipeline
+        // teardown blocks, and must hold up neither the runtime's worker
+        // nor the other cameras' attach/detach.
+        let leg = self.live.lock().await.remove(camera);
+        if let Some(mut leg) = leg
+            && let Err(e) = tokio::task::spawn_blocking(move || leg.shutdown()).await
+        {
+            warn!(error = %e, "live leg shutdown task failed");
         }
         res.map_err(Into::into)
     }
@@ -581,7 +591,7 @@ mod tests {
     #[tokio::test]
     async fn attach_user_view_before_register_returns_unknown_camera() {
         let m = mux(Arc::new(FakeRegistry::default()));
-        let url = WatchAlongUrl::parse("rtsp://127.0.0.1:1/x").unwrap();
+        let url = WatchAlongUrl::parse("rtsps://127.0.0.1:1/x").unwrap();
         let err = m.attach_user_view(&cam("CAM_A"), &url).await.unwrap_err();
         assert!(matches!(err, DomainError::UnknownCamera(_)));
     }
@@ -592,7 +602,7 @@ mod tests {
         let m = mux(reg.clone());
         m.register(&cam("CAM_A")).await.unwrap();
         // Port 1 on loopback: nothing listens, the connect is refused.
-        let url = WatchAlongUrl::parse("rtsp://127.0.0.1:1/x").unwrap();
+        let url = WatchAlongUrl::parse("rtsps://127.0.0.1:1/x").unwrap();
         let err = m.attach_user_view(&cam("CAM_A"), &url).await.unwrap_err();
         assert!(
             matches!(err, DomainError::AdapterTransport(ref msg) if msg.contains("rtsp relay")),

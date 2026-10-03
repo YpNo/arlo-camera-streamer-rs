@@ -27,6 +27,11 @@
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+/// Most RTSP sessions kept at once (viewers plus the HLS segmenters).
+/// A home deployment has a handful; the cap stops a client flood from
+/// growing the pool without bound.
+pub const MAX_RTSP_SESSIONS: u32 = 64;
+
 use gstreamer::glib;
 use gstreamer_rtsp_server::prelude::*;
 use gstreamer_rtsp_server::{
@@ -69,6 +74,12 @@ impl RtspServer {
         let mounts = server.mount_points().ok_or_else(|| {
             MediaError::Rtsp("RTSPServer::mount_points returned None".to_string())
         })?;
+        // Bound the session pool: without a cap every half-open client
+        // keeps a session (and its pipeline reference) until its timeout.
+        let sessions = server.session_pool().ok_or_else(|| {
+            MediaError::Rtsp("RTSPServer::session_pool returned None".to_string())
+        })?;
+        sessions.set_max_sessions(MAX_RTSP_SESSIONS);
 
         server
             .attach(None)

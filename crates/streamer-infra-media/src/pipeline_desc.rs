@@ -143,6 +143,9 @@ pub struct OutputBranches {
 /// Resolved HLS sink parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HlsBranchConfig {
+    /// The configured HLS root (`output.hls.dir`); `dir` must be a real
+    /// directory directly under it.
+    pub root: String,
     /// Per-stream directory holding the playlist and its segments.
     pub dir: String,
     /// Path to `index.m3u8`.
@@ -198,8 +201,15 @@ fn build_hls_branch(name: &StreamName, hls: &HlsOutput) -> HlsBranchConfig {
     let dir = format_dir(&hls.dir, name);
     let playlist_length = hls.effective_playlist_length();
     HlsBranchConfig {
+        root: hls.dir.display().to_string(),
         playlist_location: format!("{dir}/{HLS_PLAYLIST_FILE}"),
-        segment_location: format!("{dir}/{HLS_SEGMENT_PREFIX}%05d{HLS_SEGMENT_SUFFIX}"),
+        // `splitmuxsink` runs the pattern through printf: a `%` in the
+        // operator's path must be a literal there, or `%s` dereferences
+        // the fragment id as a pointer.
+        segment_location: format!(
+            "{}/{HLS_SEGMENT_PREFIX}%05d{HLS_SEGMENT_SUFFIX}",
+            dir.replace('%', "%%")
+        ),
         target_duration: hls.effective_segment_secs(),
         playlist_length,
         max_files: playlist_length + HLS_SEGMENTS_BEYOND_PLAYLIST,
@@ -451,6 +461,23 @@ mod tests {
         assert_eq!(hls.target_duration, 4);
         assert_eq!(hls.playlist_length, 6);
         assert_eq!(hls.max_files, 6 + HLS_SEGMENTS_BEYOND_PLAYLIST);
+    }
+
+    #[test]
+    fn build_output_branches_escapes_percent_in_the_segment_pattern_only() {
+        let out = HlsOutput {
+            dir: PathBuf::from("/var/h%sls"),
+            segment_secs: 4,
+            playlist_length: 6,
+        };
+        let hls = build_hls_branch(&name(), &out);
+        assert_eq!(hls.root, "/var/h%sls");
+        assert_eq!(hls.dir, "/var/h%sls/front_door");
+        assert_eq!(hls.playlist_location, "/var/h%sls/front_door/index.m3u8");
+        assert_eq!(
+            hls.segment_location,
+            "/var/h%%sls/front_door/segment-%05d.ts"
+        );
     }
 
     #[test]

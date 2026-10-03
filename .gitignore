@@ -37,5 +37,14 @@ tarpaulin-report.html
 streamer.toml
 .arlo-streamer-session.json
 
+# Secrets and local environment — never in the repository
+.env
+.env.*
+.envrc
+.direnv/
+session.json
+*.pem
+*.key
+
 # Security sweep reports and baseline (local; see /security-sweep)
 .security/

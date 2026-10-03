@@ -103,7 +103,10 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   timeout is 2 s and a WebRTC negotiation takes longer. Manual wake goes through
   `motion_signal()` like a real motion, and is refused (`WakeOutcome::TooSoon` →
   `AdminError::RateLimited` → HTTP 429) within `ADMIN_WAKE_MIN_INTERVAL` (30 s) of
-  `last_session_end`, set in `detach_and_refresh`.
+  `last_session_end`, set in `detach_and_refresh`. The actor enqueues with `try_send`:
+  a full mailbox is `AdminError::Unavailable` (503) at once, never a wait.
+- **Budget reset** fires on any change of the reset date (`!=`), so a clock stepped
+  backwards across the boundary refills the quota instead of freezing it.
 
 ## Attach flow and its failures
 

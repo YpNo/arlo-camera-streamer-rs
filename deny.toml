@@ -3,6 +3,7 @@ targets = [
     { triple = "aarch64-apple-darwin" },
     { triple = "x86_64-apple-darwin" },
     { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
 ]
 
 [advisories]
@@ -55,9 +56,9 @@ skip = [
     { crate = "getrandom@0.2.17", reason = "Required by ring v0.17" },
     { crate = "getrandom@0.3.4", reason = "Required by rand_core v0.9 (tungstenite) and jobserver" },
     { crate = "itertools@0.13.0", reason = "Required by bindgen v0.72 (btls-sys build dependency)" },
-    { crate = "syn@2.0.117", reason = "Every proc-macro crate except futures-macro v0.3.34, which moved to syn 3" },
-    { crate = "rand@0.9.4", reason = "Required by tungstenite v0.28 (stealthscraper-rs is on rand 0.10)" },
-    { crate = "rand_core@0.9.5", reason = "Required by rand v0.9.4" },
+    { crate = "syn@2.0.119", reason = "Every proc-macro crate except futures-macro v0.3.34, which moved to syn 3" },
+    { crate = "rand@0.9.5", reason = "Required by tungstenite v0.28 (stealthscraper-rs is on rand 0.10)" },
+    { crate = "rand_core@0.9.5", reason = "Required by rand v0.9.5" },
     { crate = "thiserror@1.0.69", reason = "Required by tokio-socks v0.5" },
     { crate = "thiserror-impl@1.0.69", reason = "Required by thiserror v1.0.69" },
     { crate = "webpki-roots@0.26.11", reason = "Required by tokio-tungstenite v0.28 (arlo-rs); reqwest is on 1.0" },

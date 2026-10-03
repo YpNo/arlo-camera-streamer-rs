@@ -171,7 +171,7 @@ budget and probe 0 to 86400 s).
 |----------|---------|
 | `ARLO_PASSWORD` (or whatever you put in `arlo.password_env`) | Arlo cloud password. |
 | `ARLO_IMAP_PASSWORD` (or whatever you put in `arlo.mfa.password_env`) | IMAP password. |
-| `STREAMER_ADMIN_TOKEN` | **Required.** Bearer token for `/admin/*`. |
+| `STREAMER_ADMIN_TOKEN` | **Required.** Bearer token for `/admin/*`, at least 16 bytes (`openssl rand -hex 32`). |
 | `RUST_LOG` | (optional) Tracing filter, e.g. `info,arlo_camera_streamer=debug`. |
 
 ## Usage
@@ -261,7 +261,7 @@ Stream URL pattern: `rtsp://<host>:<rtsp.bind>/<cameras.stream_name>`.
 | Endpoint                              | Auth     | Purpose                                |
 |---------------------------------------|----------|----------------------------------------|
 | `GET /metrics` (port 9090)            | None     | Prometheus exposition.                 |
-| `GET /healthz` (port 9090)            | None     | Liveness — `200 OK` while running.     |
+| `GET /healthz` (port 9090)            | None     | Liveness — `200 OK` while running. `arlo-camera-streamer healthcheck --config …` asks it for you (the container `HEALTHCHECK`). |
 | `GET /readyz`  (port 9090)            | None     | Ready iff started **and** Arlo bus connected. |
 | `GET /admin/state` (port 9091)        | Bearer   | System snapshot (JSON); per-camera state as the camera task last published it, so a camera mid-negotiation still answers (`activating`). |
 | `GET /admin/cameras/{id}` (port 9091) | Bearer   | Per-camera snapshot.                   |
@@ -399,6 +399,15 @@ Releasing is therefore: bump `version` in `Cargo.toml`, move the
   limit, a 2 MiB cap and a JPEG magic check, and written owner-only
   beside the session cache. Presigned URLs, session ids and tokens are
   never logged.
+- Camera ids are validated at every boundary (`[A-Za-z0-9_-]{1,64}`); a
+  bad `/admin/cameras/{id}` is answered `400`. The ops and admin
+  listeners close a connection that sends no request head within 10 s
+  and hold at most 64 connections each; the RTSP server keeps at most 64
+  sessions. Both HTTP listeners bind loopback by default — keep them
+  there or put a reverse proxy in front.
+- The image runs as uid/gid `10001`, ships no shell tools beyond `tini`,
+  and every published digest carries SLSA provenance and an SPDX SBOM
+  (`docker buildx imagetools inspect <ref> --format '{{json .Provenance}}'`).
 - TLS termination for RTSP is the deployer's responsibility — bind
   `output.rtsp.bind` to `127.0.0.1` and front it with go2rtc / nginx
   if you need encrypted RTSP.

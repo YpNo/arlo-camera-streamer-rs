@@ -15,35 +15,42 @@
 //! matches the token configured on [`AdminServer::new`]. A constant-
 //! time comparison guards against timing-leak side channels.
 //!
-//! Empty tokens are rejected at construction (a daemon should never
-//! expose unauthenticated write endpoints — fail fast at boot).
+//! Tokens shorter than [`MIN_ADMIN_TOKEN_BYTES`] are rejected at
+//! construction (a daemon should never expose write endpoints behind a
+//! guessable token — fail fast at boot).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use secrecy::{ExposeSecret, SecretString};
 use streamer_domain::admin::AdminError;
 use streamer_domain::camera::CameraId;
 use streamer_domain::port::AdminControl;
+use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+use crate::serve::ServeLimits;
 
 /// Header name used for bearer auth. Lower-case so axum's case-
 /// insensitive map lookups match the canonical form.
 const AUTH_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
+/// Shortest admin token accepted (128 bits of a random token).
+pub const MIN_ADMIN_TOKEN_BYTES: usize = 16;
 
 /// Shared handler state.
 #[derive(Clone)]
 struct AppState {
     admin: Arc<dyn AdminControl>,
-    /// Bearer token expected on every request. Owned here so the
-    /// constant-time comparison runs against a stable value.
-    token: Arc<str>,
+    /// Bearer token expected on every request. Kept as a secret (zeroed
+    /// on drop, never printed) and exposed only for the comparison.
+    token: Arc<SecretString>,
 }
 
 /// Errors raised by [`AdminServer::new`].
@@ -52,6 +59,9 @@ pub enum AdminServerError {
     /// The configured admin token was empty or whitespace-only.
     #[error("admin token must be non-empty")]
     EmptyToken,
+    /// The configured admin token is shorter than [`MIN_ADMIN_TOKEN_BYTES`].
+    #[error("admin token must be at least {MIN_ADMIN_TOKEN_BYTES} bytes")]
+    ShortToken,
 }
 
 /// HTTP server for the admin write surface.
@@ -70,16 +80,24 @@ impl AdminServer {
     ///
     /// # Errors
     ///
-    /// Returns [`AdminServerError::EmptyToken`] if `token` is empty
-    /// or whitespace-only.
-    pub fn new(admin: Arc<dyn AdminControl>, token: String) -> Result<Self, AdminServerError> {
-        if token.trim().is_empty() {
+    /// Returns [`AdminServerError::EmptyToken`] if `token` is empty or
+    /// whitespace-only, [`AdminServerError::ShortToken`] if it is shorter
+    /// than [`MIN_ADMIN_TOKEN_BYTES`].
+    pub fn new(
+        admin: Arc<dyn AdminControl>,
+        token: SecretString,
+    ) -> Result<Self, AdminServerError> {
+        let trimmed = token.expose_secret().trim();
+        if trimmed.is_empty() {
             return Err(AdminServerError::EmptyToken);
+        }
+        if trimmed.len() < MIN_ADMIN_TOKEN_BYTES {
+            return Err(AdminServerError::ShortToken);
         }
         Ok(Self {
             state: AppState {
                 admin,
-                token: Arc::from(token),
+                token: Arc::new(token),
             },
         })
     }
@@ -108,41 +126,35 @@ impl AdminServer {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|source| crate::error::OpsError::Bind { addr, source })?;
-        info!(%addr, "admin HTTP server listening");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                shutdown.cancelled().await;
-                info!("admin HTTP server shutting down");
-            })
-            .await
-            .map_err(crate::error::OpsError::Serve)?;
-        Ok(())
+        crate::serve::serve("admin", listener, app, ServeLimits::default(), shutdown).await
     }
 }
 
-/// Constant-time comparison of two byte slices. Returns `true` iff
-/// equal. Never short-circuits on the first mismatch.
+/// Constant-time comparison of two byte slices (`subtle`). Returns
+/// `true` iff equal; a length mismatch is the only early answer, and the
+/// length of the real token is not a secret worth hiding.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 /// Validate the `Authorization` header. Returns `Some(())` on success,
 /// `None` when missing / malformed / wrong token.
-fn check_auth(headers: &HeaderMap, expected: &str) -> Option<()> {
+fn check_auth(headers: &HeaderMap, expected: &SecretString) -> Option<()> {
     let value = headers.get(AUTH_HEADER)?.to_str().ok()?;
     let provided = value.strip_prefix(BEARER_PREFIX)?;
-    if ct_eq(provided.as_bytes(), expected.as_bytes()) {
+    if ct_eq(provided.as_bytes(), expected.expose_secret().as_bytes()) {
         Some(())
     } else {
         None
     }
+}
+
+/// The `400` for a `{id}` path parameter outside the id rule: it is
+/// refused at the trust boundary and never reaches a log line or the
+/// actor. `e` names the rule broken, never the input.
+fn bad_camera_id(e: &streamer_domain::error::DomainError) -> Response {
+    debug!(error = %e, "admin: rejected camera id");
+    (StatusCode::BAD_REQUEST, format!("invalid camera id: {e}")).into_response()
 }
 
 /// The 401 answer. The route template is logged (never the presented
@@ -152,7 +164,7 @@ fn unauthorized(route: &'static str) -> Response {
     warn!(route, "admin: rejected unauthenticated request");
     let mut resp = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     resp.headers_mut()
-        .insert(header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
     resp
 }
 
@@ -215,8 +227,12 @@ async fn handle_camera_state(
     if check_auth(&headers, &state.token).is_none() {
         return unauthorized("GET /admin/cameras/{id}");
     }
+    let id = match CameraId::parse(&id) {
+        Ok(id) => id,
+        Err(e) => return bad_camera_id(&e),
+    };
     debug!(camera = %id, "GET /admin/cameras/{id}");
-    match state.admin.camera_snapshot(&CameraId::new(id)).await {
+    match state.admin.camera_snapshot(&id).await {
         Ok(s) => json_response(&s),
         Err(e) => admin_error_to_response(e),
     }
@@ -230,8 +246,12 @@ async fn handle_wake(
     if check_auth(&headers, &state.token).is_none() {
         return unauthorized("POST /admin/cameras/{id}/wake");
     }
+    let id = match CameraId::parse(&id) {
+        Ok(id) => id,
+        Err(e) => return bad_camera_id(&e),
+    };
     info!(camera = %id, "POST /admin/cameras/{id}/wake");
-    match state.admin.manual_wake(&CameraId::new(id)).await {
+    match state.admin.manual_wake(&id).await {
         Ok(()) => (StatusCode::ACCEPTED, "wake queued").into_response(),
         Err(e) => admin_error_to_response(e),
     }
@@ -245,8 +265,12 @@ async fn handle_idle(
     if check_auth(&headers, &state.token).is_none() {
         return unauthorized("POST /admin/cameras/{id}/idle");
     }
+    let id = match CameraId::parse(&id) {
+        Ok(id) => id,
+        Err(e) => return bad_camera_id(&e),
+    };
     info!(camera = %id, "POST /admin/cameras/{id}/idle");
-    match state.admin.force_idle(&CameraId::new(id)).await {
+    match state.admin.force_idle(&id).await {
         Ok(()) => (StatusCode::ACCEPTED, "idle queued").into_response(),
         Err(e) => admin_error_to_response(e),
     }
@@ -322,17 +346,52 @@ mod tests {
         }
     }
 
+    const TOKEN: &str = "secret-token-of-sixteen-bytes-or-more";
+
     fn make_server() -> (AdminServer, Arc<StubAdmin>) {
         let admin = StubAdmin::arc();
-        let srv = AdminServer::new(admin.clone(), "secret".to_string()).unwrap();
+        let srv = AdminServer::new(admin.clone(), SecretString::from(TOKEN)).unwrap();
         (srv, admin)
     }
 
     #[tokio::test]
     async fn empty_token_is_rejected_at_construction() {
         let admin = StubAdmin::arc();
-        let err = AdminServer::new(admin, "   ".to_string()).unwrap_err();
+        let err = AdminServer::new(admin, SecretString::from("   ")).unwrap_err();
         assert!(matches!(err, AdminServerError::EmptyToken));
+    }
+
+    #[tokio::test]
+    async fn short_token_is_rejected_at_construction() {
+        let admin = StubAdmin::arc();
+        let err = AdminServer::new(admin, SecretString::from("fifteen-bytes!!")).unwrap_err();
+        assert!(matches!(err, AdminServerError::ShortToken));
+    }
+
+    #[tokio::test]
+    async fn camera_routes_answer_400_for_an_id_outside_the_rule() {
+        let (server, admin) = make_server();
+        for (method, uri) in [
+            ("GET", "/admin/cameras/..%2F..%2Fetc"),
+            ("POST", "/admin/cameras/forged%0Aline/wake"),
+            ("POST", "/admin/cameras/a%20b/idle"),
+        ] {
+            let response = server
+                .router()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                        .body(String::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+        }
+        assert!(admin.wake_calls.lock().await.is_empty());
+        assert!(admin.force_idle_calls.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -360,7 +419,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/state")
-                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                     .body(String::new())
                     .unwrap(),
             )
@@ -388,7 +447,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/cameras/MISSING")
-                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                     .body(String::new())
                     .unwrap(),
             )
@@ -406,7 +465,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/admin/cameras/CAM1/wake")
-                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                     .body(String::new())
                     .unwrap(),
             )
@@ -426,7 +485,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/admin/cameras/CAM1/idle")
-                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                     .body(String::new())
                     .unwrap(),
             )
@@ -480,7 +539,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/state")
-                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                     .body(String::new())
                     .unwrap(),
             )
@@ -497,7 +556,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/nope")
-                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                     .body(String::new())
                     .unwrap(),
             )
@@ -507,9 +566,10 @@ mod tests {
     }
 
     #[test]
-    fn ct_eq_is_constant_time_for_equal_inputs() {
+    fn ct_eq_compares_bytes_and_lengths() {
         assert!(ct_eq(b"abc", b"abc"));
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"abcd"));
+        assert!(ct_eq(b"", b""));
     }
 }

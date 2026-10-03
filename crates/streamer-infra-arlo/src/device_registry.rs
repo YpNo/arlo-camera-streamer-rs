@@ -87,7 +87,7 @@ impl DeviceRegistry {
     fn lookup(&self, camera: &CameraId) -> Option<Arc<Device>> {
         self.cache
             .read()
-            .expect("device cache lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(camera.as_str())
             .cloned()
     }
@@ -98,7 +98,10 @@ impl DeviceRegistry {
             .into_iter()
             .map(|d| (d.device_id.clone(), Arc::new(d)))
             .collect();
-        *self.cache.write().expect("device cache lock poisoned") = map;
+        *self
+            .cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = map;
         Ok(())
     }
 }

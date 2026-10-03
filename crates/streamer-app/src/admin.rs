@@ -134,12 +134,15 @@ impl AdminControlActor {
             .ok_or_else(|| AdminError::UnknownCamera(camera.clone()))
     }
 
-    async fn send(&self, route: &AdminRoute, cmd: AdminCommand) -> Result<(), AdminError> {
-        route
-            .sender
-            .send(cmd)
-            .await
-            .map_err(|e| AdminError::Unavailable(format!("send failed: {e}")))
+    /// Enqueue without waiting: a full mailbox is the documented
+    /// back-pressure signal ([`ADMIN_MAILBOX_CAPACITY`]), not something an
+    /// HTTP handler should block on.
+    fn send(route: &AdminRoute, cmd: AdminCommand) -> Result<(), AdminError> {
+        use mpsc::error::TrySendError;
+        route.sender.try_send(cmd).map_err(|e| match e {
+            TrySendError::Full(_) => AdminError::Unavailable("admin mailbox full".to_string()),
+            TrySendError::Closed(_) => AdminError::Unavailable("orchestrator gone".to_string()),
+        })
     }
 }
 
@@ -176,8 +179,7 @@ impl AdminControl for AdminControlActor {
     async fn force_idle(&self, camera: &CameraId) -> Result<(), AdminError> {
         let route = self.route(camera)?;
         let (tx, rx) = oneshot::channel();
-        self.send(route, AdminCommand::ForceIdle { reply: tx })
-            .await?;
+        Self::send(route, AdminCommand::ForceIdle { reply: tx })?;
         timeout(ADMIN_REPLY_TIMEOUT, rx)
             .await
             .map_err(|_| AdminError::Unavailable("force-idle timeout".to_string()))?
@@ -187,8 +189,7 @@ impl AdminControl for AdminControlActor {
     async fn manual_wake(&self, camera: &CameraId) -> Result<(), AdminError> {
         let route = self.route(camera)?;
         let (tx, rx) = oneshot::channel();
-        self.send(route, AdminCommand::ManualWake { reply: tx })
-            .await?;
+        Self::send(route, AdminCommand::ManualWake { reply: tx })?;
         let outcome = timeout(ADMIN_REPLY_TIMEOUT, rx)
             .await
             .map_err(|_| AdminError::Unavailable("manual-wake timeout".to_string()))?

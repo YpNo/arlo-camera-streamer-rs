@@ -62,6 +62,14 @@ audit/deny, Sonar, GitGuardian. Clippy is pedantic: functions over
   when it fires. A past instant whose condition stays true spins the loop; under a paused
   clock the test hangs instead of failing (`user_view_notice_expiry`, 2026-10-02).
 - Never log secrets, presigned URLs, egress tokens or PII; redact in `Debug` impls.
+  Secrets held for the process lifetime are `secrecy::SecretString` (admin token).
+- Text from the network or a library becomes a `DomainError` through
+  `DomainError::adapter_transport` / `sanitize_reason` (no control characters, 256
+  bytes), never through `AdapterTransport(format!(..))` directly.
+- Ids from a trust boundary (config, HTTP path, event bus) go through `CameraId::parse`
+  (`[A-Za-z0-9_-]{1,64}`); `CameraId::new` is for trusted values and tests only.
+- HTTP listeners go through `streamer_infra_ops::serve::serve` (header-read timeout,
+  connection cap), never bare `axum::serve`.
 
 ## Testing
 

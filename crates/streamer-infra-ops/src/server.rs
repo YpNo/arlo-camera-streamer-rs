@@ -13,7 +13,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::error;
 
 use crate::health::Readiness;
 use crate::metrics::Metrics;
@@ -49,12 +49,13 @@ impl OpsServer {
             .with_state(self.state.clone())
     }
 
-    /// Bind and serve until `shutdown` is cancelled.
+    /// Bind and serve until `shutdown` is cancelled, with the default
+    /// [`ServeLimits`](crate::serve::ServeLimits).
     ///
     /// # Errors
     ///
     /// Returns [`crate::error::OpsError`] if the bind address is in use, the
-    /// listener cannot be created, or axum reports an error.
+    /// listener cannot be created, or the server loop fails.
     pub async fn serve(
         self,
         addr: SocketAddr,
@@ -64,15 +65,14 @@ impl OpsServer {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|source| crate::error::OpsError::Bind { addr, source })?;
-        info!(%addr, "ops HTTP server listening");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                shutdown.cancelled().await;
-                info!("ops HTTP server shutting down");
-            })
-            .await
-            .map_err(crate::error::OpsError::Serve)?;
-        Ok(())
+        crate::serve::serve(
+            "ops",
+            listener,
+            app,
+            crate::serve::ServeLimits::default(),
+            shutdown,
+        )
+        .await
     }
 }
 

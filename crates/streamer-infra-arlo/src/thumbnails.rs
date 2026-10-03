@@ -201,7 +201,7 @@ impl ArloThumbnailSource for ArloThumbnailSourceAdapter {
 /// appends `for url (…)`, and the URL is a presigned S3 link whose query
 /// is the credential. The error class and the source chain are kept.
 fn transport_error(what: &str, e: reqwest::Error) -> DomainError {
-    DomainError::AdapterTransport(format!("{what}: {}", e.without_url()))
+    DomainError::adapter_transport(format!("{what}: {}", e.without_url()))
 }
 
 #[cfg(test)]

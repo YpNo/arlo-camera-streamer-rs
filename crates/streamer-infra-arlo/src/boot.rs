@@ -36,6 +36,10 @@ use arlo_rs::client::ArloClient;
 use arlo_rs::config as rs_config;
 use tracing::{info, warn};
 
+/// Owner-only mode for the directory holding the session token.
+#[cfg(unix)]
+const SESSION_CACHE_DIR_MODE: u32 = 0o700;
+
 use arlo_rs::secrecy::SecretString;
 use streamer_domain::config::{ArloConfig, EmailMfaConfig, MfaConfig};
 use streamer_domain::error::DomainError;
@@ -45,9 +49,9 @@ use crate::error::arlo_to_domain;
 /// Resolved secrets pulled from env vars during boot. Held only for
 /// the duration of the auth handshake; never persisted by this crate.
 struct ResolvedSecrets {
-    arlo_password: String,
+    arlo_password: SecretString,
     /// `Some` when MFA is `Email` and IMAP fields are configured.
-    imap_password: Option<String>,
+    imap_password: Option<SecretString>,
 }
 
 /// Boot an authenticated [`ArloClient`] from a domain [`ArloConfig`].
@@ -77,7 +81,7 @@ pub async fn boot(config: &ArloConfig) -> Result<Arc<ArloClient>, DomainError> {
 
     warn!("no valid cached session — running MFA cold-start");
     let secrets = resolve_secrets(config)?;
-    let rs_config = build_arlo_rs_config(config, &secrets, session_cache_path);
+    let rs_config = build_arlo_rs_config(config, secrets, session_cache_path);
 
     match &config.mfa {
         MfaConfig::Push(push) => {
@@ -133,20 +137,33 @@ async fn ensure_cache_dir(cache_path: &Path) -> Result<(), DomainError> {
             parent.display()
         )));
     }
-    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+    let mut builder = tokio::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(SESSION_CACHE_DIR_MODE);
+    builder.create(parent).await.map_err(|e| {
         DomainError::InvalidConfig(format!(
             "session_cache_path directory {} cannot be created: {e}",
             parent.display()
         ))
     })?;
+    // `recursive` creation applies the mode to the leaf only through the
+    // umask; set it explicitly, and refuse to go on with a world-readable
+    // token directory — the rationale above is the daemon's, not a hint.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) =
-            tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await
-        {
-            warn!(path = %parent.display(), error = %e, "could not restrict session cache directory to owner-only");
-        }
+        tokio::fs::set_permissions(
+            parent,
+            std::fs::Permissions::from_mode(SESSION_CACHE_DIR_MODE),
+        )
+        .await
+        .map_err(|e| {
+            DomainError::InvalidConfig(format!(
+                "session_cache_path directory {} cannot be restricted to the owner: {e}",
+                parent.display()
+            ))
+        })?;
     }
     info!(path = %parent.display(), "created session cache directory");
     Ok(())
@@ -176,8 +193,11 @@ fn resolve_secrets(config: &ArloConfig) -> Result<ResolvedSecrets, DomainError> 
     })
 }
 
-fn read_env(name: &str) -> Result<String, DomainError> {
+/// Read a secret from the environment straight into a [`SecretString`]
+/// (zeroed on drop); the plain `String` lives only inside this call.
+fn read_env(name: &str) -> Result<SecretString, DomainError> {
     env::var(name)
+        .map(SecretString::from)
         .map_err(|_| DomainError::InvalidConfig(format!("env var {name} required but not set")))
 }
 
@@ -197,15 +217,21 @@ fn email_uses_imap(email: &EmailMfaConfig) -> bool {
 /// session-cache path. Split out from [`boot`] so it's easy to test.
 fn build_arlo_rs_config(
     cfg: &ArloConfig,
-    secrets: &ResolvedSecrets,
+    secrets: ResolvedSecrets,
     session_cache_path: String,
 ) -> rs_config::ArloConfig {
+    // The secrets are moved, never cloned: one copy in memory, dropped
+    // (and zeroed) with the arlo-rs config.
+    let ResolvedSecrets {
+        arlo_password,
+        imap_password,
+    } = secrets;
     let credentials = rs_config::CredentialsConfig {
         email: Some(cfg.email.clone()),
-        password: Some(SecretString::from(secrets.arlo_password.clone())),
+        password: Some(arlo_password),
     };
 
-    let mfa = match (&cfg.mfa, secrets.imap_password.as_ref()) {
+    let mfa = match (&cfg.mfa, imap_password) {
         (MfaConfig::Email(email), Some(pw)) if email_uses_imap(email) => rs_config::MfaConfig {
             preferred_method: Some("email".to_string()),
             imap: Some(rs_config::ImapConfig {
@@ -214,7 +240,7 @@ fn build_arlo_rs_config(
                 host: email.host.clone(),
                 port: Some(email.port),
                 username: email.user.clone(),
-                password: Some(SecretString::from(pw.clone())),
+                password: Some(pw),
                 delete_after_read: Some(false),
             }),
         },
@@ -277,14 +303,14 @@ mod tests {
 
     fn secrets_imap() -> ResolvedSecrets {
         ResolvedSecrets {
-            arlo_password: "arlo_pw".to_string(),
-            imap_password: Some("imap_pw".to_string()),
+            arlo_password: SecretString::from("arlo_pw"),
+            imap_password: Some(SecretString::from("imap_pw")),
         }
     }
 
     fn secrets_stdin() -> ResolvedSecrets {
         ResolvedSecrets {
-            arlo_password: "arlo_pw".to_string(),
+            arlo_password: SecretString::from("arlo_pw"),
             imap_password: None,
         }
     }
@@ -300,7 +326,7 @@ mod tests {
     fn build_arlo_rs_config_email_imap_assembles_correctly() {
         let rs_cfg = build_arlo_rs_config(
             &cfg_email_imap(),
-            &secrets_imap(),
+            secrets_imap(),
             "/tmp/session.json".to_string(),
         );
 
@@ -338,7 +364,7 @@ mod tests {
     fn build_arlo_rs_config_sms_omits_imap() {
         let mut c = cfg_email_imap();
         c.mfa = MfaConfig::Sms;
-        let rs_cfg = build_arlo_rs_config(&c, &secrets_stdin(), "/tmp/session.json".to_string());
+        let rs_cfg = build_arlo_rs_config(&c, secrets_stdin(), "/tmp/session.json".to_string());
 
         let mfa = rs_cfg.mfa.expect("mfa present");
         assert_eq!(mfa.preferred_method.as_deref(), Some("sms"));
@@ -349,7 +375,7 @@ mod tests {
     fn build_arlo_rs_config_push_sets_preferred_method_and_omits_imap() {
         let mut c = cfg_email_imap();
         c.mfa = MfaConfig::Push(PushMfaConfig::default());
-        let rs_cfg = build_arlo_rs_config(&c, &secrets_stdin(), "/tmp/session.json".to_string());
+        let rs_cfg = build_arlo_rs_config(&c, secrets_stdin(), "/tmp/session.json".to_string());
 
         let mfa = rs_cfg.mfa.expect("mfa present");
         assert_eq!(mfa.preferred_method.as_deref(), Some("push"));
@@ -366,7 +392,7 @@ mod tests {
             password_env: None,
             port: 993,
         });
-        let rs_cfg = build_arlo_rs_config(&c, &secrets_stdin(), "/tmp/session.json".to_string());
+        let rs_cfg = build_arlo_rs_config(&c, secrets_stdin(), "/tmp/session.json".to_string());
 
         let mfa = rs_cfg.mfa.expect("mfa present");
         assert_eq!(mfa.preferred_method.as_deref(), Some("email"));
@@ -383,7 +409,7 @@ mod tests {
             password_env: Some("ARLO_IMAP_PASSWORD".to_string()),
             port: 993,
         });
-        let rs_cfg = build_arlo_rs_config(&c, &secrets_imap(), "/tmp/session.json".to_string());
+        let rs_cfg = build_arlo_rs_config(&c, secrets_imap(), "/tmp/session.json".to_string());
 
         let mfa = rs_cfg.mfa.expect("mfa present");
         assert_eq!(mfa.preferred_method.as_deref(), Some("email"));
@@ -430,7 +456,7 @@ mod tests {
     fn build_arlo_rs_config_propagates_session_path() {
         let rs_cfg = build_arlo_rs_config(
             &cfg_email_imap(),
-            &secrets_imap(),
+            secrets_imap(),
             "/etc/arlo-streamer/session.json".to_string(),
         );
         let client = rs_cfg.client.expect("client section present");

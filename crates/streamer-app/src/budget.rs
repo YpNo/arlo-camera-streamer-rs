@@ -181,9 +181,13 @@ impl LiveBudgetTracker {
         }
     }
 
+    /// Refill the quota when the reset instant moved to another day —
+    /// in either direction: a clock stepped backwards across the
+    /// boundary (RTC-less box before NTP, snapshot restore) used to leave
+    /// the recorded date in the future and the quota never refilled.
     fn maybe_reset(&mut self, now: NaiveDateTime) {
         let last_reset = previous_reset(now, self.reset_time);
-        if last_reset.date() > self.last_reset_date {
+        if last_reset.date() != self.last_reset_date {
             self.spent_today = ChronoDuration::zero();
             self.last_reset_date = last_reset.date();
         }
@@ -312,6 +316,33 @@ mod tests {
             }
             other => panic!("expected Available after reset, got {other:?}"),
         }
+    }
+
+    /// A clock stepped backwards across the boundary (RTC-less box before
+    /// NTP, a restored snapshot) used to leave the recorded reset date in
+    /// the future, so the quota never refilled again.
+    #[test]
+    fn budget_resets_when_the_clock_steps_back_across_the_boundary() {
+        let mut t =
+            LiveBudgetTracker::new(&cfg(1800, "06:00"), dt(2024, 1, 5, 12, 0)).expect("valid");
+        t.on_live_started(dt(2024, 1, 5, 12, 0));
+        t.on_live_ended(dt(2024, 1, 5, 12, 30));
+        assert_eq!(t.poll(dt(2024, 1, 5, 12, 30)), BudgetVerdict::Exhausted);
+        // The clock jumps back two days: a new day window, a fresh quota.
+        match t.poll(dt(2024, 1, 3, 12, 0)) {
+            BudgetVerdict::Available { remaining } => {
+                assert_eq!(remaining, ChronoDuration::seconds(1800));
+            }
+            other => panic!("expected Available after a backward step, got {other:?}"),
+        }
+        // And the quota keeps refilling at the following boundaries.
+        t.on_live_started(dt(2024, 1, 3, 12, 0));
+        t.on_live_ended(dt(2024, 1, 3, 12, 30));
+        assert_eq!(t.poll(dt(2024, 1, 3, 12, 30)), BudgetVerdict::Exhausted);
+        assert!(matches!(
+            t.poll(dt(2024, 1, 4, 6, 0)),
+            BudgetVerdict::Available { .. }
+        ));
     }
 
     #[test]

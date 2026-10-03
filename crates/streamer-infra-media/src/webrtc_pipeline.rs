@@ -82,6 +82,8 @@ const KEYFRAME_INTERVAL: Duration = Duration::from_secs(3);
 const FIRST_RTP_TIMEOUT_SECS: u64 = 20;
 /// Max wait for ICE gathering to complete the local offer.
 const OFFER_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long webrtcbin may take to accept or reject the gateway's answer.
+const SDP_APPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Name of the application message [`WebrtcLive::shutdown`] posts so the
 /// bus-watch thread returns instead of blocking on a bus that will never
 /// carry another message.
@@ -264,7 +266,8 @@ impl WebrtcLive {
             .negotiate(camera, &mut gathering)
             .await
             .map_err(MediaError::Signaling)?;
-        apply_answer(&webrtcbin, &answer)?;
+        let applied = apply_answer(&webrtcbin, &answer)?;
+        await_answer_applied(applied).await?;
         info!(%camera, "answer applied; awaiting first RTP");
 
         // Keyframe pump: periodic force-key-unit sent *upstream* into
@@ -319,8 +322,12 @@ struct OfferGathering<'a> {
 impl OfferBuilder for OfferGathering<'_> {
     async fn build_offer(&mut self, ice_servers: &[IceServer]) -> Result<String, DomainError> {
         apply_ice(self.webrtcbin, ice_servers);
-        self.pipeline
-            .set_state(gst::State::Playing)
+        // A state change blocks until the elements have changed state;
+        // keep that off the async runtime's worker threads.
+        let pipeline = self.pipeline.clone();
+        tokio::task::spawn_blocking(move || pipeline.set_state(gst::State::Playing))
+            .await
+            .map_err(|e| MediaError::Pipeline(format!("pipeline → Playing task: {e}")))?
             .map_err(|e| MediaError::Pipeline(format!("pipeline → Playing: {e}")))?;
         spawn_bus_watch(self.pipeline, self.notifier.clone());
         let offer_sdp = tokio::time::timeout(OFFER_TIMEOUT, self.offer_rx.recv())
@@ -332,17 +339,55 @@ impl OfferBuilder for OfferGathering<'_> {
     }
 }
 
-/// Apply the gateway's answer verbatim to `webrtcbin`.
-fn apply_answer(webrtcbin: &gst::Element, answer: &SignalingAnswer) -> Result<(), MediaError> {
+/// Apply the gateway's answer verbatim to `webrtcbin`. The returned
+/// receiver resolves with webrtcbin's verdict on the answer.
+fn apply_answer(
+    webrtcbin: &gst::Element,
+    answer: &SignalingAnswer,
+) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, MediaError> {
     let msg = gst_sdp::SDPMessage::parse_buffer(answer.answer_sdp.as_bytes())
         .map_err(|e| MediaError::Pipeline(format!("parse answer SDP: {e}")))?;
     let answer_desc =
         gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, msg);
-    webrtcbin.emit_by_name::<()>(
-        "set-remote-description",
-        &[&answer_desc, &gst::Promise::new()],
-    );
-    Ok(())
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let promise = gst::Promise::with_change_func(move |reply| {
+        let _ = tx.send(sdp_outcome(reply));
+    });
+    webrtcbin.emit_by_name::<()>("set-remote-description", &[&answer_desc, &promise]);
+    Ok(rx)
+}
+
+/// Wait for webrtcbin's verdict on the answer. A rejected answer names
+/// its cause here instead of surfacing as a splice timeout 20 s later.
+async fn await_answer_applied(
+    applied: tokio::sync::oneshot::Receiver<Result<(), String>>,
+) -> Result<(), MediaError> {
+    match tokio::time::timeout(SDP_APPLY_TIMEOUT, applied).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(reason))) => Err(MediaError::Pipeline(format!(
+            "webrtcbin rejected the answer: {reason}"
+        ))),
+        Ok(Err(_)) => Err(MediaError::Pipeline(
+            "webrtcbin dropped the set-remote-description promise".into(),
+        )),
+        Err(_) => Err(MediaError::Pipeline(
+            "webrtcbin did not apply the answer in time".into(),
+        )),
+    }
+}
+
+/// webrtcbin's reply to a `set-*-description` promise: an empty reply
+/// is success, a structure with an `error` field (or an interrupted or
+/// expired promise) is a failure.
+fn sdp_outcome(reply: Result<Option<&gst::StructureRef>, gst::PromiseError>) -> Result<(), String> {
+    match reply {
+        Ok(None) => Ok(()),
+        Ok(Some(s)) => match s.get::<gst::glib::Error>("error") {
+            Ok(e) => Err(e.to_string()),
+            Err(_) => Ok(()),
+        },
+        Err(e) => Err(format!("promise {e:?}")),
+    }
 }
 
 /// Make an element by factory name, mapping failure to [`MediaError`].
@@ -587,7 +632,12 @@ fn install_negotiation(webrtcbin: &gst::Element, offer_tx: mpsc::UnboundedSender
                 warn!("create-offer reply missing offer");
                 return;
             };
-            wb2.emit_by_name::<()>("set-local-description", &[&offer, &gst::Promise::new()]);
+            let applied = gst::Promise::with_change_func(|reply| {
+                if let Err(e) = sdp_outcome(reply) {
+                    warn!(error = %e, "set-local-description failed");
+                }
+            });
+            wb2.emit_by_name::<()>("set-local-description", &[&offer, &applied]);
         });
         wb.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
         None

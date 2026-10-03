@@ -8,7 +8,7 @@
 //! [`DomainError::AdapterTransport`].
 
 use arlo_rs::error::ArloError;
-use streamer_domain::error::DomainError;
+use streamer_domain::error::{DomainError, sanitize_reason};
 
 /// Arlo error code returned by `sipInfo` while the mobile app views the
 /// camera over RTSP: "RTSP Streaming in progress, SIP Streaming is not
@@ -19,11 +19,12 @@ const ARLO_STREAM_BUSY: u32 = 14001;
 #[must_use]
 pub fn arlo_to_domain(err: ArloError) -> DomainError {
     if is_stream_busy(&err) {
-        return DomainError::CameraBusy(err.to_string());
+        return DomainError::CameraBusy(sanitize_reason(&err.to_string()));
     }
     match err {
-        ArloError::DeviceNotFound(d) => DomainError::UnknownCamera(d),
-        other => DomainError::AdapterTransport(other.to_string()),
+        ArloError::DeviceNotFound(d) => DomainError::UnknownCamera(sanitize_reason(&d)),
+        // Cloud-sourced text: control characters removed, length bounded.
+        other => DomainError::adapter_transport(other),
     }
 }
 

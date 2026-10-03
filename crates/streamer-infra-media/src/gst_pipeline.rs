@@ -219,8 +219,9 @@ impl GstPipelineRegistry {
     }
 
     /// Stable per-camera path where the latest snapshot JPEG is kept for
-    /// the idle `gdkpixbufoverlay` to load. The camera id is
-    /// filename-safe (Arlo device ids are `[A-Z0-9]`).
+    /// the idle `gdkpixbufoverlay` to load. The id is one path component:
+    /// every id from a trust boundary went through `CameraId::parse`
+    /// (`[A-Za-z0-9_-]`).
     fn thumbnail_file_path(&self, camera: &CameraId) -> PathBuf {
         self.thumbnail_dir
             .join(format!("arlo-streamer-thumb-{camera}.jpg"))
@@ -284,11 +285,13 @@ impl PipelineRegistry for GstPipelineRegistry {
         idle: IdleKind,
         outputs: OutputBranches,
     ) -> Result<(), MediaError> {
-        {
-            let guard = self.state.read().await;
-            if guard.contains_key(camera) {
-                return Err(MediaError::AlreadyRegistered(camera.to_string()));
-            }
+        // The write lock is held from the check to the insert, so two
+        // concurrent registrations of one camera cannot both pass the
+        // check and install two factories (the hook callbacks run on the
+        // GLib thread and never take this lock).
+        let mut state = self.state.write().await;
+        if state.contains_key(camera) {
+            return Err(MediaError::AlreadyRegistered(camera.to_string()));
         }
         // Refresh the standby clock so the very first frame after
         // register reflects the current time.
@@ -350,6 +353,10 @@ impl PipelineRegistry for GstPipelineRegistry {
                 attach_media_bus_watch(media, &cam_for_cb, wiring_for_cb.clone());
             },
         )?;
+        // From here until the entry is stored, any failure must take the
+        // mount down again: a published mount the registry does not know
+        // would serve clients while attach/detach fail with UnknownCamera.
+        let mut mount = MountGuard::new(self.server.clone(), outputs.rtsp_mount_path.clone());
         info!(mount = %outputs.rtsp_mount_path, idle = idle.kind_label(), "camera registered");
 
         let hls = match (outputs.hls, hls_url) {
@@ -365,7 +372,7 @@ impl PipelineRegistry for GstPipelineRegistry {
             );
         }
 
-        self.state.write().await.insert(
+        state.insert(
             camera.clone(),
             CameraEntry {
                 mount_path: outputs.rtsp_mount_path,
@@ -378,6 +385,7 @@ impl PipelineRegistry for GstPipelineRegistry {
                 _hls: hls,
             },
         );
+        mount.disarm();
         Ok(())
     }
 
@@ -564,9 +572,7 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
     let appsrc: gst_app::AppSrc = appsrc_el
         .dynamic_cast::<gst_app::AppSrc>()
         .map_err(|_| MediaError::Pipeline("'live_rtp_src' is not an AppSrc".into()))?;
-    // Non-blocking push: full queue drops rather than back-pressuring
-    // the pump task (and through it, the streaming thread).
-    appsrc.set_property("block", false);
+    bound_appsrc(&appsrc);
 
     let selector = bin
         .by_name("sel")
@@ -584,19 +590,19 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
     let idle_overlay = bin.by_name(IDLE_OVERLAY_NAME);
     let idle_caption = bin.by_name(IDLE_CAPTION_NAME);
 
-    // Optional: live audio appsrc (Phase 8b). Non-blocking push like
-    // the video appsrc so a full queue drops instead of stalling.
+    // Optional: live audio appsrcs (Opus from WebRTC, AAC from the
+    // relay), bounded like the video one.
     let audio_appsrc = bin
         .by_name("live_audio_rtp_src")
         .and_then(|el| el.dynamic_cast::<gst_app::AppSrc>().ok());
     if let Some(a) = &audio_appsrc {
-        a.set_property("block", false);
+        bound_appsrc(a);
     }
     let aac_appsrc = bin
         .by_name(LIVE_AAC_SRC_NAME)
         .and_then(|el| el.dynamic_cast::<gst_app::AppSrc>().ok());
     if let Some(a) = &aac_appsrc {
-        a.set_property("block", false);
+        bound_appsrc(a);
     }
 
     Ok(LiveWiring {
@@ -611,6 +617,56 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
         audio_appsrc,
         aac_appsrc,
     })
+}
+
+/// Most bytes a live appsrc queues before it drops. RTP keeps arriving
+/// while the live branch is not consuming (a selector flip, a stalled
+/// decoder); two seconds of a 4 Mbit/s camera is about 1 MiB.
+const LIVE_APPSRC_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// Most buffers a live appsrc queues before it drops (one RTP packet
+/// per buffer).
+const LIVE_APPSRC_MAX_BUFFERS: u64 = 2048;
+
+/// Make a live appsrc drop instead of growing or blocking. `block=false`
+/// alone only keeps the push from blocking: without `leaky-type` the
+/// queue grows past `max-bytes` whenever the consumer stops.
+fn bound_appsrc(src: &gst_app::AppSrc) {
+    src.set_property("block", false);
+    src.set_property("max-bytes", LIVE_APPSRC_MAX_BYTES);
+    src.set_property("max-buffers", LIVE_APPSRC_MAX_BUFFERS);
+    src.set_property_from_str("leaky-type", "downstream");
+}
+
+/// Removes a freshly installed mount unless disarmed: registration can
+/// still fail after `install_factory_with_media_hook`, and the mount
+/// must not outlive the failed registration.
+struct MountGuard {
+    server: Arc<RtspServer>,
+    mount_path: String,
+    armed: bool,
+}
+
+impl MountGuard {
+    fn new(server: Arc<RtspServer>, mount_path: String) -> Self {
+        Self {
+            server,
+            mount_path,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for MountGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            warn!(mount = %self.mount_path, "registration failed after the mount was installed; removing it");
+            self.server.remove_mount(&self.mount_path);
+        }
+    }
 }
 
 /// Owner-only mode for the thumbnail directory and files: the images

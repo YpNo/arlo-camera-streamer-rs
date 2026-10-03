@@ -81,7 +81,6 @@ LABEL org.opencontainers.image.source="https://github.com/YpNo/arlo-camera-strea
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         tini \
-        wget \
         gstreamer1.0-plugins-base \
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad \
@@ -89,7 +88,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gstreamer1.0-libav \
         gstreamer1.0-rtsp \
         gstreamer1.0-nice \
-        gstreamer1.0-tools \
         gstreamer1.0-vaapi \
         mesa-va-drivers \
     # GPU encoding (ADR 0008): the `va` plugin is in plugins-bad, `vaapi`
@@ -116,7 +114,9 @@ RUN chmod +x /usr/local/bin/arlo-camera-streamer
 RUN mkdir -p /etc/arlo-streamer /var/lib/arlo-streamer/hls \
  && chown -R streamer:streamer /var/lib/arlo-streamer
 
-USER streamer
+# Numeric so the runtime can verify the image runs unprivileged without
+# resolving the name (Kubernetes `runAsNonRoot`, Docker Scout).
+USER 10001:10001
 
 # Default ports:
 # - 8554/tcp  RTSP
@@ -124,10 +124,11 @@ USER streamer
 # - 9091/tcp  /admin (bearer-token-auth required)
 EXPOSE 8554/tcp 9090/tcp 9091/tcp
 
-# Healthcheck talks to the public liveness endpoint with a 5s budget
-# (`wget` is installed above: bookworm-slim ships neither wget nor curl).
+# Healthcheck: the binary's own `healthcheck` subcommand asks the
+# liveness endpoint (read from the config's `metrics_bind`), so the image
+# needs neither a shell nor wget/curl.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["sh", "-c", "wget -qO- http://127.0.0.1:9090/healthz | grep -q ok || exit 1"]
+    CMD ["/usr/local/bin/arlo-camera-streamer", "healthcheck", "--config", "/etc/arlo-streamer/streamer.toml"]
 
 ENV RUST_LOG=info,arlo_camera_streamer=info
 

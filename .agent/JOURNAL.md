@@ -349,3 +349,21 @@ Tests:    New: thumbnails fetch (loopback server), supervised ×3, ended bus,
           router cancel, channel-close release, notice retry, snapshot watch.
 Open:     Sweep item 9 (hygiene batch); live gate of the TLS chain.
 
+## 2026-10-03 — Security sweep item 9 (hygiene batch)
+Changed:  Domain: `CameraId::parse` + `try_from` deserialize, `InvalidCameraId`,
+          `DomainError::adapter_transport`/`sanitize_reason`, redacted
+          `IceServer` Debug, constant scheme error, userinfo-free redaction.
+          Ops: `serve.rs` (hyper-util, header-read timeout 10 s, 64 conns),
+          `subtle` compare, `SecretString` token ≥ 16 bytes, `400` on a bad
+          path id, `HeaderValue::from_static`. Media: RTSP `max-sessions`
+          64, loopback-only plaintext relay, HLS dir symlink/root check and
+          `%%` escape, `MountGuard`, `bound_appsrc` (leaky), SDP promise
+          outcomes, `spawn_blocking` for state changes, locked registration.
+          Arlo: secrets moved not cloned, cache dir 0700 or fail, poison-
+          tolerant locks, case-insensitive ICE filter, bus ids parsed.
+          App: budget resets on `!=` date, admin `try_send`. Bin: async
+          config read, `healthcheck` subcommand. Image: `USER 10001:10001`,
+          no wget/gst-tools, provenance+SBOM, gitleaks in CI, ignore files,
+          arm64 deny target.
+Open:     Live gate of the TLS chain; first image build on the release.
+

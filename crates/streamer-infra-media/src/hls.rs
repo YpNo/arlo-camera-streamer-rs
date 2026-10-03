@@ -90,11 +90,33 @@ impl Drop for HlsSegmenter {
 ///
 /// # Errors
 ///
-/// [`MediaError::Pipeline`] when the directory cannot be created or read.
+/// [`MediaError::Pipeline`] when the directory cannot be created or
+/// read, is not a real directory (a symlink planted at the path would
+/// make `clear_dir` delete elsewhere), or does not sit directly under
+/// the configured HLS root. The root must be private to the daemon user.
 pub(crate) fn prepare_dir(hls: &HlsBranchConfig) -> Result<(), MediaError> {
-    std::fs::create_dir_all(&hls.dir)
+    let dir = Path::new(&hls.dir);
+    std::fs::create_dir_all(dir)
         .map_err(|e| MediaError::Pipeline(format!("create HLS dir {}: {e}", hls.dir)))?;
-    clear_dir(Path::new(&hls.dir))
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| MediaError::Pipeline(format!("stat HLS dir {}: {e}", hls.dir)))?;
+    if !meta.file_type().is_dir() {
+        return Err(MediaError::Pipeline(format!(
+            "HLS dir {} is not a directory (a symlink or a file is in the way)",
+            hls.dir
+        )));
+    }
+    let root = std::fs::canonicalize(&hls.root)
+        .map_err(|e| MediaError::Pipeline(format!("resolve HLS root {}: {e}", hls.root)))?;
+    let real = std::fs::canonicalize(dir)
+        .map_err(|e| MediaError::Pipeline(format!("resolve HLS dir {}: {e}", hls.dir)))?;
+    if real.parent() != Some(root.as_path()) {
+        return Err(MediaError::Pipeline(format!(
+            "HLS dir {} is not directly under the HLS root {}",
+            hls.dir, hls.root
+        )));
+    }
+    clear_dir(dir)
 }
 
 /// Remove our playlist and segments from `dir`; other files stay.
@@ -254,7 +276,9 @@ mod tests {
     fn prepare_dir_creates_the_dir_and_clears_only_our_files() {
         let root = std::env::temp_dir().join(format!("hls-prepare-{}", std::process::id()));
         let dir = root.join("front_door");
+        std::fs::create_dir_all(&root).expect("root");
         let hls = HlsBranchConfig {
+            root: root.to_string_lossy().into_owned(),
             dir: dir.to_string_lossy().into_owned(),
             playlist_location: String::new(),
             segment_location: String::new(),
@@ -275,5 +299,30 @@ mod tests {
         left.sort();
         assert_eq!(left, ["keep.txt"]);
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_dir_refuses_a_symlink_and_a_dir_outside_the_root() {
+        let base = std::env::temp_dir().join(format!("hls-prepare-sym-{}", std::process::id()));
+        let root = base.join("root");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, root.join("front_door")).expect("symlink");
+        let hls = |dir: &Path| HlsBranchConfig {
+            root: root.to_string_lossy().into_owned(),
+            dir: dir.to_string_lossy().into_owned(),
+            playlist_location: String::new(),
+            segment_location: String::new(),
+            target_duration: 2,
+            playlist_length: 3,
+            max_files: 5,
+        };
+        let err = prepare_dir(&hls(&root.join("front_door"))).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        let err = prepare_dir(&hls(&elsewhere.join("deeper"))).unwrap_err();
+        assert!(err.to_string().contains("not directly under"), "{err}");
+        std::fs::remove_dir_all(base).expect("cleanup");
     }
 }

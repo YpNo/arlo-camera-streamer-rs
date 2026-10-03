@@ -29,7 +29,7 @@ use crate::state::LiveLossReason;
 /// `sipInfo` and handed to the media adapter's
 /// [`OfferBuilder`](crate::port::OfferBuilder) during
 /// [`WebrtcSignaler::negotiate`](crate::port::WebrtcSignaler::negotiate).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IceServer {
     /// e.g. `stun:host:port` or `turn:host:port?transport=udp`.
     pub url: String,
@@ -37,6 +37,20 @@ pub struct IceServer {
     pub username: Option<String>,
     /// TURN long-term credential (`None` for STUN).
     pub credential: Option<String>,
+}
+
+/// Never prints the TURN credential.
+impl std::fmt::Debug for IceServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IceServer")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// The Arlo gateway's WebRTC SDP answer to our offer, plus the session
@@ -98,9 +112,9 @@ impl WatchAlongUrl {
             .split_once("://")
             .ok_or_else(|| DomainError::InvalidConfig("watch-along URL has no scheme".into()))?;
         if !matches!(scheme, "rtsp" | "rtsps") {
-            return Err(DomainError::InvalidConfig(format!(
-                "watch-along URL scheme '{scheme}' is not rtsp or rtsps"
-            )));
+            return Err(DomainError::InvalidConfig(
+                "watch-along URL scheme is not rtsp or rtsps".into(),
+            ));
         }
         if host_port(rest).is_empty() {
             return Err(DomainError::InvalidConfig(
@@ -126,9 +140,10 @@ impl WatchAlongUrl {
     }
 }
 
-/// `host[:port]` of what follows `scheme://`.
+/// `host[:port]` of what follows `scheme://`, without any `user:pw@`.
 fn host_port(rest: &str) -> &str {
-    rest.split(['/', '?', '#']).next().unwrap_or_default()
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    authority.rsplit('@').next().unwrap_or_default()
 }
 
 impl std::fmt::Debug for WatchAlongUrl {
@@ -312,5 +327,30 @@ mod tests {
         assert!(format!("{notifier:?}").contains("armed: true"));
         notifier.notify(LiveLossReason::RtpStalled);
         assert!(format!("{notifier:?}").contains("armed: false"));
+    }
+
+    #[test]
+    fn ice_server_debug_redacts_the_credential() {
+        let server = IceServer {
+            url: "turn:turn.example:3478?transport=udp".to_string(),
+            username: Some("user".to_string()),
+            credential: Some("s3cret".to_string()),
+        };
+        let text = format!("{server:?}");
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(
+            text.contains("<redacted>") && text.contains("turn.example"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn watch_along_url_redaction_drops_userinfo_and_scheme_errors_stay_constant() {
+        let url = WatchAlongUrl::parse("rtsps://user:pw@1.2.3.4:443/live/x?egressToken=t").unwrap();
+        assert_eq!(url.redacted(), "rtsps://1.2.3.4:443/…");
+        let err = WatchAlongUrl::parse("http://evil.example/x")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("http") && !err.contains("evil"), "{err}");
     }
 }

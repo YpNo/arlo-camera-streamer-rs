@@ -74,6 +74,13 @@ bytes   = "1"
 # ---- HTTP server (ops endpoints) ----
 axum       = "0.8"
 prometheus = "0.14"
+# Listener loop with a header-read timeout and a connection cap (axum::serve has neither);
+# already in the tree through axum.
+hyper-util = { version = "0.1", features = ["server", "server-auto", "server-graceful", "http1", "http2", "tokio", "service"] }
+# Constant-time token compare (already in the tree through rustls/ring).
+subtle     = "2"
+# Secrets zeroed on drop (already in the tree through arlo-rs).
+secrecy    = "0.10"
 
 # ---- CLI ----
 clap = { version = "4", features = ["derive"] }

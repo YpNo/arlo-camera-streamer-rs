@@ -13,15 +13,25 @@ use streamer_domain::stream::IceServer;
 const TURN: &str = "turn";
 const TCP: &str = "tcp";
 
+/// `turn` and `turns`, whatever the case: both carry credentials and
+/// both are refused over TCP.
+fn is_turn(kind: &str) -> bool {
+    kind.len() >= TURN.len() && kind[..TURN.len()].eq_ignore_ascii_case(TURN)
+}
+
+fn is_tcp(transport: Option<&str>) -> bool {
+    transport.is_some_and(|t| t.eq_ignore_ascii_case(TCP))
+}
+
 /// The usable ICE servers of one call, in Arlo's order.
 #[must_use]
 pub fn usable_ice_servers(servers: &IceServers) -> Vec<IceServer> {
     servers
         .data
         .iter()
-        .filter(|s| !(s.kind.eq_ignore_ascii_case(TURN) && s.transport.as_deref() == Some(TCP)))
+        .filter(|s| !(is_turn(&s.kind) && is_tcp(s.transport.as_deref())))
         .map(|s| {
-            let is_turn = s.kind.eq_ignore_ascii_case(TURN);
+            let is_turn = is_turn(&s.kind);
             IceServer {
                 url: s.url(),
                 username: if is_turn { s.username.clone() } else { None },
@@ -87,5 +97,21 @@ mod tests {
     #[test]
     fn usable_ice_servers_empty_list_is_empty() {
         assert!(usable_ice_servers(&servers(r#"{"data":[]}"#)).is_empty());
+    }
+
+    #[test]
+    fn usable_ice_servers_matches_kind_and_transport_case_insensitively() {
+        let list = servers(
+            r#"{"data":[
+                {"type":"TURNS","domain":"turn.example","port":"5349","transport":"TCP",
+                 "username":"u","credential":"c"},
+                {"type":"Turn","domain":"turn.example","port":"3478","transport":"UDP",
+                 "username":"u","credential":"c"}
+            ]}"#,
+        );
+        let kept = usable_ice_servers(&list);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0].url.contains("3478"));
+        assert_eq!(kept[0].credential.as_deref(), Some("c"));
     }
 }

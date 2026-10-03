@@ -29,6 +29,7 @@
 
 use arlo_rs::models::events::ArloEvent;
 use serde_json::Value;
+use tracing::debug;
 
 use streamer_domain::camera::CameraId;
 use streamer_domain::event::CameraEvent;
@@ -43,37 +44,36 @@ const PRESIGNED_LAST_IMAGE_URL: &str = "presignedLastImageUrl";
 /// [`None`] when the event is uninteresting or malformed.
 #[must_use]
 pub fn map_event(event: &ArloEvent) -> Option<CameraEvent> {
-    let device_id = extract_device_id(&event.resource)?;
+    let raw_id = extract_device_id(&event.resource)?;
+    // The bus is network input: an id outside the id rule never becomes
+    // a `CameraId` (it would reach the logs and a file name).
+    let device_id = match CameraId::parse(raw_id) {
+        Ok(id) => id,
+        Err(e) => {
+            debug!(error = %e, resource_len = event.resource.len(), "event with an invalid device id dropped");
+            return None;
+        }
+    };
     let props = event.properties.as_ref()?;
 
     if matches_bool_true(props, "motionDetected") {
-        return Some(CameraEvent::Motion {
-            device_id: CameraId::new(device_id),
-        });
+        return Some(CameraEvent::Motion { device_id });
     }
     if matches_bool_true(props, "audioDetected") {
-        return Some(CameraEvent::Audio {
-            device_id: CameraId::new(device_id),
-        });
+        return Some(CameraEvent::Audio { device_id });
     }
-    if let Some(mapped) = map_activity_state(device_id, props) {
+    if let Some(mapped) = map_activity_state(&device_id, props) {
         return Some(mapped);
     }
     if let Some(state) = props.get("connectionState").and_then(Value::as_str) {
         return match state {
-            "available" => Some(CameraEvent::Online {
-                device_id: CameraId::new(device_id),
-            }),
-            "unavailable" => Some(CameraEvent::Offline {
-                device_id: CameraId::new(device_id),
-            }),
+            "available" => Some(CameraEvent::Online { device_id }),
+            "unavailable" => Some(CameraEvent::Offline { device_id }),
             _ => None,
         };
     }
     if snapshot_url(event).is_some() {
-        return Some(CameraEvent::SnapshotAvailable {
-            device_id: CameraId::new(device_id),
-        });
+        return Some(CameraEvent::SnapshotAvailable { device_id });
     }
     None
 }
@@ -92,13 +92,13 @@ pub fn snapshot_url(event: &ArloEvent) -> Option<(&str, &str)> {
     Some((device_id, url))
 }
 
-fn map_activity_state(device_id: &str, props: &Value) -> Option<CameraEvent> {
+fn map_activity_state(device_id: &CameraId, props: &Value) -> Option<CameraEvent> {
     match activity_state(Some(props))? {
         USER_STREAM_ACTIVE => Some(CameraEvent::ManualStream {
-            device_id: CameraId::new(device_id),
+            device_id: device_id.clone(),
         }),
         ACTIVITY_IDLE => Some(CameraEvent::ManualStreamEnded {
-            device_id: CameraId::new(device_id),
+            device_id: device_id.clone(),
         }),
         _ => None,
     }

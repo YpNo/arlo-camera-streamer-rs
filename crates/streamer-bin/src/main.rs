@@ -50,6 +50,7 @@ use tracing_subscriber::EnvFilter;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use secrecy::SecretString;
 use streamer_app::system::StreamerSystem;
 use streamer_domain::config::StreamerConfig;
 use streamer_domain::event::ConnectionStatus;
@@ -62,6 +63,7 @@ use streamer_infra_arlo::{
     ArloWebrtcSignalerAdapter, DeviceRegistry, SnapshotUrlCache, boot::boot,
 };
 use streamer_infra_media::{GstMediaMultiplexer, GstPipelineRegistry, RtspServer};
+use streamer_infra_ops::admin_server::MIN_ADMIN_TOKEN_BYTES;
 use streamer_infra_ops::{AdminServer, Metrics, OpsServer, Readiness};
 
 /// Env var holding the bearer token for `/admin/*` routes.
@@ -75,6 +77,7 @@ const SHUTDOWN_STAGE_TIMEOUT: Duration = Duration::from_secs(8);
 /// Subdirectory beside the session cache that holds the idle thumbnails.
 const THUMBNAIL_DIR_NAME: &str = "thumbnails";
 
+mod healthcheck;
 mod list_devices;
 
 /// CLI arguments.
@@ -108,16 +111,22 @@ enum Command {
     /// yet configured. Starts no server. Completes the MFA pairing, so the
     /// daemon's first start needs no OTP.
     ListDevices,
+    /// Ask the running daemon's liveness endpoint; exit 0 when it answers.
+    ///
+    /// For the container `HEALTHCHECK`: needs no `wget` or `curl` in the
+    /// image. Connects to `output.metrics_bind` on loopback.
+    Healthcheck,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing()?;
-    let config = load_config(&cli.config)?;
+    let config = load_config(&cli.config).await?;
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run_daemon(config).await,
         Command::ListDevices => list_devices::run(&config).await,
+        Command::Healthcheck => healthcheck::run(&config).await,
     }
 }
 
@@ -329,14 +338,22 @@ async fn drain_stage<F: std::future::Future<Output = ()>>(name: &str, fut: F) {
 
 /// Read the admin token from `STREAMER_ADMIN_TOKEN`. Fails if missing
 /// or empty — we never want to run an unauthenticated admin surface.
-fn read_admin_token() -> Result<String> {
+/// The admin bearer token from the environment, as a secret (zeroed on
+/// drop). Empty or short tokens fail the boot here, before anything
+/// listens; the server re-checks the same rule.
+fn read_admin_token() -> Result<SecretString> {
     let token = std::env::var(ADMIN_TOKEN_ENV).with_context(|| {
         format!("environment variable {ADMIN_TOKEN_ENV} must be set to enable /admin/*")
     })?;
     if token.trim().is_empty() {
         anyhow::bail!("environment variable {ADMIN_TOKEN_ENV} must not be empty");
     }
-    Ok(token)
+    if token.trim().len() < MIN_ADMIN_TOKEN_BYTES {
+        anyhow::bail!(
+            "environment variable {ADMIN_TOKEN_ENV} must hold at least {MIN_ADMIN_TOKEN_BYTES} bytes"
+        );
+    }
+    Ok(SecretString::from(token))
 }
 
 /// Subscribe to Arlo's `connection_status` watch and mirror it into
@@ -448,8 +465,9 @@ fn thumbnail_dir(config: &StreamerConfig) -> std::path::PathBuf {
         .join(THUMBNAIL_DIR_NAME)
 }
 
-fn load_config(path: &std::path::Path) -> Result<StreamerConfig> {
-    let raw = std::fs::read_to_string(path)
+async fn load_config(path: &std::path::Path) -> Result<StreamerConfig> {
+    let raw = tokio::fs::read_to_string(path)
+        .await
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
     let cfg: StreamerConfig = toml::from_str(&raw)
         .with_context(|| format!("failed to parse config: {}", path.display()))?;

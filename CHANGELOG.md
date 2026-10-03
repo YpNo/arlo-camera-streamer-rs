@@ -37,6 +37,28 @@ First release: the daemon as validated on the owner's camera and box.
   user on the host can no longer plant or block them.
 - A rejected `/admin/*` request is logged (route only, never the token);
   the WebRTC session id is no longer logged in full.
+- Camera ids are validated (`[A-Za-z0-9_-]{1,64}`) wherever they enter:
+  the configuration, the `/admin/cameras/{id}` path (`400` otherwise) and
+  the event bus, so an id can neither escape the thumbnail directory nor
+  forge a log line. Text that arrives from the cloud or a library is
+  stripped of control characters and bounded at 256 bytes before it
+  reaches the `Failed` state, the admin API or the logs.
+- The ops and admin listeners run with a 10 s header-read timeout and a
+  cap of 64 open connections each; the RTSP server keeps at most 64
+  sessions. `STREAMER_ADMIN_TOKEN` must be at least 16 bytes, is held as
+  a secret zeroed on drop and compared with `subtle`. The Arlo and IMAP
+  passwords are moved into the client, never copied.
+- The app-view relay refuses a plaintext `rtsp://` URL to a remote host
+  (the egress token would travel in clear); the redacted URL no longer
+  shows user info and the scheme error no longer echoes the input. The
+  TURN credential is redacted from `Debug` output.
+- The session cache directory is created owner-only (`0700`) and the boot
+  fails when that mode cannot be applied; an HLS stream directory must be
+  a real directory directly under the configured HLS root.
+- The container runs as `10001:10001` (numeric), without `wget` or the
+  GStreamer tools; the health check is the binary's own `healthcheck`
+  subcommand. Every image digest carries SLSA provenance and an SPDX
+  SBOM; the security job scans the repository history with gitleaks.
 
 ### Changed
 - The configuration is validated at boot: unknown keys are errors
@@ -70,6 +92,25 @@ First release: the daemon as validated on the owner's camera and box.
   negotiating WebRTC.
 - A failing update of the "live in the Arlo app" notice after the view's
   hold ran out re-fired the loop at CPU speed; it is retried every 30 s.
+- A clock stepped backwards across the budget's reset time left the
+  quota exhausted for good; the budget now refills on any date change.
+- A `%` in `output.hls.dir` reached `splitmuxsink`'s printf pattern
+  (`%s` crashed the daemon); it is escaped in the segment pattern.
+- A registration that failed after the RTSP mount was installed left the
+  mount published and unknown to the registry; it is removed again.
+- The live appsrcs queued without bound while the live branch did not
+  consume; they now drop past 4 MiB or 2048 packets (`leaky-type`).
+- An answer webrtcbin rejects is reported at once with its reason instead
+  of as a splice timeout 20 s later; a failed local description is logged.
+- Pipeline state changes run off the async runtime, and the live leg is
+  stopped outside the multiplexer's lock. Registering a camera holds its
+  lock from the check to the insert.
+- An admin command no longer waits on a full mailbox; the request is
+  answered `503` at once, as documented.
+- ICE servers are filtered case-insensitively (`TURNS`, `TCP`), the admin
+  `WWW-Authenticate` header is a constant, the configuration file is read
+  without blocking the runtime, and a poisoned device-cache lock is
+  tolerated instead of panicking.
 
 ### Added
 - The container image is published to GitHub's registry on every release

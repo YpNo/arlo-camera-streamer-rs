@@ -10,19 +10,58 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DomainError;
 
+/// Longest camera id accepted at a trust boundary. Arlo device ids are
+/// 13 to 20 characters; the margin covers other id shapes without
+/// letting a path or a header carry arbitrary text.
+pub const MAX_CAMERA_ID_LEN: usize = 64;
+
 /// Stable identifier of an Arlo device, as reported by the cloud API.
 ///
 /// Treated as opaque by the rest of the system; only `streamer-infra-arlo`
-/// inspects its contents.
+/// inspects its contents. The id ends up in log lines, in a file name
+/// and in HTTP paths, so everything that crosses a trust boundary (the
+/// configuration, the admin API, the event bus) goes through
+/// [`CameraId::parse`], which allows `[A-Za-z0-9_-]{1,64}` only.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct CameraId(String);
 
 impl CameraId {
-    /// Construct a `CameraId` from any string-like value. No validation —
-    /// Arlo IDs are opaque and we accept whatever the cloud emits.
+    /// Construct a `CameraId` without validation, for ids this process
+    /// already trusts: values the cloud's device list reports (printed
+    /// back to the operator) and test fixtures. Input from a config
+    /// file, an HTTP path or the event bus goes through [`Self::parse`].
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
+    }
+
+    /// Parse an id from an untrusted source.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::InvalidCameraId`] when `input` is empty, longer
+    /// than [`MAX_CAMERA_ID_LEN`] or has characters outside
+    /// `[A-Za-z0-9_-]`. The message describes the rule broken, never the
+    /// input.
+    pub fn parse(input: impl AsRef<str>) -> Result<Self, DomainError> {
+        let s = input.as_ref();
+        if s.is_empty() {
+            return Err(DomainError::InvalidCameraId("empty".to_string()));
+        }
+        if s.len() > MAX_CAMERA_ID_LEN {
+            return Err(DomainError::InvalidCameraId(format!(
+                "longer than {MAX_CAMERA_ID_LEN} characters"
+            )));
+        }
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(DomainError::InvalidCameraId(
+                "characters outside [A-Za-z0-9_-]".to_string(),
+            ));
+        }
+        Ok(Self(s.to_string()))
     }
 
     /// Borrow the inner identifier as a `&str`.
@@ -34,6 +73,20 @@ impl CameraId {
 impl fmt::Display for CameraId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for CameraId {
+    type Error = DomainError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl From<CameraId> for String {
+    fn from(id: CameraId) -> Self {
+        id.0
     }
 }
 
@@ -220,5 +273,29 @@ mod tests {
         let name = StreamName::parse("back_yard").unwrap();
         let s: String = name.into();
         assert_eq!(s, "back_yard");
+    }
+
+    #[test]
+    fn camera_id_parse_accepts_arlo_shaped_ids_and_refuses_the_rest() {
+        assert!(CameraId::parse("A4K1234567ABC").is_ok());
+        assert!(CameraId::parse("cam_front-1").is_ok());
+        assert!(CameraId::parse("x".repeat(MAX_CAMERA_ID_LEN)).is_ok());
+        for bad in ["", "../../x", "cam\nid", "cam id", "cam/1", "%0Aforged"] {
+            let err = CameraId::parse(bad).unwrap_err();
+            assert!(matches!(err, DomainError::InvalidCameraId(_)), "{bad:?}");
+            assert!(
+                !err.to_string().contains(bad.trim()) || bad.is_empty(),
+                "{err}"
+            );
+        }
+        assert!(CameraId::parse("x".repeat(MAX_CAMERA_ID_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn camera_id_deserialize_goes_through_parse() {
+        let ok: CameraId = serde_json::from_str("\"CAM1\"").unwrap();
+        assert_eq!(ok.as_str(), "CAM1");
+        assert!(serde_json::from_str::<CameraId>("\"../x\"").is_err());
+        assert_eq!(serde_json::to_string(&ok).unwrap(), "\"CAM1\"");
     }
 }

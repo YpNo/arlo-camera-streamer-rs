@@ -77,6 +77,20 @@ Arlo-specific behaviour with the `live-validation` skill.
   redirects) and checks the JPEG magic, so gdk-pixbuf only ever loads our own JPEGs.
 - Pin each branch's final caps in one capsfilter; keep launch strings as pure builders
   in `pipeline_desc.rs` with their constants beside them.
+- The three live appsrcs are bounded by `bound_appsrc` (`block=false` **and**
+  `leaky-type=downstream`, `max-bytes`, `max-buffers`): `block=false` alone lets the
+  queue grow without limit while the live branch is not consuming.
+- `register` holds the registry's write lock from the check to the insert and arms a
+  `MountGuard` after `install_factory_with_media_hook`: any later failure removes the
+  mount again. `set_state` calls run in `spawn_blocking`; the multiplexer takes the live
+  leg out of its lock before stopping it.
+- `set-remote-description` / `set-local-description` get a `Promise::with_change_func`
+  (`sdp_outcome`): a rejected answer fails the attach within `SDP_APPLY_TIMEOUT` with
+  webrtcbin's reason instead of surfacing as a splice timeout.
+- HLS: `prepare_dir` refuses a symlink at the stream dir and a dir not directly under
+  `HlsBranchConfig::root`; `%` in the root is escaped in the segment pattern only.
+- The relay dials plaintext `rtsp://` only to loopback (`is_loopback_host`) — the
+  integration tests' server; a remote host must be `rtsps://`.
 
 ## HLS output (ADR 0006)
 

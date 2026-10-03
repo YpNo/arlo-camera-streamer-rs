@@ -331,6 +331,18 @@ struct Client {
     link: Link,
 }
 
+/// Whether `host` (as `url::Url::host_str` gives it, IPv6 in brackets)
+/// is this machine's loopback.
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
 impl Client {
     async fn connect(url: &WatchAlongUrl, tls_policy: &RelayTls) -> Result<Self, MediaError> {
         let parsed = url::Url::parse(url.as_str())
@@ -340,6 +352,13 @@ impl Client {
             .ok_or_else(|| MediaError::Relay("watch-along URL has no host".into()))?
             .to_string();
         let tls = parsed.scheme() == "rtsps";
+        // The URL carries the egress token: in clear only on this machine
+        // (the integration tests' own server), never across a network.
+        if !tls && !is_loopback_host(&host) {
+            return Err(MediaError::Relay(
+                "watch-along URL is plaintext rtsp to a remote host; refused".into(),
+            ));
+        }
         let port = parsed.port().unwrap_or(if tls { 443 } else { 554 });
         let tcp = tokio::time::timeout(REQUEST_TIMEOUT, TcpStream::connect((host.as_str(), port)))
             .await
@@ -1905,5 +1924,25 @@ mod tests {
     fn rtcp_receiver_report_is_a_valid_empty_rr() {
         let rr = rtcp_receiver_report(0x0102_0304);
         assert_eq!(rr, [0x80, 201, 0, 1, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn is_loopback_host_accepts_only_this_machine() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("localhost"));
+        assert!(!is_loopback_host("1.2.3.4"));
+        assert!(!is_loopback_host("arlo.example"));
+        assert!(!is_loopback_host("[fe80::1]"));
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_plaintext_rtsp_to_a_remote_host() {
+        let url = WatchAlongUrl::parse("rtsp://192.0.2.1:554/live/x?egressToken=t").unwrap();
+        let tls = RelayTls::from_config(None).unwrap();
+        let Err(err) = Client::connect(&url, &tls).await else {
+            panic!("plaintext rtsp to a remote host was accepted");
+        };
+        assert!(err.to_string().contains("plaintext"), "{err}");
     }
 }
