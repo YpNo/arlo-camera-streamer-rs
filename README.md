@@ -7,6 +7,7 @@
 [![Rust CI](https://github.com/YpNo/arlo-camera-streamer-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/YpNo/arlo-camera-streamer-rs/actions/workflows/ci.yml)
 [![GitHub release](https://img.shields.io/github/v/release/YpNo/arlo-camera-streamer-rs?sort=semver)](https://github.com/YpNo/arlo-camera-streamer-rs/releases/latest)
 [![Container image](https://img.shields.io/badge/ghcr.io-arlo--camera--streamer--rs-2496ED?logo=docker&logoColor=white)](https://github.com/YpNo/arlo-camera-streamer-rs/pkgs/container/arlo-camera-streamer-rs)
+[![Docker Hub](https://img.shields.io/docker/v/ypno/arlo-camera-streamer-rs?sort=semver&logo=docker&logoColor=white&label=docker.io)](https://hub.docker.com/r/ypno/arlo-camera-streamer-rs)
 [![codecov](https://codecov.io/gh/YpNo/arlo-camera-streamer-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/YpNo/arlo-camera-streamer-rs)
 [![Quality gate](https://sonarcloud.io/api/project_badges/measure?project=YpNo_arlo-camera-streamer-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=YpNo_arlo-camera-streamer-rs)
 [![MSRV](https://img.shields.io/badge/MSRV-1.99.0-blue.svg)](https://github.com/YpNo/arlo-camera-streamer-rs)
@@ -133,16 +134,22 @@ sudo install -m 0755 target/release/arlo-camera-streamer /usr/local/bin/
 
 ### Docker (recommended)
 
-Every release publishes an image to GitHub's registry, built from the
-`Dockerfile` at the repo root: non-root, `tini` as PID 1, every GStreamer
-plugin the pipelines need, scanned with Trivy before it is tagged.
+The daemon ships as a container image only; no crate is published.
+Every release pushes the same image, built from the `Dockerfile` at the
+repo root (non-root, `tini` as PID 1, every GStreamer plugin the
+pipelines need, scanned with Trivy before it is tagged), to GitHub's
+registry and to Docker Hub:
 
 ```bash
 docker pull ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.0
 ```
 
+```bash
+docker pull docker.io/ypno/arlo-camera-streamer-rs:v0.1.0
+```
+
 Tags: `v<version>` (pin this one), `latest` (the newest release), and
-`sha-<commit>`. `linux/amd64` is always built; `linux/arm64` (Raspberry
+`sha-<commit>`, identical on both registries. `linux/amd64` is always built; `linux/arm64` (Raspberry
 Pi) is added when the repository variable `IMAGE_PLATFORMS` lists it.
 To build it yourself instead:
 
@@ -580,8 +587,12 @@ Renovate's PRs skip coverage and SonarCloud. After every gate, a push to
 tagged `v<version>`, then the container image for that version: built per
 platform on native runners, each platform scanned with Trivy (a fixable
 CRITICAL finding stops the release), pushed by digest, and tagged
-`ghcr.io/ypno/arlo-camera-streamer-rs:v<version>`, `:latest` and
-`:sha-<commit>`. A push without a version bump publishes nothing.
+`v<version>`, `latest` and `sha-<commit>` on `ghcr.io/ypno/arlo-camera-streamer-rs`
+and on `docker.io/ypno/arlo-camera-streamer-rs` (Docker Hub needs the
+repository variable `DOCKERHUB_USERNAME` and the secret `DOCKERHUB_TOKEN`;
+without them GHCR alone is published). A push without a version bump
+publishes nothing, and no crate is ever published: the workspace is
+`publish = false`.
 
 Releasing is therefore: bump `version` in `Cargo.toml`, move the
 `[Unreleased]` changelog entries under the new version, merge.

@@ -15,6 +15,9 @@ edition      = "2024"
 rust-version = "1.99.0"
 license      = "MIT"
 repository   = "https://github.com/YpNo/arlo-camera-streamer-rs"
+# The product is the container image, never a crate: `cargo publish` is
+# refused for every member.
+publish      = false
 
 [workspace.lints.rust]
 unsafe_code  = "forbid"

@@ -39,6 +39,7 @@
 - [ ] Blocking I/O in the async runtime (use `tokio::fs` or `spawn_blocking`)
 - [ ] Manual GStreamer element management without safe wrappers (use `gst_pipeline.rs`)
 - [ ] Committing cleartext credentials (use `streamer.toml` with env var substitution support)
+- [ ] Publishing any crate: the product is the container image (workspace `publish = false`)
 
 ### Naming Conventions
 - Pipelines: `camera_<id>_live`, `camera_<id>_idle`

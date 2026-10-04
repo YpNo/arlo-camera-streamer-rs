@@ -114,11 +114,13 @@ First release: the daemon as validated on the owner's camera and box.
   tolerated instead of panicking.
 
 ### Added
-- The container image is published to GitHub's registry on every release
-  (`ghcr.io/ypno/arlo-camera-streamer-rs:v<version>`, `:latest`,
-  `:sha-<commit>`), built per platform on native runners, scanned with
+- The container image is published to GitHub's registry and to Docker Hub
+  on every release (`ghcr.io/ypno/arlo-camera-streamer-rs` and
+  `docker.io/ypno/arlo-camera-streamer-rs`, tags `v<version>`, `latest`,
+  `sha-<commit>`), built per platform on native runners, scanned with
   Trivy before it is tagged; `linux/arm64` is opt-in through the
-  `IMAGE_PLATFORMS` repository variable.
+  `IMAGE_PLATFORMS` repository variable. No crate is published (the
+  workspace is `publish = false`).
 - Per-camera bridge from Arlo's event-driven live stream to a persistent
   local RTSP output: idle still frame (last thumbnail over a STANDBY
   overlay), motion-triggered WebRTC ingest through `webrtcbin`, and a
