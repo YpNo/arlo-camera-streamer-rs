@@ -391,3 +391,16 @@ Notes:    arlo-rs PR #35 was squash-merged and lost its fix entry: changelog
 Open:     Live gate of the TLS chain; first image build on the release; the
           arlo-rs `target/` (23 G) is the user's to prune.
 
+## 2026-10-04 — Phase 0: sweep #2, deny duplicates, image log default
+Changed:  deny.toml accepts the six transitive duplicates with reasons (cargo
+          deny warning-free); README states the image's quieter RUST_LOG on
+          purpose. Separate branch fix/ci-trivy-platform: TRIVY_PLATFORM from
+          the matrix (the arm64 leg failed: Trivy looked for linux/amd64 in a
+          one-platform index; nothing was tagged).
+Sweep #2: ten review units (re-run on Opus after Fable's usage limit), every
+          candidate re-read against the code. All 48 findings of sweep #1
+          fixed. 64 new: 0 critical, 0 high, 5 medium, 30 low, 29 hazards.
+          Report and baseline are local in .security/ (gitignored; the repo is
+          public, keep details out of issues and commits).
+Open:     Work through the report's recommended actions, battery hazards first.
+
