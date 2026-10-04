@@ -424,6 +424,12 @@ jobs:
       # report HIGH and CRITICAL, stop on a fixable CRITICAL.
       - name: Vulnerability report
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          # The digest is a one-platform index (the image plus its
+          # attestations); without this Trivy looks for linux/amd64 in it
+          # and fails on the arm64 leg. The action has no platform input,
+          # Trivy reads TRIVY_PLATFORM for --platform.
+          TRIVY_PLATFORM: ${{ matrix.platform }}
         with:
           image-ref: ${{ steps.names.outputs.ghcr }}@${{ steps.build.outputs.digest }}
           format: table
@@ -431,6 +437,8 @@ jobs:
           exit-code: '0'
       - name: Vulnerability gate
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: ${{ matrix.platform }}
         with:
           image-ref: ${{ steps.names.outputs.ghcr }}@${{ steps.build.outputs.digest }}
           format: table
