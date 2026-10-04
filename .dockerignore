@@ -1,0 +1,52 @@
+# Build artifacts — rebuilt inside the image
+target/
+**/target/
+
+# IDE / editor scratch
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local development clutter
+.git/
+.github/
+.gitignore
+.envrc
+.direnv/
+.DS_Store
+*.log
+
+# Secrets and local state — never in the build context
+.env
+.env.*
+*.pem
+*.key
+session.json
+streamer.toml
+.security/
+.agent/
+
+# Documentation, tooling, project meta — none of it goes into the image
+README.md
+CHANGELOG.md
+CONTRIBUTING.md
+SECURITY.md
+LICENSE
+docs/
+sonar-project.properties
+.agents/
+.claude/
+.rtk/
+WORKFILE.md
+GEMINI.md
+CLAUDE.md
+CONTEXT.md
+renovate.json
+
+# Examples and test fixtures
+config/streamer.example.toml
+
+# Compose / dev orchestration files (not needed at build time)
+docker-compose*.yml
+compose.*.yml

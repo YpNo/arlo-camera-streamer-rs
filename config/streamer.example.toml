@@ -1,0 +1,142 @@
+# ---------------------------------------------------------------------------
+# arlo-camera-streamer example configuration
+#
+# Copy to /etc/arlo-streamer/streamer.toml (or pass `--config <path>`)
+# and edit the marked sections before running. Secrets MUST come from
+# env vars — never write a password into this file.
+#
+# This file is parsed by a unit test in `streamer-domain`, so every key
+# below is guaranteed to be accepted by the current binary.
+# ---------------------------------------------------------------------------
+
+[arlo]
+# Arlo cloud account email (the one used to log into the Arlo app).
+email              = "owner@example.com"
+# Name of the env var holding the Arlo cloud account password.
+# Never write the password into this file directly.
+password_env       = "ARLO_PASSWORD"
+# arlo-rs persists the session token, cookie jar and paired device id
+# here so the second factor is only asked once. Path must be readable +
+# writable by the streamer process. Permissions are forced to 0600.
+session_cache_path = "/var/lib/arlo-streamer/session.json"
+# Arlo app version the daemon identifies as when it fetches the stream of a
+# live view you started in the app, to relay it (ADR 0007). Arlo hands that
+# identity an RTSPS stream; a browser identity gets an unplayable DASH URL.
+# app_version = "6.46.0"
+# The relay verifies that host's certificate chain against the system roots
+# and waives only the hostname check (Arlo hands out a raw IP). If the log
+# says `watch-along certificate chain not trusted`, copy the fingerprint it
+# prints here to pin the certificate instead.
+# watch_along_cert_sha256 = "…64 hex digits…"
+
+# Second factor for the first login (and whenever the cached session is
+# rejected). Exactly one `[arlo.mfa]` block; pick a `kind`:
+#   kind = "email" — the OTP mail is fetched over IMAP when the mailbox
+#                    is locatable (`host` or `provider`) and `user` +
+#                    `password_env` are set; otherwise the OTP is
+#                    prompted on stdin (interactive setup only).
+#   kind = "push"  — approve the prompt in the Arlo mobile app; headless.
+#   kind = "sms"   — OTP prompted on stdin; not suitable headless.
+[arlo.mfa]
+kind         = "email"
+# Either an explicit IMAP host or a provider shortcut
+# (`gmail`, `outlook`, `hotmail`, `yahoo`). `host` wins when both are set.
+host         = "imap.example.com"
+# provider   = "gmail"
+user         = "arlo-otp@example.com"
+# Only the *name* of the env var goes here. The streamer reads
+# `std::env::var("ARLO_IMAP_PASSWORD")` at boot.
+password_env = "ARLO_IMAP_PASSWORD"
+# port       = 993                # default (IMAPS)
+
+# Push alternative (replace the block above):
+# [arlo.mfa]
+# kind               = "push"
+# poll_interval_secs = 3          # default
+# timeout_secs       = 120        # default; time to reach your phone
+
+# ---------------------------------------------------------------------------
+# WebRTC ingest (applies to every camera's `webrtcbin`)
+# ---------------------------------------------------------------------------
+
+[webrtc]
+# Local ICE candidate gathering:
+#   "dual" — IPv4 + IPv6 (default).
+#   "ipv4" — IPv4 only; use it when IPv6 towards Arlo's gateway is broken
+#            or slow to fail over (live activation then stalls on ICE).
+ice_address_family = "dual"
+# Seconds without inbound video from the camera (after the first frame)
+# before the live source is declared lost and the output returns to the
+# idle still. Default 10; values below 4 are raised to 4. Raise it on a
+# slow TURN path if you see spurious `live-lost-rtp-stalled` transitions.
+live_stall_timeout_secs = 10
+
+# ---------------------------------------------------------------------------
+# Output endpoints
+# ---------------------------------------------------------------------------
+
+[output]
+# H.264 encoder for the live/idle pipeline. This encoder runs continuously
+# per connected camera, so it dominates CPU (see the README "Performance"
+# section and docs/adr/0008-video-encoder-selection.md).
+#   "auto"  — probe the host at boot and take the first working backend,
+#             in this order: nvenc, va, vaapi, v4l2, x264 (default).
+#   "x264"  — software encoding, works everywhere; what a Raspberry Pi 5
+#             gets, since it has no H.264 hardware encoder.
+#   "va"    — Intel/AMD GPU through the `va` plugin (`vah264enc`).
+#   "vaapi" — Intel/AMD GPU through the older `vaapi` plugin.
+#             Both need a `/dev/dri` render node and the VA drivers.
+#   "v4l2"  — V4L2 memory-to-memory (`v4l2h264enc`): Raspberry Pi 4,
+#             Zero 2, CM4; needs `/dev/video11`.
+#   "nvenc" — NVIDIA GPU (`nvh264enc`); needs the NVIDIA container toolkit.
+# An explicit name fails the boot when that encoder does not work here.
+video_encoder = "auto"
+# Prometheus /metrics endpoint (per-camera state, transitions, live seconds).
+metrics_bind = "127.0.0.1:9090"
+# Operational /admin HTTP endpoint (force-wake, force-idle, state snapshot).
+# Requires the STREAMER_ADMIN_TOKEN env var at boot.
+admin_bind   = "127.0.0.1:9091"
+
+[output.rtsp]
+bind = "0.0.0.0:8554"
+
+# Optional HLS output (docs/adr/0006-hls-output-via-loopback-segmenter.md):
+# <dir>/<stream_name>/index.m3u8 plus segments, repackaged from the RTSP
+# output without re-encoding. Serve the directory with any web server.
+# Enabling it keeps each camera's encoder running.
+#
+# [output.hls]
+# dir             = "/var/lib/arlo-streamer/hls"
+# segment_secs    = 2      # floor 1; segments cut at keyframes (every 2 s)
+# playlist_length = 10     # floor 3; two more segments are kept on disk
+#
+# [output.dash] is parsed but not supported (see ADR 0006); the daemon
+# warns and ignores it.
+
+# ---------------------------------------------------------------------------
+# Cameras — one [[cameras]] block per Arlo device you want to expose.
+# `arlo_device_id` is the opaque id from the Arlo cloud. To list them,
+# with a ready-to-paste block per camera:
+#   arlo-camera-streamer list-devices --config <this file>
+# ---------------------------------------------------------------------------
+
+[[cameras]]
+arlo_device_id = "REPLACE_WITH_DEVICE_ID"
+# URL path of the RTSP output: rtsp://<host>:8554/front_door
+stream_name    = "front_door"
+# codec_hint   = "h264"   # or "h265"; learned automatically on first stream
+
+# Checked at boot: debounce_secs and max_continuous_live 1..=86400, the
+# other two 0..=86400 (0 = disabled). A session is cut the moment the daily
+# budget runs out, and every activation costs it 15 s besides the live time.
+[cameras.cooldown]
+debounce_secs       = 60     # hold-live after last motion (debounce window)
+max_continuous_live = 300    # hard cap on continuous live time (battery save)
+user_view_probe_secs = 60    # relayed app view: release every N s to learn whether the app still views (0 = never, cap only)
+daily_live_budget   = 0      # 0 = unlimited; otherwise total live secs/day
+budget_reset        = "00:00"
+
+# Operational note:
+#   Disable the official Arlo app's motion *recording* for every camera
+#   exposed here. Arlo's cloud-recording job competes with the live
+#   activation and will delay or block it.

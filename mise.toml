@@ -1,0 +1,17 @@
+# Pinned (not "latest"): `rust` must equal rust-toolchain.toml and the
+# workspace `rust-version` — mise's rust wins over rustup's file. cmake is
+# pinned because a floating one would change the BoringSSL build under us.
+[tools]
+cmake = "4.4.3"
+rust = "1.99.0"
+
+[env]
+# arlo-rs pulls boring-sys2 (BoringSSL) via stealthscraper-rs -> wreq, whose
+# build.rs runs bindgen and needs a real libclang. On this workstation only
+# the `rust-build` distrobox has one, and neither the host nor that container
+# has the GStreamer dev headers, so only the non-media crates build locally:
+#
+#   distrobox enter rust-build
+#   mise exec -- cargo test -p streamer-domain -p streamer-app \
+#                           -p streamer-infra-arlo -p streamer-infra-ops
+LIBCLANG_PATH = "/usr/lib/llvm-19/lib"

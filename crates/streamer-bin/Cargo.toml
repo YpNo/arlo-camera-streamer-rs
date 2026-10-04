@@ -1,0 +1,38 @@
+[package]
+name        = "arlo-camera-streamer"
+description = "Daemon bridging Arlo battery cameras to Frigate and other NVRs over RTSP and HLS."
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace = true
+repository.workspace   = true
+
+default-run = "arlo-camera-streamer"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "arlo-camera-streamer"
+path = "src/main.rs"
+
+[dependencies]
+streamer-domain      = { workspace = true }
+streamer-app         = { workspace = true }
+streamer-infra-arlo  = { workspace = true }
+streamer-infra-media = { workspace = true }
+streamer-infra-ops   = { workspace = true }
+
+anyhow             = { workspace = true }
+clap               = { workspace = true }
+futures            = { workspace = true }
+gstreamer          = { workspace = true }
+secrecy            = { workspace = true }
+serde              = { workspace = true }
+tokio              = { workspace = true }
+tokio-util         = { workspace = true }
+toml               = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }

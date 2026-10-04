@@ -1,0 +1,107 @@
+[workspace]
+resolver = "2"
+members  = [
+    "crates/streamer-app",
+    "crates/streamer-bin",
+    "crates/streamer-domain",
+    "crates/streamer-infra-arlo",
+    "crates/streamer-infra-media",
+    "crates/streamer-infra-ops",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.99.0"
+license      = "MIT"
+repository   = "https://github.com/YpNo/arlo-camera-streamer-rs"
+# The product is the container image, never a crate: `cargo publish` is
+# refused for every member.
+publish      = false
+
+[workspace.lints.rust]
+unsafe_code  = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all                     = { level = "deny", priority = -1 }
+pedantic                = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+
+[workspace.dependencies]
+# ---- Local workspace crates ----
+streamer-domain      = { path = "crates/streamer-domain" }
+streamer-app         = { path = "crates/streamer-app" }
+streamer-infra-arlo  = { path = "crates/streamer-infra-arlo" }
+streamer-infra-media = { path = "crates/streamer-infra-media" }
+streamer-infra-ops   = { path = "crates/streamer-infra-ops" }
+
+# ---- Arlo client (published sibling project) ----
+# Pinned to the crates.io release so CI, Docker and a fresh clone resolve it
+# without a sibling checkout. To build against a local ../arlo-rs, uncomment
+# the `[patch.crates-io]` block at the end of this file (never commit it on).
+arlo-rs = "0.3.0"
+
+# ---- Async runtime ----
+tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util   = "0.7"
+tokio-rustls = "0.26"
+# Watch-along TLS (ADR 0007): system roots for chain verification, SHA-256 for the certificate pin.
+rustls-native-certs = "0.8"
+ring = "0.17"
+rustls       = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+url          = "2"
+futures      = "0.3"
+async-trait  = "0.1"
+serde_json   = "1"
+
+# ---- Errors / Tracing ----
+thiserror          = "2"
+anyhow             = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# ---- Serde / Config ----
+serde = { version = "1", features = ["derive"] }
+toml  = "1"
+
+# ---- Time / Dates ----
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# ---- HTTP / Bytes (thumbnail fetch, generic transport) ----
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+bytes   = "1"
+
+# ---- HTTP server (ops endpoints) ----
+axum       = "0.8"
+prometheus = "0.14"
+# Listener loop with a header-read timeout and a connection cap (axum::serve has neither);
+# already in the tree through axum.
+hyper-util = { version = "0.1", features = ["server", "server-auto", "server-graceful", "http1", "http2", "tokio", "service"] }
+# Constant-time token compare (already in the tree through rustls/ring).
+subtle     = "2"
+# Secrets zeroed on drop (already in the tree through arlo-rs).
+secrecy    = "0.10"
+
+# ---- CLI ----
+clap = { version = "4", features = ["derive"] }
+
+# ---- GStreamer (media adapter only) ----
+gstreamer             = "0.25"
+gstreamer-app         = "0.25"
+gstreamer-rtsp        = "0.25"
+gstreamer-rtsp-server = "0.25"
+gstreamer-webrtc      = "0.25"
+gstreamer-sdp         = "0.25"
+
+# ---- Test ----
+mockall    = "0.15"
+rstest     = "0.27"
+tokio-test = "0.4"
+
+# To build against a local ../arlo-rs before a release, uncomment this block
+# (never commit it on: CI, Docker and a fresh clone have no sibling tree).
+# [patch.crates-io]
+# arlo-rs = { path = "../arlo-rs" }

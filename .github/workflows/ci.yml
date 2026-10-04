@@ -1,0 +1,486 @@
+name: Rust CI
+
+# Minutes are metered (private repository). The workflow is staged —
+# format → clippy → test → coverage / SonarQube, with doc beside test — so
+# a failed stage skips the costlier ones (coverage alone is ~9 min);
+# docs-only changes do not run it; the weekly schedule runs the audit
+# only; Renovate's PRs skip coverage and SonarQube; the GitHub release and
+# the container image (one per released version, to GHCR) come last, after
+# every gate.
+on:
+  pull_request:
+    branches: [main, master]
+    paths-ignore: # keep in step with `push` below
+      - "**.md"
+      - "docs/**"
+      - ".agents/**"
+      - ".agent/**"
+      - "LICENSE*"
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".agents/**"
+      - ".agent/**"
+      - "LICENSE*"
+  schedule:
+    - cron: '0 0 * * 0'   # weekly security audit on Sundays
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+# A new push to the same PR supersedes the running workflow. Pushes to
+# main are never cancelled: a release run cut after the tag but before the
+# image left a version without an image.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  format:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Root of the build chain: the weekly schedule is for the audit only,
+    # and every build job below `needs` this one.
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.99.0
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Lint with Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [format]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install system build deps (btls-sys/BoringSSL + GStreamer)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential libssl-dev libclang-dev nasm golang-go \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.99.0
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [clippy] # same build, warmed by clippy's cache; a lint failure skips it
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install system build deps (btls-sys/BoringSSL + GStreamer)
+        # The runtime plugins are for `streamer-infra-media/tests/live_session.rs`,
+        # which runs a real WebRTC call and RTSP client; STREAMER_REQUIRE_GST_IT
+        # makes a missing element fail the job instead of skipping the tests.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential libssl-dev libclang-dev nasm golang-go \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav gstreamer1.0-nice
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test --workspace --all-features
+        env:
+          STREAMER_REQUIRE_GST_IT: "1"
+
+  security:
+    name: Security & License Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # On pull_request events gitleaks lists the PR's commits through the
+    # API, which needs pull-requests: read (the restricted default token
+    # carries contents and packages only). Comments are off so write access
+    # is never required; findings fail the job and show in the log.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # gitleaks scans the whole history, not the checked-out tree only.
+          fetch-depth: 0
+      - name: Secret scan
+        # Rules and allow-list live in .gitleaks.toml. No license key is
+        # needed for a personal-account repository.
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_COMMENTS: "false"
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+
+  doc:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [clippy]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install system build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential libssl-dev libclang-dev nasm golang-go \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [test]
+    # The costliest job (instrumented rebuild + the GStreamer integration
+    # tests, ~9 min): not for a dependency bump — the tests already ran.
+    if: github.actor != 'renovate[bot]'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install system build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential libssl-dev libclang-dev nasm golang-go \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav gstreamer1.0-nice
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install cargo-tarpaulin (pinned binary release, checksum-verified)
+        # Bump both lines together; the digest is the one GitHub publishes
+        # for the release asset.
+        env:
+          TARPAULIN_VERSION: "0.37.5"
+          TARPAULIN_SHA256: edd214e46aedd1692bf8601f9754da5c6ade83da78f73d291f5dd611c940b590
+        run: |
+          curl -fsSL -o tarpaulin.tar.gz \
+            "https://github.com/xd009642/tarpaulin/releases/download/${TARPAULIN_VERSION}/cargo-tarpaulin-x86_64-unknown-linux-musl.tar.gz"
+          echo "${TARPAULIN_SHA256}  tarpaulin.tar.gz" | sha256sum --check --strict
+          tar xzf tarpaulin.tar.gz -C /usr/local/bin cargo-tarpaulin
+          rm tarpaulin.tar.gz
+      - name: Run cargo-tarpaulin
+        # Exclusions (files, not packages: `--exclude <pkg>` only stops a
+        # package's tests from running while its lines still count, which
+        # is how the first run reported the media crate at 0 %):
+        # - `crates/streamer-bin/*` — composition root, only glue
+        # - The GStreamer-bound media files count: `tests/live_session.rs`
+        #   drives them through real WebRTC calls (STREAMER_REQUIRE_GST_IT
+        #   makes a missing plugin fail instead of silently skipping).
+        # - I/O-heavy infra-arlo files — `boot.rs` async auth, `events.rs`
+        #   live MQTT bus, `stream_requester.rs` and `thumbnails.rs` real
+        #   network calls. Their pure logic (`event_mapper.rs`, `error.rs`,
+        #   the `build_arlo_rs_config` and `utf8_path` helpers) IS unit-tested
+        #   inline; the wrappers belong to integration tests against a real
+        #   Arlo account.
+        # Threshold: 86 — measured 88.25 % on 2026-09-28 with the media files
+        # counted. Raise deliberately; never set above what is held.
+        env:
+          STREAMER_REQUIRE_GST_IT: "1"
+        run: |
+          cargo tarpaulin --workspace --all-features --timeout 180 --out xml \
+            --exclude arlo-camera-streamer \
+            --exclude-files 'crates/streamer-bin/*' \
+            --exclude-files 'crates/streamer-infra-arlo/src/boot.rs' \
+            --exclude-files 'crates/streamer-infra-arlo/src/events.rs' \
+            --exclude-files 'crates/streamer-infra-arlo/src/stream_requester.rs' \
+            --exclude-files 'crates/streamer-infra-arlo/src/thumbnails.rs' \
+            --fail-under 86
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  sonarqube:
+    name: SonarQube
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [test]
+    if: github.actor != 'renovate[bot]' # a bump carries no code to analyse
+    # Secrets are not readable in a job-level `if`, so the token is mapped
+    # to the job environment and the scan step checks it: a fork or a
+    # repository without the SonarCloud secret skips the scan instead of
+    # failing the pipeline on "Not authorized".
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Skip notice
+        if: env.SONAR_TOKEN == ''
+        run: echo "SONAR_TOKEN is not set; skipping the SonarCloud scan."
+      - uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
+        if: env.SONAR_TOKEN != ''
+
+  # The GitHub release, after every gate: a push to main whose Cargo.toml
+  # version has no release yet gets tagged `v<version>` with generated
+  # notes. SonarCloud is reporting only and does not hold a release back.
+  # The image jobs below key on `created`, so an image is published once
+  # per version, never for an unversioned push.
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [format, clippy, test, security, doc, coverage]
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    permissions:
+      contents: write
+      packages: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      created: ${{ steps.exists.outputs.created }}
+      image_missing: ${{ steps.image.outputs.missing }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags decide whether this version is released already
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | awk -F '"' '{print $2}')
+          echo "version=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: v$VERSION"
+
+      - name: Check whether the release exists
+        id: exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists. Skipping."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The image jobs key on this, not on `created`: a run cancelled or
+      # failed after the tag can be re-run and still publish the image.
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Is the image for this version published?
+        id: image
+        env:
+          REF: ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+        run: |
+          if docker manifest inspect "$REF" >/dev/null 2>&1; then
+            echo "Image $REF exists."
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Release
+        if: steps.exists.outputs.created == 'true'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Release ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          target_commitish: ${{ github.sha }}
+
+  # The container image, one per released version, to GHCR as
+  # ghcr.io/<owner>/<repo>:<version>, :latest and :sha-<commit>, and to
+  # Docker Hub as docker.io/<DOCKERHUB_USERNAME>/<repo> with the same tags
+  # when the repository variable DOCKERHUB_USERNAME and the secret
+  # DOCKERHUB_TOKEN are set (GHCR alone otherwise). Built per platform on a
+  # native runner and pushed by digest to every registry at once, scanned,
+  # then tagged as one manifest list per registry. `linux/amd64` always;
+  # add `linux/arm64` (Raspberry Pi, native arm64 runner, billed) with the
+  # repository variable IMAGE_PLATFORMS = ["linux/amd64","linux/arm64"]. A
+  # QEMU build of the Rust + BoringSSL stage would take hours, hence native
+  # runners. No crate is ever published: the workspace is `publish = false`.
+  image:
+    name: Container image (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 90
+    needs: [release]
+    if: needs.release.outputs.image_missing == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        platform: ${{ fromJSON(vars.IMAGE_PLATFORMS || '["linux/amd64"]') }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: vars.DOCKERHUB_USERNAME != ''
+        with:
+          registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Image names
+        id: names
+        env:
+          GHCR: ghcr.io/${{ github.repository }}
+          HUB_USER: ${{ vars.DOCKERHUB_USERNAME }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          names="$GHCR"
+          if [ -n "$HUB_USER" ]; then
+            names="$names,docker.io/$HUB_USER/$REPO_NAME"
+          fi
+          echo "list=$names" >> "$GITHUB_OUTPUT"
+          echo "Publishing to: $names"
+      - name: Image labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.names.outputs.list }}
+          labels: |
+            org.opencontainers.image.title=arlo-camera-streamer
+            org.opencontainers.image.description=Battery-safe bridge from Arlo cameras to a local RTSP / HLS output for Frigate and other NVRs
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ needs.release.outputs.version }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # SLSA provenance and an SPDX SBOM are attached to every digest.
+          provenance: mode=max
+          sbom: true
+          # One build, pushed by digest to every registry in the list (the
+          # quoted name field is buildx's CSV form for several names).
+          outputs: type=image,"name=${{ steps.names.outputs.list }}",push-by-digest=true,name-canonical=true,push=true
+      # Every platform's image is scanned before its digest can be tagged:
+      # report HIGH and CRITICAL, stop on a fixable CRITICAL.
+      - name: Vulnerability report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+      - name: Vulnerability gate
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+      - name: Keep the digest for the manifest job
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+          echo "$PLATFORM -> $DIGEST"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  image-publish:
+    name: Tag the image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [release, image]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: vars.DOCKERHUB_USERNAME != ''
+        with:
+          registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Image names
+        id: names
+        env:
+          GHCR: ghcr.io/${{ github.repository }}
+          HUB_USER: ${{ vars.DOCKERHUB_USERNAME }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          names="$GHCR"
+          if [ -n "$HUB_USER" ]; then
+            names="$names,docker.io/$HUB_USER/$REPO_NAME"
+          fi
+          echo "list=$names" >> "$GITHUB_OUTPUT"
+          echo "Publishing to: $names"
+      - name: Tag the manifest lists
+        env:
+          NAMES: ${{ steps.names.outputs.list }}
+          VERSION: ${{ needs.release.outputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          cd /tmp/digests
+          # The per-platform digests are identical in every registry: the
+          # build pushed the same manifests to each one by digest.
+          for IMAGE in ${NAMES//,/ }; do
+            docker buildx imagetools create \
+              -t "$IMAGE:$VERSION" -t "$IMAGE:latest" -t "$IMAGE:sha-${SHA::7}" \
+              $(printf "$IMAGE@sha256:%s " *)
+            docker buildx imagetools inspect "$IMAGE:$VERSION"
+          done

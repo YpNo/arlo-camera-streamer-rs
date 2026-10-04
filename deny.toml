@@ -1,0 +1,64 @@
+[graph]
+targets = [
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+
+[advisories]
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "0BSD",
+    # foldhash (hashbrown 0.17, under indexmap/h2). OSI-approved, permissive.
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+deny = [
+    # General legacy/deprecated
+    # { crate = "lazy_static", reason = "Use standard library's std::sync::OnceLock or once_cell" },
+    { crate = "failure", reason = "Use thiserror or anyhow" },
+    { crate = "net2", reason = "Deprecated in favor of socket2" },
+    { crate = "futures-cpupool", reason = "Use tokio or rayon" },
+
+    # Security: TLS and Crypto
+    { crate = "openssl", reason = "Use rustls for memory-safe TLS" },
+    { crate = "native-tls", reason = "Use rustls for memory-safe TLS" },
+]
+
+# Certain crates/versions that will be skipped when doing duplicate detection.
+skip = [
+    # Duplicate-version allowances, one per older version, each naming the
+    # crate that still requires it. Re-derive with
+    # `cargo tree -i <crate>@<version>` after a lockfile change.
+    { crate = "getrandom@0.2.17", reason = "Required by ring v0.17" },
+    { crate = "itertools@0.13.0", reason = "Required by bindgen v0.72 (btls-sys build dependency)" },
+    { crate = "syn@2.0.119", reason = "Every proc-macro crate except futures-macro v0.3.34, which moved to syn 3" },
+    { crate = "thiserror@1.0.69", reason = "Required by tokio-socks v0.5" },
+    { crate = "thiserror-impl@1.0.69", reason = "Required by thiserror v1.0.69" },
+    { crate = "webpki-roots@0.26.11", reason = "Required by tokio-tungstenite v0.28 (arlo-rs); reqwest is on 1.0" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

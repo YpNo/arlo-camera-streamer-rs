@@ -1,0 +1,39 @@
+[package]
+name        = "streamer-infra-media"
+description = "GStreamer-based MediaMultiplexer adapter (RTSP + HLS + DASH outputs)."
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[dependencies]
+streamer-domain = { workspace = true }
+
+async-trait           = { workspace = true }
+bytes                 = { workspace = true }
+chrono                = { workspace = true }
+futures               = { workspace = true }
+gstreamer             = { workspace = true }
+gstreamer-app         = { workspace = true }
+gstreamer-rtsp        = { workspace = true }
+gstreamer-rtsp-server = { workspace = true }
+gstreamer-sdp         = { workspace = true }
+gstreamer-webrtc      = { workspace = true }
+rustls                = { workspace = true }
+rustls-native-certs   = { workspace = true }
+ring                  = { workspace = true }
+thiserror             = { workspace = true }
+tokio                 = { workspace = true }
+tokio-rustls          = { workspace = true }
+tracing               = { workspace = true }
+url                   = { workspace = true }
+
+[dev-dependencies]
+# Enables tokio's `test-util` (paused clock) for the setup-race tests.
+tokio-test = { workspace = true }
