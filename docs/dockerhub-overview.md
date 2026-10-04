@@ -40,7 +40,8 @@ Source, full documentation, changelog and issues:
 Every tag is also published to GitHub's registry as
 `ghcr.io/ypno/arlo-camera-streamer-rs`, byte for byte the same image. Each
 digest is scanned with Trivy before it is tagged and carries SLSA provenance
-and an SPDX SBOM. Platform: `linux/amd64` (`linux/arm64` is on the roadmap).
+and an SPDX SBOM. Platforms: `linux/amd64` and `linux/arm64` (Raspberry Pi 4
+and 5, Apple silicon hosts) in one manifest list; `docker pull` picks yours.
 
 ## What is in the image
 
