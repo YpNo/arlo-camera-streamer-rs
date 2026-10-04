@@ -299,8 +299,9 @@ use it: `--device /dev/dri` for an Intel/AMD GPU, `--device /dev/video11`
 on a Raspberry Pi 4 / Zero 2 / CM4, `--gpus all` with the NVIDIA
 container toolkit for NVENC. A Raspberry Pi 5 has no H.264 hardware
 encoder; it runs x264 in software. The image sets
-`RUST_LOG=info,arlo_camera_streamer=info`; pass `-e RUST_LOG=…` to change
-it. The container `HEALTHCHECK` runs the binary's own `healthcheck`
+`RUST_LOG=info,arlo_camera_streamer=info` on purpose, quieter than the
+binary's own default, because a container runs unattended for months; pass
+`-e RUST_LOG=…` to change it. The container `HEALTHCHECK` runs the binary's own `healthcheck`
 subcommand against `metrics_bind`.
 
 ### Frigate integration
