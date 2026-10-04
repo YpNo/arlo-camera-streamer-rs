@@ -39,7 +39,7 @@ them.
 | `CameraBusy` | `Activating → Idle`, **no backoff** (ADR 0005) |
 | `UserViewStarted` / `UserViewEnded` / `UserViewUnavailable` | Relay of the app view (ADR 0007): `Idle → Activating`, `Live → Idle`, `Activating → Idle` without backoff |
 | `UserViewProbe` | The relay lets go (`Live → Idle`) to let the camera report `idle`; `probe_until` arms a 2 s grace in `Idle`, after which `UserViewStarted` relays again unless the report came |
-| `Failure(reason)` | `→ Failed` from any state; `process_signals` arms `failed_deadline` on **every** entry (an `Offline` while idle used to strand the camera), exponential backoff, then `BackoffElapsed → Idle`; an `Online` report in `Failed` emits `BackoffElapsed` at once |
+| `Failure(reason)` | `→ Failed` from any state; `process_signals` arms `failed_deadline` on **every** entry (an `Offline` while idle used to strand the camera), then `BackoffElapsed → Idle`; an `Online` report in `Failed` emits `BackoffElapsed` at once. The backoff (1/5/30/60 s) is sized by `failure_streak`, which `count_failure` writes into `retries` (the reducer's fresh `Failed` is always 0) and which resets on `Activating → Live` |
 | `BudgetExhausted` / `BudgetReset` | `→ BatteryProtect` / back to `Idle`. Emitted on a motion pulse **and** from `handle_deadline` while `Live`: `next_deadline` takes `min(debouncer, now + budget.remaining())`, so a session is cut when the quota runs out. Every `Idle → Activating` for motion charges `ACTIVATION_SURCHARGE_SECS` (15) through `budget.charge`. The budget is wall-clock (chrono): paused-clock tests cannot move its in-flight time, so test it with quotas the surcharge exhausts |
 
 The metric `signal` label is `signal_label(&StateTransition)`; `LiveLost` carries its
@@ -73,6 +73,8 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   not resumed. `user_view_active()` is also true during a relay and its probe, so the
   still keeps the notice; `user_view_notice_expiry()` returns `None` while relaying —
   a past instant there spun the select loop (found by a hanging paused test).
+  A pulse during a relay returns `None` before `intercept_budget`: a relay is not
+  charged, and an exhausted quota would otherwise cut the viewers' picture.
   `ManualStreamEnded` → `UserViewEnded` → `Idle`; a failure →
   `UserViewUnavailable` → `Idle` (no backoff) + 30 s `USER_VIEW_RETRY` guard, same after
   a `LiveLost`. A motion pulse during a relay is absorbed and must not prime the
@@ -84,6 +86,11 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   into `user_view_notice_expiry()`: without it a past expiry and a media call that
   kept failing spun the loop. Every path out of `sync_user_view_notice` must leave
   `notice_retry_after` consistent, including the early "nothing to do" return.
+- **Activation vs shutdown**: `start_activation` and `start_user_view_relay` run
+  their attach under `shutdown.run_until_cancelled` (attaches are cancel-safe). A
+  stop mid-negotiation returns `Failure` / `UserViewUnavailable`, whose exits
+  detach and tear down; an attach can take 40 s and the drain stage waits 8 s.
+  The binary handles SIGINT **and** SIGTERM (`streamer-bin/src/signals.rs`).
 - **Exit paths**: `handle_shutdown()` (detach + teardown) runs on the token **and** on
   a closed event mailbox — the router drops the senders only when the system stops or
   died, and nothing may stay streaming either way. `StreamerSystem` runs every task
@@ -97,8 +104,11 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   `AdminRoute.snapshots` reads it with `borrow()`. `AdminCommand` has no `Snapshot`
   variant any more — a camera inside a negotiation used to time out and report
   `unresponsive`. Tests read `orch.snapshots()` and `sleep` a few ms between reads.
-- **Debouncer priming** only in `Idle|Live` (`motion_signal()`); priming in
-  `Failed`/`BatteryProtect` left a stale hard-cap deadline that cut the next session short.
+- **Debouncer priming** only in `Idle|Live` (`motion_signal()`) and only *after*
+  the budget let the pulse through; priming in `Failed`/`BatteryProtect`, or for a
+  pulse the budget refused, left a stale hard-cap deadline that cut the next
+  session short. `Idle → BatteryProtect` and `BatteryProtect → Idle` also call
+  `debouncer.on_idle()`.
 - **Snapshots** (`CameraEvent::SnapshotAvailable`, no URL in the domain) refresh the idle
   still only in `Idle|BatteryProtect|Failed` — the states where the still is on screen.
 - **Admin commands** (wake, force-idle) are acked when dequeued, before acting: the reply
@@ -106,7 +116,9 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   `motion_signal()` like a real motion, and is refused (`WakeOutcome::TooSoon` →
   `AdminError::RateLimited` → HTTP 429) within `ADMIN_WAKE_MIN_INTERVAL` (30 s) of
   `last_session_end`, set in `detach_and_refresh`. The actor enqueues with `try_send`:
-  a full mailbox is `AdminError::Unavailable` (503) at once, never a wait.
+  a full mailbox (`ADMIN_MAILBOX_CAPACITY` = 2) is `AdminError::Unavailable` (503)
+  at once, never a wait. A command whose reply channel is already closed (its
+  caller timed out and answered 503) is dropped unapplied.
 - **Budget reset** fires on any change of the reset date (`!=`), so a clock stepped
   backwards across the boundary refills the quota instead of freezing it.
 

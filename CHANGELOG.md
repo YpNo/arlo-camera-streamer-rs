@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- SIGTERM (`docker stop`, `compose down`, systemd) now runs the graceful
+  drain like Ctrl-C; it used to kill the process with the camera's live
+  session still open, so the camera kept streaming on battery until Arlo
+  timed it out. The handlers are installed before the Arlo boot.
+- A stop requested while a camera negotiates its session no longer waits
+  for the negotiation (up to 40 s, longer than the drain): the attempt is
+  abandoned, detached and torn down.
+- The failure backoff grows across repeated activation failures (1 s, 5 s,
+  30 s, then 60 s) instead of restarting at 1 s on every motion pulse; it
+  resets once a session comes up.
+- A motion pulse refused by the daily budget no longer primes the motion
+  debouncer, which cut the next session at the hard cap right after the
+  budget reset; entering and leaving battery-protect clears it too.
+- A motion pulse during a relayed app view no longer goes through the
+  budget, which cut the viewers' picture once the quota was spent.
+- An admin wake or force-idle whose caller already gave up (503 after the
+  2 s timeout) is dropped instead of being applied later; the per-camera
+  admin mailbox holds 2 commands instead of 32.
+
 ## [0.1.0] - 2026-10-03
 
 First release: the daemon as validated on the owner's camera and box.

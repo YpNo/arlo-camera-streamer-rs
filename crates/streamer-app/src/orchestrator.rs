@@ -115,6 +115,8 @@ const ADMIN_WAKE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// before it is tried again by time. Without it a past notice expiry
 /// and a media call that keeps failing ran the loop at CPU speed.
 const USER_VIEW_NOTICE_RETRY: Duration = Duration::from_secs(30);
+/// Failure reason of an activation cut short by shutdown.
+const SHUTDOWN_DURING_ACTIVATION: &str = "shutdown during activation";
 /// Quota charged for the activation itself (wake-up, negotiation), so
 /// short sessions still cost the battery they really cost.
 const ACTIVATION_SURCHARGE_SECS: i64 = 15;
@@ -129,6 +131,11 @@ pub struct CameraOrchestrator {
     budget: LiveBudgetTracker,
     /// Set when in [`CameraState::Failed`]; cleared on transition out.
     failed_deadline: Option<Instant>,
+    /// Entries into [`CameraState::Failed`] since the last session that
+    /// came up; sizes the backoff. The reducer starts every fresh
+    /// `Failed` at 0, so a gateway failing each motion pulse would be
+    /// retried after 1 s every time. Reset when a session attaches.
+    failure_streak: u32,
     /// Handle to the attached live session (ADR 0004).
     ///
     /// Invariant: `Some` iff `state` is `Live`. Set by
@@ -237,6 +244,7 @@ impl CameraOrchestrator {
             debouncer,
             budget,
             failed_deadline: None,
+            failure_streak: 0,
             live: None,
             user_view_until: None,
             user_view_notice: false,
@@ -392,6 +400,16 @@ impl CameraOrchestrator {
             // spends several seconds in WebRTC negotiation — longer
             // than the admin reply timeout, which would report a
             // perfectly healthy wake as "orchestrator unavailable".
+            // A command whose caller stopped waiting (it already answered
+            // 503 after its timeout) is dropped: applying it now would
+            // start or end a session nobody asked for any more, and a
+            // retried wake would queue a second one.
+            AdminCommand::ForceIdle { reply } if reply.is_closed() => {
+                debug!("stale admin force-idle dropped: its caller timed out");
+            }
+            AdminCommand::ManualWake { reply } if reply.is_closed() => {
+                debug!("stale admin manual-wake dropped: its caller timed out");
+            }
             AdminCommand::ForceIdle { reply } => {
                 if reply.send(()).is_err() {
                     debug!("admin force-idle reply dropped");
@@ -565,16 +583,26 @@ impl CameraOrchestrator {
                 .record_motion(&self.camera_id, MotionOutcome::SuppressedUserView);
             return None;
         }
-        // Prime the debouncer only where a session can start or extend;
-        // a pulse in BatteryProtect / Failed would leave a stale
-        // `live_since` that trips the hard cap right after the next attach.
-        // A relay of the user's view has no cooldown: it ends with the
-        // view, so a pulse during it must not start the debouncer.
-        let relaying = self.session_source == Some(LiveSource::UserView);
-        if (in_session && !relaying) || self.state == CameraState::Idle {
-            self.debouncer.on_motion(now());
+        // A relay of the user's view has no cooldown and is not charged:
+        // it ends with the view. A pulse during it must neither start the
+        // debouncer (the cooldown would end the relay) nor reach the
+        // budget check (an exhausted quota would cut the viewers' picture
+        // until the reset).
+        if self.session_source == Some(LiveSource::UserView) {
+            debug!(trigger, "pulse during a relayed user view; absorbed");
+            self.metrics
+                .record_motion(&self.camera_id, MotionOutcome::Absorbed);
+            return None;
         }
         let signal = self.intercept_budget(StateTransition::MotionDetected);
+        // Prime the debouncer only where a session can start or extend,
+        // and only for a pulse the budget let through: a pulse refused in
+        // `Idle`, or one in BatteryProtect / Failed, would leave a stale
+        // `live_since` that trips the hard cap right after the next attach.
+        let session_possible = in_session || self.state == CameraState::Idle;
+        if session_possible && matches!(signal, StateTransition::MotionDetected) {
+            self.debouncer.on_motion(now());
+        }
         let outcome = classify_motion(&self.state, &signal);
         let at = now();
         let session_ends_in_ms = self
@@ -791,7 +819,7 @@ impl CameraOrchestrator {
     ) -> Result<(), DomainError> {
         while let Some(signal) = signals.pop_front() {
             let from = self.state.clone();
-            let to = transition(&from, &signal);
+            let to = self.count_failure(&signal, transition(&from, &signal));
             if to == from {
                 debug!(?signal, ?from, "no-op transition");
                 continue;
@@ -850,6 +878,21 @@ impl CameraOrchestrator {
         Ok(())
     }
 
+    /// Number a `Failed` entry by the failure streak rather than the
+    /// reducer's fresh 0, so the backoff grows across failures separated
+    /// by a retry from `Idle`. Only a `Failure` signal counts: other
+    /// signals leave a `Failed` state as it is.
+    fn count_failure(&mut self, signal: &StateTransition, to: CameraState) -> CameraState {
+        match (signal, to) {
+            (StateTransition::Failure(_), CameraState::Failed { reason, .. }) => {
+                let retries = self.failure_streak;
+                self.failure_streak = self.failure_streak.saturating_add(1);
+                CameraState::Failed { reason, retries }
+            }
+            (_, to) => to,
+        }
+    }
+
     async fn apply_state_change(
         &mut self,
         from: &CameraState,
@@ -874,6 +917,7 @@ impl CameraOrchestrator {
             // cooldown and costs no battery of ours: it is not debounced
             // and not charged to the daily budget.
             (CameraState::Activating, CameraState::Live) => {
+                self.failure_streak = 0;
                 if self.session_source == Some(LiveSource::UserView) {
                     let segment = self.probe_interval.unwrap_or(self.relay_cap);
                     self.relay_deadline = Some(now() + segment);
@@ -882,9 +926,10 @@ impl CameraOrchestrator {
                     self.budget.on_live_started(Local::now().naive_local());
                 }
             }
-            // Attach refused because the user watches in the Arlo app:
-            // release whatever the attempt left behind, no backoff.
-            (CameraState::Activating, CameraState::Idle) => {
+            // Attach refused because the user watches in the Arlo app (or,
+            // defensively, the quota ran out mid-negotiation): release
+            // whatever the attempt left behind, no backoff.
+            (CameraState::Activating, CameraState::Idle | CameraState::BatteryProtect { .. }) => {
                 let _ = self.media.detach_live(&self.camera_id).await;
                 self.stop_arlo_live().await;
                 self.debouncer.on_idle();
@@ -905,8 +950,14 @@ impl CameraOrchestrator {
             (CameraState::Failed { .. }, CameraState::Idle) => {
                 self.failed_deadline = None;
             }
-            // BatteryProtect → Idle (budget reset).
+            // Entering or leaving BatteryProtect without a session: no
+            // pulse may carry its debouncer state into the next session,
+            // or the hard cap would cut it right after the attach.
+            (CameraState::Idle, CameraState::BatteryProtect { .. }) => {
+                self.debouncer.on_idle();
+            }
             (CameraState::BatteryProtect { .. }, CameraState::Idle) => {
+                self.debouncer.on_idle();
                 debug!("budget reset; ready to wake on motion");
             }
             // No-op transitions (already filtered by process_signals).
@@ -918,13 +969,23 @@ impl CameraOrchestrator {
     /// Bring up a fresh live session. The media adapter owns the
     /// WebRTC offer/answer round-trip (via `signaler`); the orchestrator
     /// only drives the splice and keeps teardown symmetric.
+    ///
+    /// Raced against shutdown: an attach can take 40 s (offer, then the
+    /// first RTP), longer than the drain waits, and a session the gateway
+    /// already answered must still be torn down. The attach is
+    /// cancel-safe; the `Failed` exit detaches and tears down.
     async fn start_activation(&mut self) -> Vec<StateTransition> {
         let started = now();
-        match self
+        let attach = self
             .media
-            .attach_live(&self.camera_id, self.signaler.as_ref())
-            .await
-        {
+            .attach_live(&self.camera_id, self.signaler.as_ref());
+        let Some(attached) = self.shutdown.run_until_cancelled(attach).await else {
+            info!("shutdown during the activation; releasing the camera");
+            return vec![StateTransition::Failure(
+                SHUTDOWN_DURING_ACTIVATION.to_string(),
+            )];
+        };
+        match attached {
             Ok(session) => {
                 self.live = Some(session);
                 self.metrics.record_splice(
@@ -971,11 +1032,18 @@ impl CameraOrchestrator {
     /// watch-along stream and attach it as the live source. A failure
     /// returns to idle without backoff and arms the retry guard; the idle
     /// frame keeps saying where the live picture is.
+    ///
+    /// Raced against shutdown like [`Self::start_activation`]; the
+    /// `Activating → Idle` exit then releases the relay.
     async fn start_user_view_relay(&mut self) -> Vec<StateTransition> {
         let started = now();
-        let attached = match self.user_views.watch_along_url(&self.camera_id).await {
-            Ok(url) => self.media.attach_user_view(&self.camera_id, &url).await,
-            Err(e) => Err(e),
+        let attach = async {
+            let url = self.user_views.watch_along_url(&self.camera_id).await?;
+            self.media.attach_user_view(&self.camera_id, &url).await
+        };
+        let Some(attached) = self.shutdown.run_until_cancelled(attach).await else {
+            info!("shutdown while setting up the relay; releasing the camera");
+            return vec![StateTransition::UserViewUnavailable];
         };
         match attached {
             Ok(session) => {
@@ -1280,6 +1348,7 @@ mod tests {
     /// so a test can observe the orchestrator mid-activation.
     struct HeldSignaler {
         release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        stops: std::sync::atomic::AtomicU32,
     }
 
     impl HeldSignaler {
@@ -1288,6 +1357,7 @@ mod tests {
             (
                 Arc::new(Self {
                     release: Mutex::new(Some(rx)),
+                    stops: std::sync::atomic::AtomicU32::new(0),
                 }),
                 tx,
             )
@@ -1309,6 +1379,8 @@ mod tests {
             Ok(ok_answer())
         }
         async fn teardown(&self, _camera: &CameraId) -> Result<(), DomainError> {
+            self.stops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
     }
@@ -2907,6 +2979,211 @@ mod tests {
 
         // negotiate was never called.
         assert_eq!(sr.call_count().await, 0);
+    }
+
+    // ---------- Battery: shutdown, backoff, budget, stale commands ----------
+
+    /// Let a deadline that `advance` made due fire before the next event:
+    /// the loop's `select!` is biased towards events.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    /// Each fresh `Failed` used to start at retries 0, so a gateway that
+    /// failed every motion pulse was renegotiated after 1 s each time.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_activation_failures_grow_the_backoff() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![
+            Err(DomainError::AdapterTransport("gateway".to_string())),
+            Err(DomainError::AdapterTransport("gateway".to_string())),
+        ]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        tokio::time::advance(backoff_duration(0) + Duration::from_millis(100)).await;
+        settle().await;
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 2, "the first backoff is 1 s");
+
+        // The second failure in a row backs off 5 s, not 1 s again.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 2, "still backing off after 2 s");
+        tokio::time::advance(backoff_duration(1)).await;
+        settle().await;
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 3, "retried once the 5 s ran out");
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_comes_up_resets_the_failure_streak() {
+        let cfg = camera_cfg(1, 300);
+        let sr = StubSignaler::with_responses(vec![
+            Err(DomainError::AdapterTransport("gateway".to_string())),
+            Ok(ok_answer()),
+            Err(DomainError::AdapterTransport("gateway".to_string())),
+        ]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await; // fails
+        tokio::time::advance(backoff_duration(0) + Duration::from_millis(100)).await;
+        settle().await;
+        send(&tx, motion()).await; // comes up
+        tokio::time::advance(Duration::from_secs(2)).await; // cooldown
+        settle().await;
+        send(&tx, motion()).await; // fails: a first failure again
+        assert_eq!(sr.call_count().await, 3);
+        tokio::time::advance(backoff_duration(0) + Duration::from_millis(100)).await;
+        settle().await;
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 4, "the streak restarted at 1 s");
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    /// A pulse refused by the budget in `Idle` used to prime the
+    /// debouncer first: its stale `live_since` cut the next session (after
+    /// the reset) at the hard cap right after the attach.
+    #[tokio::test(start_paused = true)]
+    async fn pulse_refused_by_the_budget_does_not_prime_the_debouncer() {
+        let cfg = camera_cfg_budget(60, 300, 10);
+        let (mut orch, _tx, _token) = build(
+            &cfg,
+            StubSignaler::with_responses(vec![]),
+            RecordingMedia::new(),
+        );
+        orch.budget.charge(
+            now_local(),
+            chrono::Duration::seconds(ACTIVATION_SURCHARGE_SECS),
+        );
+
+        let signal = orch.motion_signal("motion");
+
+        assert_eq!(signal, Some(StateTransition::BudgetExhausted));
+        assert_eq!(orch.debouncer.next_deadline(now()), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leaving_battery_protect_clears_the_debouncer() {
+        let cfg = camera_cfg(60, 300);
+        let (mut orch, _tx, _token) = build(
+            &cfg,
+            StubSignaler::with_responses(vec![]),
+            RecordingMedia::new(),
+        );
+        orch.state = CameraState::BatteryProtect {
+            reset_in: Duration::ZERO,
+        };
+        orch.debouncer.on_motion(now());
+
+        orch.process_signals(VecDeque::from([StateTransition::BudgetReset]))
+            .await
+            .unwrap();
+
+        assert_eq!(orch.state, CameraState::Idle);
+        assert_eq!(orch.debouncer.next_deadline(now()), None);
+    }
+
+    /// A relay is not charged, but a pulse during it still went through
+    /// the budget: with the quota spent it cut the viewers' picture and
+    /// held the camera in `BatteryProtect` until the reset.
+    #[tokio::test(start_paused = true)]
+    async fn motion_during_a_relay_is_not_cut_by_an_exhausted_budget() {
+        let cfg = camera_cfg_budget(60, 300, 10);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        let (mut orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        orch.budget.charge(
+            now_local(),
+            chrono::Duration::seconds(ACTIVATION_SURCHARGE_SECS),
+        );
+        let snapshots = orch.snapshots();
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await;
+        assert!(media.calls().await.contains(&MediaCall::AttachUserView));
+        send(&tx, motion()).await;
+
+        assert!(
+            !media.calls().await.contains(&MediaCall::DetachLive),
+            "the relay must survive the pulse"
+        );
+        assert_eq!(snapshots.borrow().state, "live");
+        assert_eq!(sr.stop_count().await, 0);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    /// An attach can outlast the drain; shutdown used to wait for it and
+    /// the process exited without tearing down the answered session.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_an_activation_detaches_and_tears_down() {
+        let cfg = camera_cfg(60, 300);
+        let (sr, _release) = HeldSignaler::new();
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await; // negotiation held open
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("shutdown must not wait for the negotiation")
+            .unwrap();
+
+        assert!(media.calls().await.contains(&MediaCall::DetachLive));
+        assert!(
+            sr.stops.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "teardown releases whatever the gateway answered"
+        );
+    }
+
+    /// The HTTP caller answers 503 after 2 s, but the command stayed
+    /// queued and ran later: a retried wake started a second session.
+    #[tokio::test(start_paused = true)]
+    async fn admin_commands_whose_caller_gave_up_are_dropped() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, admin_tx, token) = build_with_admin(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        admin_tx
+            .send(crate::admin::AdminCommand::ManualWake { reply })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sr.call_count().await, 0, "a stale wake starts nothing");
+
+        send(&tx, motion()).await;
+        media.calls().await;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        admin_tx
+            .send(crate::admin::AdminCommand::ForceIdle { reply })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !media.calls().await.contains(&MediaCall::DetachLive),
+            "a stale force-idle ends nothing"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
     }
 
     // ---------- now_local just returns naive local time ----------

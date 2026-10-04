@@ -404,3 +404,19 @@ Sweep #2: ten review units (re-run on Opus after Fable's usage limit), every
           public, keep details out of issues and commits).
 Open:     Work through the report's recommended actions, battery hazards first.
 
+
+## 2026-10-04 — Battery fixes: SIGTERM, shutdown mid-attach, backoff, budget, admin
+Changed:  streamer-bin `signals.rs` handles SIGINT and SIGTERM, installed
+          before the Arlo boot (docker stop used to kill the process with the
+          session open). Orchestrator: attaches run under
+          `shutdown.run_until_cancelled`; `failure_streak` sizes the backoff
+          (reset on attach); the budget is checked before the debouncer is
+          primed and BatteryProtect entry/exit clears it; a pulse during a
+          relay is absorbed before the budget; admin commands whose caller
+          timed out are dropped, admin mailbox 2. README/overview: 30 s stop
+          timeout. Skill `arlo-orchestrator` invariants updated.
+Tests:    seven regression tests, each checked to fail with its fix reverted;
+          workspace suite green with STREAMER_REQUIRE_GST_IT=1.
+Open:     Next batch: long-running stability (webrtcbin/probe leaks,
+          thumbnail decode limits). Optional, owner's call: let a user view
+          leave BatteryProtect.
