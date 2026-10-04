@@ -391,3 +391,32 @@ Notes:    arlo-rs PR #35 was squash-merged and lost its fix entry: changelog
 Open:     Live gate of the TLS chain; first image build on the release; the
           arlo-rs `target/` (23 G) is the user's to prune.
 
+## 2026-10-04 — Phase 0: sweep #2, deny duplicates, image log default
+Changed:  deny.toml accepts the six transitive duplicates with reasons (cargo
+          deny warning-free); README states the image's quieter RUST_LOG on
+          purpose. Separate branch fix/ci-trivy-platform: TRIVY_PLATFORM from
+          the matrix (the arm64 leg failed: Trivy looked for linux/amd64 in a
+          one-platform index; nothing was tagged).
+Sweep #2: ten review units (re-run on Opus after Fable's usage limit), every
+          candidate re-read against the code. All 48 findings of sweep #1
+          fixed. 64 new: 0 critical, 0 high, 5 medium, 30 low, 29 hazards.
+          Report and baseline are local in .security/ (gitignored; the repo is
+          public, keep details out of issues and commits).
+Open:     Work through the report's recommended actions, battery hazards first.
+
+
+## 2026-10-04 — Battery fixes: SIGTERM, shutdown mid-attach, backoff, budget, admin
+Changed:  streamer-bin `signals.rs` handles SIGINT and SIGTERM, installed
+          before the Arlo boot (docker stop used to kill the process with the
+          session open). Orchestrator: attaches run under
+          `shutdown.run_until_cancelled`; `failure_streak` sizes the backoff
+          (reset on attach); the budget is checked before the debouncer is
+          primed and BatteryProtect entry/exit clears it; a pulse during a
+          relay is absorbed before the budget; admin commands whose caller
+          timed out are dropped, admin mailbox 2. README/overview: 30 s stop
+          timeout. Skill `arlo-orchestrator` invariants updated.
+Tests:    seven regression tests, each checked to fail with its fix reverted;
+          workspace suite green with STREAMER_REQUIRE_GST_IT=1.
+Open:     Next batch: long-running stability (webrtcbin/probe leaks,
+          thumbnail decode limits). Optional, owner's call: let a user view
+          leave BatteryProtect.

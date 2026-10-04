@@ -41,8 +41,6 @@ use streamer_domain::admin::{AdminError, CameraSnapshot, SystemSnapshot};
 use streamer_domain::camera::CameraId;
 use streamer_domain::port::AdminControl;
 
-use crate::system::MAILBOX_CAPACITY;
-
 /// Per-call admin timeout. The orchestrator should reply almost
 /// instantly (it's only handling one command between two select-loop
 /// iterations) — the timeout guards against a permanently stuck task.
@@ -149,8 +147,9 @@ impl AdminControlActor {
 /// Capacity of each per-camera admin mailbox. Admin commands are slow
 /// (one HTTP request at a time per camera in practice), so this is
 /// intentionally tiny — back-pressure surfaces immediately as
-/// `Unavailable`.
-pub const ADMIN_MAILBOX_CAPACITY: usize = MAILBOX_CAPACITY;
+/// `Unavailable` instead of a queue of wakes applied long after their
+/// callers gave up.
+pub const ADMIN_MAILBOX_CAPACITY: usize = 2;
 
 #[async_trait]
 impl AdminControl for AdminControlActor {

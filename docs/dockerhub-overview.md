@@ -85,7 +85,7 @@ docker run --rm -it -e ARLO_PASSWORD -e ARLO_IMAP_PASSWORD \
 **4. Run the daemon.**
 
 ```bash
-docker run -d --name arlo-camera-streamer --restart on-failure \
+docker run -d --name arlo-camera-streamer --restart on-failure --stop-timeout 30 \
   -p 8554:8554 \
   -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
   -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \

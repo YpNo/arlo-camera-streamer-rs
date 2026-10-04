@@ -24,7 +24,7 @@
 //!     (`/metrics`, `/healthz`, `/readyz`).
 //! 11. Spawn the admin HTTP server on `output.admin_bind` (`/admin/*`),
 //!     authed with the bearer token from `STREAMER_ADMIN_TOKEN`.
-//! 12. Wait for `Ctrl-C` or for the system token to be cancelled.
+//! 12. Wait for SIGINT / SIGTERM or for the system token to be cancelled.
 //! 13. Cancel the shared token, await all spawned tasks, drop the
 //!     RTSP server.
 
@@ -66,6 +66,8 @@ use streamer_infra_media::{GstMediaMultiplexer, GstPipelineRegistry, RtspServer}
 use streamer_infra_ops::admin_server::MIN_ADMIN_TOKEN_BYTES;
 use streamer_infra_ops::{AdminServer, Metrics, OpsServer, Readiness};
 
+use crate::signals::ShutdownSignals;
+
 /// Env var holding the bearer token for `/admin/*` routes.
 const ADMIN_TOKEN_ENV: &str = "STREAMER_ADMIN_TOKEN";
 
@@ -79,6 +81,7 @@ const THUMBNAIL_DIR_NAME: &str = "thumbnails";
 
 mod healthcheck;
 mod list_devices;
+mod signals;
 
 /// CLI arguments.
 #[derive(Debug, Parser)]
@@ -135,6 +138,9 @@ async fn run_daemon(config: StreamerConfig) -> Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         "starting arlo-camera-streamer"
     );
+    // Before anything that can open an Arlo session: from here a SIGTERM
+    // is held for the drain instead of killing the process.
+    let signals = ShutdownSignals::install()?;
     gstreamer::init().context("failed to initialize GStreamer")?;
     info!("GStreamer initialized");
     info!(
@@ -143,14 +149,14 @@ async fn run_daemon(config: StreamerConfig) -> Result<()> {
         metrics_bind = %config.output.metrics_bind,
         "configuration loaded"
     );
-    if let Err(e) = run(config).await {
+    if let Err(e) = run(config, signals).await {
         error!(error = %e, "fatal error");
         return Err(e);
     }
     Ok(())
 }
 
-async fn run(config: StreamerConfig) -> Result<()> {
+async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()> {
     // -- Observability handles --
     let cameras_count = u32::try_from(config.cameras.len()).unwrap_or(u32::MAX);
     let metrics = Arc::new(
@@ -275,8 +281,8 @@ async fn run(config: StreamerConfig) -> Result<()> {
     // bus ends (see `streamer_app::system`); that is a failure, reported
     // as a non-zero exit after the drain so a restart policy kicks in.
     let requested = tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            warn!("Ctrl-C received; initiating graceful shutdown");
+        signal = signals.recv() => {
+            warn!(signal, "stop requested; initiating graceful shutdown");
             true
         }
         () = shutdown.cancelled() => {

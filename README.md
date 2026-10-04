@@ -263,16 +263,22 @@ arlo-camera-streamer --config /etc/arlo-streamer/streamer.toml
 `run` is the default subcommand, so `arlo-camera-streamer run --config …`
 is equivalent.
 
-The process exits `0` on Ctrl-C / SIGTERM. It exits non-zero when it stops
+The process exits `0` on Ctrl-C / SIGTERM, after releasing every live
+session — including one still negotiating. It exits non-zero when it stops
 on its own — the Arlo event bus ended, or a camera task ended or panicked —
-after releasing every live session; run it under a restart policy
+after the same release; run it under a restart policy
 (`restart: on-failure` in Compose, `Restart=on-failure` in systemd).
+Give the stop at least 30 s (`docker run --stop-timeout 30`,
+`stop_grace_period: 30s` in Compose, `TimeoutStopSec=30` in systemd):
+sessions are released first, but the full drain can take longer than
+Docker's default 10 s, after which the process is killed.
 
 ### Docker run
 
 ```bash
 docker run -d \
   --name arlo-camera-streamer \
+  --stop-timeout 30 \
   -p 8554:8554 -p 9090:9090 -p 9091:9091 \
   -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
   -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \
@@ -299,8 +305,9 @@ use it: `--device /dev/dri` for an Intel/AMD GPU, `--device /dev/video11`
 on a Raspberry Pi 4 / Zero 2 / CM4, `--gpus all` with the NVIDIA
 container toolkit for NVENC. A Raspberry Pi 5 has no H.264 hardware
 encoder; it runs x264 in software. The image sets
-`RUST_LOG=info,arlo_camera_streamer=info`; pass `-e RUST_LOG=…` to change
-it. The container `HEALTHCHECK` runs the binary's own `healthcheck`
+`RUST_LOG=info,arlo_camera_streamer=info` on purpose, quieter than the
+binary's own default, because a container runs unattended for months; pass
+`-e RUST_LOG=…` to change it. The container `HEALTHCHECK` runs the binary's own `healthcheck`
 subcommand against `metrics_bind`.
 
 ### Frigate integration

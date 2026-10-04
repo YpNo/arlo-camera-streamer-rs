@@ -132,6 +132,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 
 ENV RUST_LOG=info,arlo_camera_streamer=info
 
-# tini handles SIGTERM correctly; the daemon's tokio runtime then drains.
+# tini forwards SIGTERM; the daemon handles it and drains (detach,
+# release every Arlo session) before exiting 0.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/arlo-camera-streamer"]
 CMD ["--config", "/etc/arlo-streamer/streamer.toml"]
