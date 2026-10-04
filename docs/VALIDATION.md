@@ -22,7 +22,7 @@ this file records whether reality agreed. Update it after every live gate
 | Several cameras at once | **never** | per-camera actors, unit-tested only. |
 | H.265 camera | **never** | code path present, the owner's camera sends H.264. |
 | Container image from the release workflow | **never** | first build on the merge that releases 0.1.0. |
-| `linux/arm64` image | **never** | opt-in through `IMAGE_PLATFORMS`; needs a Pi to prove. |
+| `linux/arm64` image | **never run** | built by the release workflow since 2026-10-04 (`IMAGE_PLATFORMS` lists both platforms); running it on a Pi is still owed. |
 
 ## Status detail
 

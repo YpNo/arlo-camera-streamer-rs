@@ -303,17 +303,30 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Is the image for this version published?
+      - name: Is the image for this version published for every platform?
         id: image
         env:
           REF: ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+          PLATFORMS: ${{ vars.IMAGE_PLATFORMS || '["linux/amd64"]' }}
         run: |
           # Lowercase for the same reason as the image names below.
           REF=$(printf '%s' "$REF" | tr '[:upper:]' '[:lower:]')
-          if docker manifest inspect "$REF" >/dev/null 2>&1; then
-            echo "Image $REF exists."
-            echo "missing=false" >> "$GITHUB_OUTPUT"
+          expected=$(printf '%s' "$PLATFORMS" | jq -r '.[]' | sort -u)
+          if manifest=$(docker manifest inspect "$REF" 2>/dev/null); then
+            # Attestation manifests carry os/arch "unknown"; skip them.
+            have=$(printf '%s' "$manifest" \
+              | jq -r '.manifests[]? | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture)"' \
+              | sort -u)
+            lacking=$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$have"))
+            if [ -z "$lacking" ]; then
+              echo "Image $REF exists for: $(printf '%s' "$have" | tr '\n' ' ')"
+              echo "missing=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "Image $REF lacks: $(printf '%s' "$lacking" | tr '\n' ' '); rebuilding every platform."
+              echo "missing=true" >> "$GITHUB_OUTPUT"
+            fi
           else
+            echo "No image for $REF yet."
             echo "missing=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -332,11 +345,14 @@ jobs:
   # when the repository variable DOCKERHUB_USERNAME and the secret
   # DOCKERHUB_TOKEN are set (GHCR alone otherwise). Built per platform on a
   # native runner and pushed by digest to every registry at once, scanned,
-  # then tagged as one manifest list per registry. `linux/amd64` always;
-  # add `linux/arm64` (Raspberry Pi, native arm64 runner, billed) with the
-  # repository variable IMAGE_PLATFORMS = ["linux/amd64","linux/arm64"]. A
+  # then tagged as one manifest list per registry. The platforms come from
+  # the repository variable IMAGE_PLATFORMS (set to
+  # ["linux/amd64","linux/arm64"]; `linux/amd64` alone when unset), each on
+  # a native runner — the arm64 runner is free for a public repository. A
   # QEMU build of the Rust + BoringSSL stage would take hours, hence native
-  # runners. No crate is ever published: the workspace is `publish = false`.
+  # runners. The release job rebuilds and re-tags a version whose published
+  # manifest list lacks any configured platform, so adding a platform needs
+  # no version bump. No crate is ever published: `publish = false`.
   image:
     name: Container image (${{ matrix.platform }})
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}

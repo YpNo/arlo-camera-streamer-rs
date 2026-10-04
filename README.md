@@ -149,9 +149,9 @@ docker pull docker.io/ypno/arlo-camera-streamer-rs:v0.1.0
 ```
 
 Tags: `v<version>` (pin this one), `latest` (the newest release), and
-`sha-<commit>`, identical on both registries. `linux/amd64` is always built; `linux/arm64` (Raspberry
-Pi) is added when the repository variable `IMAGE_PLATFORMS` lists it.
-To build it yourself instead:
+`sha-<commit>`, identical on both registries. Each tag is a manifest list
+for `linux/amd64` and `linux/arm64` (Raspberry Pi 4 and 5, Apple silicon
+hosts); `docker pull` picks the right one. To build it yourself instead:
 
 ```bash
 docker build -t arlo-camera-streamer:dev .
