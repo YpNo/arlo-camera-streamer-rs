@@ -31,6 +31,7 @@ pub mod metrics;
 pub mod port;
 pub mod state;
 pub mod stream;
+pub mod thumbnail;
 
 pub use admin::{AdminError, CameraSnapshot, SystemSnapshot};
 pub use camera::{CameraId, DiscoveredDevice, StreamName};
@@ -51,3 +52,4 @@ pub use stream::{
     Codec, IceAddressFamily, IceServer, LiveLossNotifier, LiveSession, SignalingAnswer,
     WatchAlongUrl,
 };
+pub use thumbnail::{JpegSize, MAX_THUMBNAIL_DIMENSION, ThumbnailError, check_thumbnail};

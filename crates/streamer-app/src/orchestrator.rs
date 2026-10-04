@@ -3149,6 +3149,39 @@ mod tests {
         );
     }
 
+    /// A watch-along lookup that never answers, to hold a relay setup open.
+    struct HeldUserViews;
+
+    #[async_trait]
+    impl UserViewSource for HeldUserViews {
+        async fn watch_along_url(
+            &self,
+            _camera: &CameraId,
+        ) -> Result<streamer_domain::stream::WatchAlongUrl, DomainError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_while_a_relay_is_set_up_releases_the_camera() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) =
+            build_with_views(&cfg, sr.clone(), media.clone(), Arc::new(HeldUserViews));
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, manual()).await; // relay setup held open
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("shutdown must not wait for the relay setup")
+            .unwrap();
+
+        assert!(media.calls().await.contains(&MediaCall::DetachLive));
+        assert!(sr.stop_count().await >= 1, "the camera is released");
+    }
+
     /// The HTTP caller answers 503 after 2 s, but the command stayed
     /// queued and ran later: a retried wake started a second session.
     #[tokio::test(start_paused = true)]

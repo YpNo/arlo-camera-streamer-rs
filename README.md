@@ -493,7 +493,7 @@ on `/metrics` the same for a dashboard.
 | VLC connects, idle frame shows, never goes live | `to=Activating` then `attach_live failed …` | Read the reason: `webrtcbin has no sink request pad` is the missing `gstreamer1.0-nice`; `camera busy` is the Arlo app viewing; `splice timeout` is no RTP from Arlo (firewall on UDP, try `ice_address_family = "ipv4"`). |
 | Live starts and drops after ~10 s | `live source stalled` | UDP to Arlo's TURN blocked after the handshake, or the camera's own network. |
 | Motion in front of the camera, nothing in the log | `camera trigger pulse` at `streamer_infra_arlo::events=debug`; `event for unconfigured camera` at `streamer_app::router=trace` | Motion detection or the armed mode is off in the Arlo app, or the camera's `arlo_device_id` is not in `[[cameras]]`. |
-| Idle frame is the synthetic STANDBY screen, never a photo | `thumbnail fetch failed` (or no `thumbnail applied to idle overlay`) | Arlo has no snapshot for the camera yet (one appears after the first motion), or the fetch failed for the reason logged. |
+| Idle frame is the synthetic STANDBY screen, never a photo | `thumbnail fetch failed` (or no `thumbnail applied to idle overlay`) | Arlo has no snapshot for the camera yet (one appears after the first motion), or the fetch failed for the reason logged; `refused: JPEG declares …` means the snapshot is over the 4096-pixel limit. |
 | `/metrics` or `/admin/*` unreachable from another host | nothing: the listener bound loopback | `metrics_bind` / `admin_bind` are `127.0.0.1` by default; see [Docker run](#docker-run). |
 | `401` on `/admin/*` | `admin: rejected unauthenticated request route=…` | Wrong or rotated `STREAMER_ADMIN_TOKEN`, or a missing `Bearer ` prefix. |
 | Relayed app view has no sound or no picture | `watch-along relay ended why=…` with a hex dump | Paste that line as it is in a bug report; it holds no secret. |
@@ -612,8 +612,11 @@ Releasing is therefore: bump `version` in `Cargo.toml`, move the
   restarting. Rejected requests are logged with their route, never the
   presented token.
 - Thumbnails are fetched over `https` only, with timeouts, a redirect
-  limit, a 2 MiB cap and a JPEG magic check, and written owner-only
-  beside the session cache. Presigned URLs, session ids and tokens are
+  limit and a 2 MiB cap, and written owner-only beside the session
+  cache. The JPEG header is read before anything decodes it: a frame
+  larger than 4096 pixels on a side is refused (a few KB can otherwise
+  declare a gigabyte of pixels), and a stored still that fails the check
+  is removed at boot. Presigned URLs, session ids and tokens are
   never logged.
 - Camera ids are validated at every boundary (`[A-Za-z0-9_-]{1,64}`); a
   bad `/admin/cameras/{id}` is answered `400`. The ops and admin

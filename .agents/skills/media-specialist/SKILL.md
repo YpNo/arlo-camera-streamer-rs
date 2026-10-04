@@ -47,8 +47,14 @@ Arlo-specific behaviour with the `live-validation` skill.
   every cancellation stops the pipeline through `Drop`. Keep `start` **cancel-safe** —
   the multiplexer drops it when a detector fires during setup (`setup_or_loss`).
 - `shutdown` is idempotent (`stopped` flag): the multiplexer calls it and `Drop` runs it.
-  It aborts tasks, posts `BUS_WATCH_STOP` **before** `set_state(Null)` (a flushing bus
-  drops posts and the bus thread would block forever), then goes to `Null`.
+  It aborts tasks, posts `BUS_WATCH_STOP`, then goes to `Null`. `owning` turns
+  `auto-flush-bus` off: READY → NULL flushed the bus and could drop the stop message
+  before the bus thread read it (that thread then waited forever).
+- `Drop` (a failed or cancelled `start`) hands the `Null` transition to
+  `spawn_blocking` when a runtime is around; inline otherwise.
+- `on-negotiation-needed` takes the element from the signal's `args[0]` and the
+  promise a `WeakRef`: a captured clone was a cycle that leaked every session's
+  webrtcbin and ICE thread (`install_negotiation_keeps_no_reference_to_its_webrtcbin`).
 - Detectors share one `LiveLossNotifier`, first wins: bus `ERROR`/`EOS`,
   `connection-state`/`ice-connection-state` `failed|closed` (`disconnected` only logs;
   it may recover), and the stall watchdog — spawned **after** the first RTP, never
@@ -73,8 +79,14 @@ Arlo-specific behaviour with the `live-validation` skill.
   passes `<session_cache_path dir>/thumbnails`, prepared owner-only by
   `prepare_thumbnail_dir` at boot), written through a `create_new` temp file and a
   rename — never the shared temp directory (sweep finding M4). The adapter fetching
-  it (`streamer-infra-arlo/thumbnails.rs`) is https-only, bounded (10 s, 2 MiB, two
-  redirects) and checks the JPEG magic, so gdk-pixbuf only ever loads our own JPEGs.
+  it (`streamer-infra-arlo/thumbnails.rs`) is https-only and bounded (10 s, 2 MiB, two
+  redirects). gdk-pixbuf decodes at the **declared** size, so both the fetch and
+  `refresh_thumbnail` run `streamer_domain::thumbnail::check_thumbnail` (SOFn header,
+  ≤ `MAX_THUMBNAIL_DIMENSION` = 4096 a side); `bring_up` removes a stored still that
+  fails it (`discard_unsafe_thumbnail`). Never decode under the registry lock or on the
+  RTSP server thread: `refresh_thumbnail` clones the overlay, drops the lock and loads in
+  `spawn_blocking`; the `media-configure` hook loads on a `thumbnail-load` thread
+  (`load_thumbnail_detached`).
 - Pin each branch's final caps in one capsfilter; keep launch strings as pure builders
   in `pipeline_desc.rs` with their constants beside them.
 - The three live appsrcs are bounded by `bound_appsrc` (`block=false` **and**
@@ -164,7 +176,12 @@ so a session can start with no media or outlive it.
 - Never `bus.add_watch_local()` inside `media-configure` ("no default main context");
   use `bus.set_sync_handler` for diagnostics, or a dedicated thread with `iter_timed`
   that exits on EOS or `BUS_WATCH_STOP`.
-- Signal closures hold `WeakRef`s to the pipeline/pads, never strong refs.
+- Signal closures and pad probes hold `WeakRef`s to the pipeline/pads/elements, never
+  strong refs; use the callback's own pad/element argument where there is one.
+- The live-switch probe (`arm_switch_probe`) keeps its id in `LiveWiring.live_switch`
+  (`PendingSwitch`): the probe and a detach race to `take()` it — the probe flips only
+  if it got the id, `detach_live_sink` removes it if it got the id
+  (`disarm_switch_probe`). The slot is locked while the probe is added.
 - `gupnp … 1900: Address already in use` at live start is harmless.
 - `GStreamer-WARNING … Sticky event misordering, got 'segment' before 'caps'` on
   `funnelN:src` / `rtpbin0:recv_rtcp_sink_N` is harmless: gst-rtsp-server logs it when a

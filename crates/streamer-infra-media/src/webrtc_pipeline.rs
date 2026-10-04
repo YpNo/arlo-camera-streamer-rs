@@ -106,7 +106,12 @@ impl WebrtcLive {
     /// Take ownership of `pipeline` before anything can fail, so every
     /// exit from [`start`](Self::start), cancellation included, shuts it
     /// down through `Drop`.
+    ///
+    /// The bus is not auto-flushed: READY → NULL would otherwise drop the
+    /// [`BUS_WATCH_STOP`] message `shutdown` posts before the bus-watch
+    /// thread has read it, and that thread would wait forever.
     fn owning(pipeline: gst::Pipeline) -> Self {
+        pipeline.set_auto_flush_bus(false);
         Self {
             pipeline,
             tasks: Vec::new(),
@@ -301,8 +306,26 @@ impl WebrtcLive {
 }
 
 impl Drop for WebrtcLive {
+    /// A failed or cancelled `start` drops the session on an async worker;
+    /// the `Null` transition blocks, so it moves to the blocking pool when
+    /// a runtime is around. No `Playing` can follow it: `build_offer` sets
+    /// that inline, inside the future being dropped.
     fn drop(&mut self) {
-        self.shutdown();
+        if self.stopped {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                self.stopped = true;
+                let mut rest = Self {
+                    pipeline: self.pipeline.clone(),
+                    tasks: std::mem::take(&mut self.tasks),
+                    stopped: false,
+                };
+                runtime.spawn_blocking(move || rest.shutdown());
+            }
+            Err(_) => self.shutdown(),
+        }
     }
 }
 
@@ -331,7 +354,8 @@ impl OfferBuilder for OfferGathering<'_> {
         self.pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| MediaError::Pipeline(format!("pipeline → Playing: {e}")))?;
-        spawn_bus_watch(self.pipeline, self.notifier.clone());
+        // Detached: the thread ends on the stop message `shutdown` posts.
+        let _ = spawn_bus_watch(self.pipeline, self.notifier.clone());
         let offer_sdp = tokio::time::timeout(OFFER_TIMEOUT, self.offer_rx.recv())
             .await
             .map_err(|_| MediaError::Pipeline("timed out gathering local offer".into()))?
@@ -622,9 +646,15 @@ fn link_video_appsink(
 /// Wire `on-negotiation-needed` → create-offer → set-local-description,
 /// then ship the full SDP once ICE gathering completes.
 fn install_negotiation(webrtcbin: &gst::Element, offer_tx: mpsc::UnboundedSender<String>) {
-    let wb = webrtcbin.clone();
-    webrtcbin.connect("on-negotiation-needed", false, move |_| {
-        let wb2 = wb.clone();
+    // The element comes from the signal's arguments: a clone captured by a
+    // closure connected on the element itself is a reference cycle, and
+    // every session leaked its webrtcbin and its ICE thread.
+    webrtcbin.connect("on-negotiation-needed", false, |args| {
+        let Some(wb) = args.first().and_then(|v| v.get::<gst::Element>().ok()) else {
+            warn!("on-negotiation-needed without its element");
+            return None;
+        };
+        let wb_weak = wb.downgrade();
         let promise = gst::Promise::with_change_func(move |reply| {
             let Ok(Some(reply)) = reply else {
                 warn!("create-offer failed");
@@ -634,12 +664,16 @@ fn install_negotiation(webrtcbin: &gst::Element, offer_tx: mpsc::UnboundedSender
                 warn!("create-offer reply missing offer");
                 return;
             };
+            let Some(wb) = wb_weak.upgrade() else {
+                debug!("webrtcbin gone before its offer was applied");
+                return;
+            };
             let applied = gst::Promise::with_change_func(|reply| {
                 if let Err(e) = sdp_outcome(reply) {
                     warn!(error = %e, "set-local-description failed");
                 }
             });
-            wb2.emit_by_name::<()>("set-local-description", &[&offer, &applied]);
+            wb.emit_by_name::<()>("set-local-description", &[&offer, &applied]);
         });
         wb.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
         None
@@ -690,9 +724,12 @@ fn spawn_keyframe_pump(
 /// Drain the pipeline bus; surface ERROR/EOS in the log and to the
 /// live-loss notifier. The thread ends at EOS or on the
 /// [`BUS_WATCH_STOP`] application message that `shutdown` posts.
-fn spawn_bus_watch(pipeline: &gst::Pipeline, notifier: LiveLossNotifier) {
-    let Some(bus) = pipeline.bus() else { return };
-    std::thread::spawn(move || {
+fn spawn_bus_watch(
+    pipeline: &gst::Pipeline,
+    notifier: LiveLossNotifier,
+) -> Option<std::thread::JoinHandle<()>> {
+    let bus = pipeline.bus()?;
+    Some(std::thread::spawn(move || {
         for msg in bus.iter_timed(gst::ClockTime::NONE) {
             use gst::MessageView as V;
             match msg.view() {
@@ -718,7 +755,7 @@ fn spawn_bus_watch(pipeline: &gst::Pipeline, notifier: LiveLossNotifier) {
             }
         }
         debug!("webrtcbin bus watch exited");
-    });
+    }))
 }
 
 /// Watch `webrtcbin`'s peer-connection and ICE state; a terminal state
@@ -769,5 +806,70 @@ mod tests {
         };
         apply_ice_address_family(&bin, IceAddressFamily::Ipv4);
         apply_ice_address_family(&bin, IceAddressFamily::Dual);
+    }
+
+    /// Poll `done` for up to 2 s.
+    fn eventually(done: impl Fn() -> bool) -> bool {
+        (0..200).any(|_| {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        })
+    }
+
+    /// The negotiation closure held a strong clone of the element it is
+    /// connected on: every session leaked its webrtcbin and ICE thread.
+    #[test]
+    fn install_negotiation_keeps_no_reference_to_its_webrtcbin() {
+        gst::init().ok();
+        let Ok(bin) = gst::ElementFactory::make("webrtcbin").build() else {
+            eprintln!("webrtcbin not available here; skipping");
+            return;
+        };
+        let (offer_tx, _offer_rx) = mpsc::unbounded_channel();
+        install_negotiation(&bin, offer_tx);
+        let weak = bin.downgrade();
+        drop(bin);
+        assert!(weak.upgrade().is_none(), "the webrtcbin must be freed");
+    }
+
+    /// READY → NULL used to flush the bus, losing a stop message the
+    /// watcher had not read yet; the thread then waited forever.
+    #[test]
+    fn bus_watch_reads_the_stop_message_even_after_the_pipeline_stopped() {
+        gst::init().ok();
+        let pipeline = gst::Pipeline::default();
+        let mut live = WebrtcLive::owning(pipeline.clone());
+        pipeline.set_state(gst::State::Ready).unwrap();
+        live.shutdown();
+
+        let (_session, notifier) = streamer_domain::stream::LiveSession::new();
+        let watcher = spawn_bus_watch(&pipeline, notifier).unwrap();
+        assert!(
+            eventually(|| watcher.is_finished()),
+            "the bus watch must exit on the stop message"
+        );
+    }
+
+    /// A failed or cancelled start drops the session on an async worker;
+    /// the `Null` transition moved to the blocking pool must still happen.
+    #[tokio::test]
+    async fn dropping_a_running_session_in_a_runtime_still_stops_the_pipeline() {
+        gst::init().ok();
+        let pipeline = gst::Pipeline::default();
+        let live = WebrtcLive::owning(pipeline.clone());
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        drop(live);
+
+        for _ in 0..200 {
+            if pipeline.current_state() == gst::State::Null {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the pipeline never reached Null");
     }
 }
