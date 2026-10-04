@@ -308,6 +308,8 @@ jobs:
         env:
           REF: ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
         run: |
+          # Lowercase for the same reason as the image names below.
+          REF=$(printf '%s' "$REF" | tr '[:upper:]' '[:lower:]')
           if docker manifest inspect "$REF" >/dev/null 2>&1; then
             echo "Image $REF exists."
             echo "missing=false" >> "$GITHUB_OUTPUT"
@@ -369,11 +371,15 @@ jobs:
           HUB_USER: ${{ vars.DOCKERHUB_USERNAME }}
           REPO_NAME: ${{ github.event.repository.name }}
         run: |
+          # OCI references must be lowercase; github.repository keeps the
+          # owner's case (YpNo), which buildx refuses in an image name.
           names="$GHCR"
           if [ -n "$HUB_USER" ]; then
             names="$names,docker.io/$HUB_USER/$REPO_NAME"
           fi
+          names=$(printf '%s' "$names" | tr '[:upper:]' '[:lower:]')
           echo "list=$names" >> "$GITHUB_OUTPUT"
+          echo "ghcr=${names%%,*}" >> "$GITHUB_OUTPUT"
           echo "Publishing to: $names"
       - name: Image labels
         id: meta
@@ -403,14 +409,14 @@ jobs:
       - name: Vulnerability report
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          image-ref: ${{ steps.names.outputs.ghcr }}@${{ steps.build.outputs.digest }}
           format: table
           severity: CRITICAL,HIGH
           exit-code: '0'
       - name: Vulnerability gate
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          image-ref: ${{ steps.names.outputs.ghcr }}@${{ steps.build.outputs.digest }}
           format: table
           severity: CRITICAL
           ignore-unfixed: true
@@ -463,11 +469,15 @@ jobs:
           HUB_USER: ${{ vars.DOCKERHUB_USERNAME }}
           REPO_NAME: ${{ github.event.repository.name }}
         run: |
+          # OCI references must be lowercase; github.repository keeps the
+          # owner's case (YpNo), which buildx refuses in an image name.
           names="$GHCR"
           if [ -n "$HUB_USER" ]; then
             names="$names,docker.io/$HUB_USER/$REPO_NAME"
           fi
+          names=$(printf '%s' "$names" | tr '[:upper:]' '[:lower:]')
           echo "list=$names" >> "$GITHUB_OUTPUT"
+          echo "ghcr=${names%%,*}" >> "$GITHUB_OUTPUT"
           echo "Publishing to: $names"
       - name: Tag the manifest lists
         env:
