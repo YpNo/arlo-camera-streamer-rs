@@ -83,6 +83,7 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, instrument, warn};
 
 use streamer_domain::camera::CameraId;
+use streamer_domain::thumbnail::check_thumbnail;
 
 use crate::encoder::EncoderBackend;
 use crate::error::MediaError;
@@ -134,7 +135,14 @@ struct LiveWiring {
     /// The relayed-audio `appsrc` (`live_aac_rtp_src`, ADR 0007) — AAC
     /// RTP from the app-view relay, decoded onto the mixer's third pad.
     aac_appsrc: Option<gst_app::AppSrc>,
+    /// The armed idle → live switch probe on `sink_live`, until it fires;
+    /// a detach before the first live frame removes it.
+    live_switch: PendingSwitch,
 }
+
+/// The id of a live-switch probe that has not fired yet. Whoever takes
+/// it — the probe on the first live frame, or a detach — owns the switch.
+type PendingSwitch = Arc<StdMutex<Option<gst::PadProbeId>>>;
 
 /// Active live ingestion bookkeeping.
 struct LiveSession {
@@ -307,6 +315,7 @@ impl GstPipelineRegistry {
             caption,
             thumbnail_path: thumb_path_for_cb,
         } = hooks;
+        discard_unsafe_thumbnail(&thumb_path_for_cb).await;
         let caption_for_cb = caption;
         let wiring_for_cb = wiring;
         let live_for_cb = live_active;
@@ -321,10 +330,8 @@ impl GstPipelineRegistry {
                         // media so a rebuild between live sessions keeps
                         // showing the thumbnail rather than reverting to
                         // the black STANDBY frame.
-                        if let Some(overlay) = &w.idle_overlay
-                            && thumb_path_for_cb.exists()
-                        {
-                            apply_thumbnail_overlay(overlay, &thumb_path_for_cb);
+                        if let Some(overlay) = &w.idle_overlay {
+                            load_thumbnail_detached(overlay.clone(), thumb_path_for_cb.clone());
                         }
                         if let (Some(text), Some(el)) =
                             (lock(&caption_for_cb).as_deref(), &w.idle_caption)
@@ -500,6 +507,12 @@ impl PipelineRegistry for GstPipelineRegistry {
 
         let wiring_snapshot = lock(&entry.wiring).clone();
         if let Some(wiring) = wiring_snapshot {
+            // A switch armed for a live frame that never came would
+            // otherwise wait on the pad (and fire on the next session's
+            // first frame out of turn).
+            if disarm_switch_probe(&wiring.sink_live, &wiring.live_switch) {
+                debug!("pending live switch removed: no live frame arrived");
+            }
             // Synchronous flip on the video selector: raw I420 frames
             // are independently complete, so any boundary works. A
             // force-key-unit on the encoder gives clients a clean IDR
@@ -529,28 +542,41 @@ impl PipelineRegistry for GstPipelineRegistry {
         // idle branch's `gdkpixbufoverlay` at it so the STANDBY screen
         // shows the last snapshot (Phase 5). The write is atomic
         // (temp + rename) so the overlay never reads a partial file.
+        // Whatever the source, gdk-pixbuf decodes at the declared size:
+        // the header is bounded before the file exists.
+        check_thumbnail(&jpeg).map_err(|e| MediaError::InvalidThumbnail(e.to_string()))?;
         let path = self.thumbnail_file_path(camera);
         write_thumbnail_atomic(&path, &jpeg).await?;
 
-        let mut guard = self.state.write().await;
-        let entry = guard
-            .get_mut(camera)
-            .ok_or_else(|| MediaError::UnknownCamera(camera.to_string()))?;
-        entry.last_thumbnail = Some(jpeg);
+        // Take the overlay under the lock, decode without it: the load
+        // blocks for the decode, and attach/detach of every camera wait
+        // on this lock.
+        let overlay = {
+            let mut guard = self.state.write().await;
+            let entry = guard
+                .get_mut(camera)
+                .ok_or_else(|| MediaError::UnknownCamera(camera.to_string()))?;
+            entry.last_thumbnail = Some(jpeg);
+            lock(&entry.wiring)
+                .as_ref()
+                .and_then(|w| w.idle_overlay.clone())
+        };
 
         // Apply to the running media if one is up. If no client has
         // connected yet the file is already in place and the overlay
         // is re-applied at the next `media-configure` (see `register`).
-        let wiring = lock(&entry.wiring).clone();
-        if let Some(overlay) = wiring.and_then(|w| w.idle_overlay) {
-            apply_thumbnail_overlay(&overlay, &path);
-            debug!(path = %path.display(), "thumbnail applied to idle overlay");
-        } else {
+        let Some(overlay) = overlay else {
             debug!(
                 path = %path.display(),
                 "thumbnail stored; no live overlay yet (applied on next media build)"
             );
-        }
+            return Ok(());
+        };
+        let shown = path.clone();
+        tokio::task::spawn_blocking(move || apply_thumbnail_overlay(&overlay, &shown))
+            .await
+            .map_err(|e| MediaError::Pipeline(format!("thumbnail load task failed: {e}")))?;
+        debug!(path = %path.display(), "thumbnail applied to idle overlay");
         Ok(())
     }
 
@@ -664,6 +690,7 @@ fn build_live_wiring(media: &RTSPMedia) -> Result<LiveWiring, MediaError> {
         idle_caption,
         audio_appsrc,
         aac_appsrc,
+        live_switch: PendingSwitch::default(),
     })
 }
 
@@ -825,27 +852,105 @@ fn apply_thumbnail_overlay(overlay: &gst::Element, path: &Path) {
     );
 }
 
-/// Install a single-shot pad probe on the live branch's selector
-/// sink pad; on the **first raw frame** it sets `active-pad = sink_1`,
+/// Load the idle still into a media being configured on a thread of its
+/// own: the `media-configure` hook runs on the RTSP server's thread, and
+/// a decode there (tens of ms for a 4K snapshot, more on a Pi) holds up
+/// the clients waiting on it. A missing file leaves the synthetic frame.
+fn load_thumbnail_detached(overlay: gst::Element, path: PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("thumbnail-load".to_string())
+        .spawn(move || {
+            if path.exists() {
+                apply_thumbnail_overlay(&overlay, &path);
+            }
+        });
+    if let Err(e) = spawned {
+        warn!(error = %e, "thumbnail load thread not started; idle frame stays synthetic");
+    }
+}
+
+/// Remove a still left by an earlier run that today's [`check_thumbnail`]
+/// refuses (it may predate the check): every media build would decode it
+/// until a refresh replaced it, and a refused refresh never does.
+async fn discard_unsafe_thumbnail(path: &Path) {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "stored thumbnail unreadable");
+            return;
+        }
+    };
+    let Err(reason) = check_thumbnail(&bytes) else {
+        return;
+    };
+    warn!(path = %path.display(), %reason, "stored thumbnail refused; removing it");
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        warn!(path = %path.display(), error = %e, "refused thumbnail not removed");
+    }
+}
+
+/// Arm the idle → live switch on the media `wiring` belongs to.
+fn arm_live_switch(wiring: &LiveWiring) {
+    arm_switch_probe(
+        &wiring.sink_live,
+        &wiring.selector,
+        &wiring.encoder,
+        &wiring.live_switch,
+    );
+}
+
+/// Install a single-shot pad probe on the live branch's selector sink
+/// pad; on the **first raw frame** it sets `active-pad` to that pad,
 /// dispatches a force-key-unit to the downstream encoder (so its next
 /// encoded frame is a fresh IDR after the content swap), and
 /// self-removes.
-fn arm_live_switch(wiring: &LiveWiring) {
-    let selector = wiring.selector.clone();
-    let sink_live = wiring.sink_live.clone();
-    let encoder = wiring.encoder.clone();
-    let fired = AtomicBool::new(false);
-    wiring
-        .sink_live
-        .add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
-            if fired.swap(true, Ordering::AcqRel) {
-                return gst::PadProbeReturn::Ok;
-            }
-            selector.set_property("active-pad", &sink_live);
+///
+/// The probe holds only weak references: it lives on a pad of the
+/// selector it flips, and a strong one kept the selector, its pads and
+/// the encoder alive after the media was torn down. Its id waits in
+/// `pending` so a detach before the first live frame removes it
+/// ([`disarm_switch_probe`]); a probe re-armed replaces the old one.
+fn arm_switch_probe(
+    sink_live: &gst::Pad,
+    selector: &gst::Element,
+    encoder: &gst::Element,
+    pending: &PendingSwitch,
+) {
+    let selector = selector.downgrade();
+    let encoder = encoder.downgrade();
+    let claim = Arc::clone(pending);
+    // Held while the probe is added, so a frame arriving at once waits
+    // for the id instead of finding the slot empty and skipping the flip.
+    let mut slot = lock(pending);
+    if let Some(old) = slot.take() {
+        sink_live.remove_probe(old);
+    }
+    *slot = sink_live.add_probe(gst::PadProbeType::BUFFER, move |pad, _info| {
+        // Taking the id claims the switch; an empty slot means a detach
+        // took it first and the camera is no longer live.
+        if lock(&claim).take().is_none() {
+            return gst::PadProbeReturn::Remove;
+        }
+        if let Some(selector) = selector.upgrade() {
+            selector.set_property("active-pad", pad);
+        }
+        if let Some(encoder) = encoder.upgrade() {
             force_keyframe(&encoder);
-            debug!("input-selector flipped to sink_1 (live); IDR forced on encoder");
-            gst::PadProbeReturn::Remove
-        });
+        }
+        debug!("input-selector flipped to sink_1 (live); IDR forced on encoder");
+        gst::PadProbeReturn::Remove
+    });
+}
+
+/// Remove a live-switch probe that has not fired yet. Returns whether
+/// there was one.
+fn disarm_switch_probe(sink_live: &gst::Pad, pending: &PendingSwitch) -> bool {
+    let Some(id) = lock(pending).take() else {
+        return false;
+    };
+    sink_live.remove_probe(id);
+    true
 }
 
 /// Dispatch a downstream `GstForceKeyUnit` event to the encoder so
@@ -1016,5 +1121,116 @@ mod tests {
             vec!["/guarded".to_string()],
             "a disarmed guard leaves the mount"
         );
+    }
+
+    /// An `input-selector` (not in a pipeline, streams not synchronised)
+    /// with an idle pad and a live pad, plus a stand-in encoder.
+    fn switch_fixture() -> Option<(gst::Element, gst::Pad, gst::Pad, gst::Element)> {
+        gst::init().ok();
+        let selector = gst::ElementFactory::make("input-selector")
+            .property("sync-streams", false)
+            .build()
+            .ok()?;
+        let encoder = gst::ElementFactory::make("identity").build().ok()?;
+        let sink_idle = selector.request_pad_simple("sink_%u")?;
+        let sink_live = selector.request_pad_simple("sink_%u")?;
+        selector.set_property("active-pad", &sink_idle);
+        Some((selector, sink_idle, sink_live, encoder))
+    }
+
+    fn active_pad(selector: &gst::Element) -> Option<gst::Pad> {
+        selector.property::<Option<gst::Pad>>("active-pad")
+    }
+
+    /// The probe lives on a pad of the selector it flips: strong refs in
+    /// it kept the selector, its pads and the encoder alive for good.
+    #[test]
+    fn live_switch_probe_keeps_no_reference_to_the_selector_or_encoder() {
+        let Some((selector, sink_idle, sink_live, encoder)) = switch_fixture() else {
+            eprintln!("input-selector not available here; skipping");
+            return;
+        };
+        let pending = PendingSwitch::default();
+        arm_switch_probe(&sink_live, &selector, &encoder, &pending);
+        let (selector_w, encoder_w) = (selector.downgrade(), encoder.downgrade());
+
+        drop((selector, sink_idle, sink_live, encoder));
+
+        assert!(selector_w.upgrade().is_none(), "the selector must be freed");
+        assert!(encoder_w.upgrade().is_none(), "the encoder must be freed");
+    }
+
+    #[test]
+    fn live_switch_flips_on_the_first_live_frame() {
+        let Some((selector, _sink_idle, sink_live, encoder)) = switch_fixture() else {
+            eprintln!("input-selector not available here; skipping");
+            return;
+        };
+        selector.set_state(gst::State::Paused).unwrap();
+        let pending = PendingSwitch::default();
+        arm_switch_probe(&sink_live, &selector, &encoder, &pending);
+
+        let _ = sink_live.chain(gst::Buffer::new());
+
+        assert_eq!(active_pad(&selector).as_ref(), Some(&sink_live));
+        assert!(lock(&pending).is_none(), "the fired probe released its id");
+        selector.set_state(gst::State::Null).unwrap();
+    }
+
+    /// An attach that failed before its first live frame left the probe
+    /// on the pad, where the next session's first frame fired it.
+    #[test]
+    fn disarmed_live_switch_never_flips() {
+        let Some((selector, sink_idle, sink_live, encoder)) = switch_fixture() else {
+            eprintln!("input-selector not available here; skipping");
+            return;
+        };
+        selector.set_state(gst::State::Paused).unwrap();
+        let pending = PendingSwitch::default();
+        arm_switch_probe(&sink_live, &selector, &encoder, &pending);
+
+        assert!(disarm_switch_probe(&sink_live, &pending));
+        assert!(!disarm_switch_probe(&sink_live, &pending), "only once");
+        assert_eq!(
+            Arc::strong_count(&pending),
+            1,
+            "the probe and its closure are removed from the pad"
+        );
+        let _ = sink_live.chain(gst::Buffer::new());
+
+        assert_eq!(active_pad(&selector).as_ref(), Some(&sink_idle));
+        selector.set_state(gst::State::Null).unwrap();
+    }
+
+    /// SOI and a baseline frame header declaring `width`×`height`.
+    fn jpeg_header(width: u16, height: u16) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08];
+        v.extend(height.to_be_bytes());
+        v.extend(width.to_be_bytes());
+        v
+    }
+
+    /// A still stored before the size check existed would be decoded at
+    /// every media build; registration removes it and keeps a sound one.
+    #[tokio::test]
+    async fn stored_thumbnail_declaring_a_huge_frame_is_removed() {
+        let dir = std::env::temp_dir().join(format!("thumb-discard-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let huge = dir.join("huge.jpg");
+        let sound = dir.join("sound.jpg");
+        tokio::fs::write(&huge, jpeg_header(12000, 12000))
+            .await
+            .unwrap();
+        tokio::fs::write(&sound, jpeg_header(1920, 1080))
+            .await
+            .unwrap();
+
+        discard_unsafe_thumbnail(&huge).await;
+        discard_unsafe_thumbnail(&sound).await;
+        discard_unsafe_thumbnail(&dir.join("missing.jpg")).await;
+
+        assert!(!huge.exists(), "the refused still is removed");
+        assert!(sound.exists(), "a sound still is kept");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- A thumbnail whose JPEG header declares more than 4096 pixels on a side
+  is refused at the fetch and again before it is stored: gdk-pixbuf
+  decodes at the declared size, and a 2.6 KB file could take about 1 GB.
+  A stored still that fails the check is removed when the camera
+  registers.
+
 ### Fixed
+- Every live session leaked its `webrtcbin` and ICE thread: the
+  negotiation callback held a strong reference to its own element.
+- The idle → live switch probe kept the selector and the encoder alive,
+  and one armed for a session that never sent a frame stayed on the pad;
+  it now holds weak references and a detach removes it.
+- The webrtcbin bus is no longer flushed on shutdown, which could drop
+  the stop message before the bus-watch thread read it and leave that
+  thread waiting forever.
+- A failed or cancelled live start stops its pipeline on the blocking
+  pool instead of an async worker thread.
+- Loading the idle thumbnail no longer holds the registry lock (every
+  camera's attach and detach waited on the decode) nor the RTSP server
+  thread that configures a new client's media.
 - SIGTERM (`docker stop`, `compose down`, systemd) now runs the graceful
   drain like Ctrl-C; it used to kill the process with the camera's live
   session still open, so the camera kept streaming on battery until Arlo

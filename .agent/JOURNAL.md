@@ -420,3 +420,21 @@ Tests:    seven regression tests, each checked to fail with its fix reverted;
 Open:     Next batch: long-running stability (webrtcbin/probe leaks,
           thumbnail decode limits). Optional, owner's call: let a user view
           leave BatteryProtect.
+
+## 2026-10-05 — Long-running stability: leaks, thumbnail decode
+Changed:  webrtcbin's negotiation closure takes its element from the signal
+          (the captured clone leaked every session's webrtcbin and ICE
+          thread); `auto-flush-bus` off so the bus-watch stop message is
+          never flushed; `Drop` stops the pipeline in `spawn_blocking`. The
+          live-switch probe holds weak refs and its id in `PendingSwitch`;
+          detach removes an unfired one. New `streamer_domain::thumbnail`
+          (JPEG SOFn header, ≤ 4096 a side) used by the fetch and by
+          `refresh_thumbnail`; stored stills that fail it are removed at
+          registration; the decode runs off the registry lock and off the
+          RTSP server thread. Orchestrator test for shutdown during a relay
+          setup (a Codecov gap on PR #6).
+Tests:    unit tests for each fix plus an integration test (refused crafted
+          thumbnail, client undisturbed); each checked to fail with its fix
+          reverted. Workspace green with STREAMER_REQUIRE_GST_IT=1.
+Open:     Thread/RSS growth over many sessions is for `scripts/measure.sh`
+          (Phase 1). Next sweep batch: relay trust (needs the TLS live gate).

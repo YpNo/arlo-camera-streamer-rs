@@ -318,6 +318,42 @@ async fn user_view_notice_switches_the_caption_without_interrupting_the_client()
     );
 }
 
+/// gdk-pixbuf decodes at the declared size: a 2.6 KB file declaring
+/// 12000×12000 took about 1 GB. The refresh refuses it before any decode,
+/// and the client keeps its picture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thumbnail_declaring_a_huge_frame_is_refused_without_disturbing_the_client() {
+    let _serial = SERIAL.lock().await;
+    if !gstreamer_ready() {
+        return;
+    }
+    let stack = Stack::new(WebrtcConfig::default());
+    stack.media.register(&stack.camera).await.expect("register");
+    let probe = RtspProbe::connect(&stack.url());
+    assert!(
+        eventually(PICTURE_TIMEOUT, || shows_idle(&probe)).await,
+        "client never showed the idle screen"
+    );
+
+    let mut crafted = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08];
+    crafted.extend(12000_u16.to_be_bytes());
+    crafted.extend(12000_u16.to_be_bytes());
+    crafted.resize(2669, 0);
+    let err = stack
+        .media
+        .refresh_thumbnail(&stack.camera, bytes::Bytes::from(crafted))
+        .await
+        .expect_err("a huge declared frame must be refused");
+
+    assert!(err.to_string().contains("12000x12000"), "{err}");
+    let frames = probe.frames();
+    assert!(
+        eventually(PICTURE_TIMEOUT, || probe.frames() > frames + 2).await,
+        "frames stopped after the refused thumbnail"
+    );
+    assert!(!probe.interrupted(), "the refusal interrupted the client");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_client_over_udp_joins_a_playing_media() {
     // With HLS on, the segmenter is always the first client, so every

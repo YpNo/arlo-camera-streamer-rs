@@ -29,6 +29,7 @@ use tracing::debug;
 use streamer_domain::camera::CameraId;
 use streamer_domain::error::DomainError;
 use streamer_domain::port::ArloThumbnailSource;
+use streamer_domain::thumbnail::check_thumbnail;
 
 use crate::error::arlo_to_domain;
 use crate::snapshot_cache::{SnapshotUrlCache, is_https_with_host};
@@ -45,8 +46,6 @@ pub const THUMBNAIL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Redirect hops followed. A presigned URL answers directly; one hop
 /// covers a bucket region redirect.
 pub const THUMBNAIL_MAX_REDIRECTS: usize = 2;
-/// JPEG start-of-image marker followed by the first segment marker.
-const JPEG_MAGIC: [u8; 3] = [0xFF, 0xD8, 0xFF];
 
 /// Build the HTTP client the thumbnail adapter fetches with: `https`
 /// only, bounded in time and in redirect hops. Shared across cameras so
@@ -115,7 +114,9 @@ impl ArloThumbnailSourceAdapter {
 }
 
 /// GET `url` and return its body once it is known to be a JPEG no
-/// larger than [`THUMBNAIL_MAX_BYTES`]. The URL must already be
+/// larger than [`THUMBNAIL_MAX_BYTES`] whose header declares a frame the
+/// idle overlay can decode safely ([`check_thumbnail`]: a small file can
+/// declare a gigabyte of pixels). The URL must already be
 /// validated; the client's policy (see [`http_client`]) bounds the
 /// request itself.
 async fn fetch_jpeg(
@@ -142,12 +143,12 @@ async fn fetch_jpeg(
         )));
     }
     let bytes = read_body_capped(resp, THUMBNAIL_MAX_BYTES, camera).await?;
-    if !bytes.starts_with(&JPEG_MAGIC) {
-        return Err(DomainError::AdapterTransport(format!(
-            "thumbnail for {camera} is not a JPEG ({} bytes)",
+    check_thumbnail(&bytes).map_err(|e| {
+        DomainError::AdapterTransport(format!(
+            "thumbnail for {camera} refused: {e} ({} bytes)",
             bytes.len()
-        )));
-    }
+        ))
+    })?;
     Ok(bytes)
 }
 
@@ -249,8 +250,17 @@ mod tests {
         CameraId::new("CAM1")
     }
 
+    /// SOI and a baseline frame header declaring `width`×`height`.
+    fn jpeg_header(width: u16, height: u16) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08];
+        v.extend(height.to_be_bytes());
+        v.extend(width.to_be_bytes());
+        v
+    }
+
+    /// A 640×480 JPEG header padded to `len` bytes.
     fn jpeg(len: usize) -> Vec<u8> {
-        let mut v = JPEG_MAGIC.to_vec();
+        let mut v = jpeg_header(640, 480);
         v.resize(len, 0);
         v
     }
@@ -307,6 +317,21 @@ mod tests {
         .await;
         let err = fetch_jpeg(&test_client(), &url, &cam()).await.unwrap_err();
         assert!(err.to_string().contains("not a JPEG"), "{err}");
+    }
+
+    /// A 2.6 KB file declaring 12000×12000 took about 1 GB to decode.
+    #[tokio::test]
+    async fn fetch_jpeg_rejects_a_jpeg_declaring_a_huge_frame() {
+        let mut body = jpeg_header(12000, 12000);
+        body.resize(2669, 0);
+        let url = one_shot_server(
+            "200 OK",
+            format!("Content-Length: {}\r\n", body.len()),
+            body,
+        )
+        .await;
+        let err = fetch_jpeg(&test_client(), &url, &cam()).await.unwrap_err();
+        assert!(err.to_string().contains("12000x12000"), "{err}");
     }
 
     #[tokio::test]
