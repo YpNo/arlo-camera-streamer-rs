@@ -21,7 +21,7 @@ this file records whether reality agreed. Update it after every live gate
 | Encoders `va`, `v4l2`, `nvenc` | **never** | written from element documentation; first run on the Frigate box. |
 | Several cameras at once | **never** | per-camera actors, unit-tested only. |
 | H.265 camera | **never** | code path present, the owner's camera sends H.264. |
-| Container image from the release workflow | **never** | first build on the merge that releases 0.1.0. |
+| Container image from the release workflow | **partial** | `v0.1.0` published for amd64 and arm64 (2026-10-04). Run under podman 2026-10-06 with a read-only root filesystem, no capabilities and caches on a tmpfs: clean up to the Arlo login (offline). The full run belongs to the Frigate box deployment (`docker-compose.yml`). |
 | `linux/arm64` image | **never run** | built by the release workflow since 2026-10-04 (`IMAGE_PLATFORMS` lists both platforms); running it on a Pi is still owed. |
 
 ## Status detail
