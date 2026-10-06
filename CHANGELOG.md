@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-06
+
+Fixes for long-running and battery behaviour found by the second security
+sweep, and a Compose deployment.
+
+### Added
+- `docker-compose.yml`: the published image with a 30 s stop grace period,
+  `restart: on-failure`, a named state volume, a read-only root filesystem
+  (caches on a tmpfs), all capabilities dropped, `no-new-privileges`,
+  rotated logs, and commented blocks for the VA-API, V4L2 and NVENC
+  encoders and the ops ports.
+
 ### Security
 - A thumbnail whose JPEG header declares more than 4096 pixels on a side
   is refused at the fetch and again before it is stored: gdk-pixbuf
@@ -319,5 +331,6 @@ First release: the daemon as validated on the owner's camera and box.
 - Documentation still described the retired SSE bus and a Chromium
   requirement; both are gone since the move to `arlo-rs` 0.2.0.
 
-[Unreleased]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/YpNo/arlo-camera-streamer-rs/releases/tag/v0.1.0

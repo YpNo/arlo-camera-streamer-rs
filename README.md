@@ -141,11 +141,11 @@ pipelines need, scanned with Trivy before it is tagged), to GitHub's
 registry and to Docker Hub:
 
 ```bash
-docker pull ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.0
+docker pull ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.1
 ```
 
 ```bash
-docker pull docker.io/ypno/arlo-camera-streamer-rs:v0.1.0
+docker pull docker.io/ypno/arlo-camera-streamer-rs:v0.1.1
 ```
 
 Tags: `v<version>` (pin this one), `latest` (the newest release), and
@@ -242,7 +242,7 @@ the OTP is typed on stdin:
 docker run --rm -it -e ARLO_PASSWORD -e ARLO_IMAP_PASSWORD \
   -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
   -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \
-  ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.0 list-devices --config /etc/arlo-streamer/streamer.toml
+  ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.1 list-devices --config /etc/arlo-streamer/streamer.toml
 ```
 
 It also warns about configured `arlo_device_id` values the account does
@@ -285,7 +285,7 @@ docker run -d \
   -e ARLO_PASSWORD \
   -e ARLO_IMAP_PASSWORD \
   -e STREAMER_ADMIN_TOKEN \
-  ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.0
+  ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.1
 ```
 
 Two things the image cannot do for you:
@@ -303,12 +303,33 @@ Two things the image cannot do for you:
 Add the encoder device your box has, and `video_encoder = "auto"` will
 use it: `--device /dev/dri` for an Intel/AMD GPU, `--device /dev/video11`
 on a Raspberry Pi 4 / Zero 2 / CM4, `--gpus all` with the NVIDIA
-container toolkit for NVENC. A Raspberry Pi 5 has no H.264 hardware
+container toolkit for NVENC. uid 10001 must be allowed to open the
+device: add the group that owns it on the host by number,
+`--group-add "$(getent group render | cut -d: -f3)"` (`video` on a Pi);
+without it the encoder fails its dry run and `auto` falls back to x264. A Raspberry Pi 5 has no H.264 hardware
 encoder; it runs x264 in software. The image sets
 `RUST_LOG=info,arlo_camera_streamer=info` on purpose, quieter than the
 binary's own default, because a container runs unattended for months; pass
 `-e RUST_LOG=…` to change it. The container `HEALTHCHECK` runs the binary's own `healthcheck`
 subcommand against `metrics_bind`.
+
+### Docker Compose
+
+[`docker-compose.yml`](./docker-compose.yml) runs the same image with the
+settings above built in: the 30 s stop grace period, `restart: on-failure`,
+a named state volume (no `chown` needed), a read-only root filesystem, no
+capabilities, rotated logs, and commented blocks for the hardware encoders
+and the ops ports. Its header lists the three files to prepare —
+`config/streamer.toml`, a `.env` with the secrets (gitignored), and the one
+interactive `list-devices` login:
+
+```bash
+docker compose run --rm arlo-camera-streamer list-devices --config /etc/arlo-streamer/streamer.toml
+```
+
+```bash
+docker compose up -d
+```
 
 ### Frigate integration
 

@@ -1,0 +1,87 @@
+# arlo-camera-streamer-rs — Compose deployment.
+#
+# Before the first `docker compose up -d`, next to this file:
+#
+#   1. config/streamer.toml — copy config/streamer.example.toml and fill in
+#      the account, the second factor and the [[cameras]] (their device ids
+#      come from step 3). Keep metrics_bind / admin_bind on 127.0.0.1 unless
+#      you publish those ports below.
+#   2. .env — the secrets, one per line (the file is gitignored; chmod 600):
+#        ARLO_PASSWORD=…
+#        ARLO_IMAP_PASSWORD=…     # only for an IMAP mailbox second factor
+#        STREAMER_ADMIN_TOKEN=…   # at least 16 bytes: openssl rand -hex 32
+#   3. The one interactive login, which pairs the second factor, stores the
+#      session in the state volume and lists the device ids:
+#        docker compose run --rm arlo-camera-streamer list-devices --config /etc/arlo-streamer/streamer.toml
+#
+# Then: docker compose up -d && docker compose logs -f
+# Stream URL: rtsp://<host>:8554/<stream_name>, or
+# rtsp://arlo-camera-streamer:8554/<stream_name> from a container on the
+# same Compose network (Frigate's go2rtc, for one).
+
+services:
+  arlo-camera-streamer:
+    # Pin a release; `latest` follows the newest one. Same image on
+    # docker.io/ypno/arlo-camera-streamer-rs. amd64 and arm64.
+    image: ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.1
+    container_name: arlo-camera-streamer
+    # A non-zero exit means the daemon stopped on its own (the Arlo event bus
+    # ended, a camera task died) after releasing every live session.
+    restart: on-failure
+    # SIGTERM drains: every live session is released first, but the whole
+    # drain can take longer than Docker's default 10 s before the kill.
+    stop_grace_period: 30s
+    env_file: .env
+    environment:
+      # Font and GStreamer caches on the tmpfs below: the root filesystem is
+      # read-only.
+      XDG_CACHE_HOME: /tmp/.cache
+      # The image logs at info; uncomment while setting up or debugging.
+      # RUST_LOG: info,arlo_camera_streamer=debug
+    volumes:
+      - ./config:/etc/arlo-streamer:ro
+      # Session cache and idle thumbnails (and HLS segments when
+      # [output.hls] is set). A named volume is created owned by the image's
+      # uid 10001; a host directory instead needs
+      # `sudo chown -R 10001:10001 <dir>` once.
+      - arlo-state:/var/lib/arlo-streamer
+    ports:
+      - "8554:8554"
+      # /metrics, /healthz, /readyz and /admin/*: only with metrics_bind /
+      # admin_bind set to 0.0.0.0 in the config. Keep the admin port off
+      # any untrusted network.
+      # - "127.0.0.1:9090:9090"
+      # - "127.0.0.1:9091:9091"
+    # Hardware H.264 encoder for video_encoder = "auto". Uncomment what the
+    # box has; the boot log names the winner: `video encoder (auto) encoder=…`.
+    # The device must be usable by uid 10001, so add the group that owns it
+    # on the host, by number: `getent group render` (VA-API) or
+    # `getent group video` (Raspberry Pi).
+    # devices:
+    #   - /dev/dri:/dev/dri            # Intel / AMD GPU (VA-API)
+    #   - /dev/video11:/dev/video11    # Raspberry Pi 4 / Zero 2 / CM4
+    # group_add:
+    #   - "993"                        # the host's render (or video) gid
+    # NVIDIA NVENC, with the NVIDIA container toolkit installed:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu, video]
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  arlo-state:

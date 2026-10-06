@@ -438,3 +438,18 @@ Tests:    unit tests for each fix plus an integration test (refused crafted
           reverted. Workspace green with STREAMER_REQUIRE_GST_IT=1.
 Open:     Thread/RSS growth over many sessions is for `scripts/measure.sh`
           (Phase 1). Next sweep batch: relay trust (needs the TLS live gate).
+
+## 2026-10-06 — Release 0.1.1 prepared; Compose deployment
+Changed:  version 0.1.1 (lockfile: workspace members only), CHANGELOG cut
+          with the fixes of #6 and #7. New `docker-compose.yml`: stop grace
+          30 s, restart on-failure, named state volume, read-only rootfs
+          with `XDG_CACHE_HOME` on a tmpfs, cap_drop ALL, no-new-privileges,
+          log rotation, commented VA-API/V4L2/NVENC and ops-port blocks.
+          README: Compose section; a device needs `group_add` (host gid) or
+          the encoder dry run fails and `auto` falls back to x264.
+Checked:  `docker compose config` (compose v5.6.0) on the file and on its
+          encoder blocks uncommented. The v0.1.0 image under podman,
+          read-only + no caps, offline: GStreamer init clean once the caches
+          point at the tmpfs (fontconfig errored without), up to the login.
+Open:     Merge → CI tags v0.1.1 and publishes both platforms; then the
+          Frigate box deployment and live gates (owner).
