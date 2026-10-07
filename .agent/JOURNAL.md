@@ -453,3 +453,15 @@ Checked:  `docker compose config` (compose v5.6.0) on the file and on its
           point at the tmpfs (fontconfig errored without), up to the login.
 Open:     Merge → CI tags v0.1.1 and publishes both platforms; then the
           Frigate box deployment and live gates (owner).
+
+## 2026-10-07 — v0.1.1 image blocked by the Trivy gate
+Cause:    CVE-2026-13221 and two more in `perl-base 5.36.0-7+deb12u3`
+          (CRITICAL, fixed in deb12u4 in bookworm-security). The newest
+          bookworm-slim (2026-10-05) still ships deb12u3, so a digest bump
+          would not help. The arm64 leg failed first; fail-fast cancelled
+          amd64. The GitHub release and tag v0.1.1 exist (d007ff7).
+Changed:  the runtime stage runs `apt-get upgrade` before the install.
+Checked:  runtime stage built locally (podman): perl-base deb12u4; Trivy
+          0.75.0 with the CI gate's settings: 0 vulnerabilities.
+Next:     merge → the release job sees no v0.1.1 image and builds it from
+          that commit (Dockerfile fix included; code identical to the tag).
