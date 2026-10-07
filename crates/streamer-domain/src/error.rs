@@ -58,11 +58,15 @@ impl DomainError {
     }
 }
 
-/// Drop control characters (newlines included) and truncate to
+/// Drop control characters (newlines included) and the invisible format
+/// characters that can reorder or split a log line, then truncate to
 /// [`MAX_REASON_BYTES`] on a character boundary, marking the cut.
 #[must_use]
 pub fn sanitize_reason(raw: &str) -> String {
-    let clean: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let clean: String = raw
+        .chars()
+        .filter(|&c| !c.is_control() && !is_invisible_format(c))
+        .collect();
     if clean.len() <= MAX_REASON_BYTES {
         return clean;
     }
@@ -71,6 +75,16 @@ pub fn sanitize_reason(raw: &str) -> String {
         cut -= 1;
     }
     format!("{}…", &clean[..cut])
+}
+
+/// Zero-width characters, the Unicode line and paragraph separators and
+/// the bidirectional overrides and isolates: none is a control character,
+/// and each can make a log line read as something else.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+    )
 }
 
 #[cfg(test)]
@@ -83,6 +97,10 @@ mod tests {
         assert_eq!(
             sanitize_reason("line\none\r\nforged\x1b[31m"),
             "lineoneforged[31m"
+        );
+        assert_eq!(
+            sanitize_reason("ok\u{2028}INFO forged\u{202E}desrever\u{200B}\u{2066}x\u{FEFF}"),
+            "okINFO forgeddesreverx"
         );
         let long = "é".repeat(MAX_REASON_BYTES);
         let cut = sanitize_reason(&long);

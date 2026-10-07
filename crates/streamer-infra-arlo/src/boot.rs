@@ -101,7 +101,7 @@ pub async fn boot(config: &ArloConfig) -> Result<Arc<ArloClient>, DomainError> {
                 .map_err(arlo_to_domain)?;
         }
         // Email-without-IMAP and SMS both resolve the OTP interactively.
-        MfaConfig::Email(_) | MfaConfig::Sms => {
+        MfaConfig::Email(_) | MfaConfig::Sms(_) => {
             client
                 .authenticate_with_handler(&rs_config, arlo_rs::client::mfa::StdinMfaHandler)
                 .await
@@ -185,7 +185,7 @@ fn resolve_secrets(config: &ArloConfig) -> Result<ResolvedSecrets, DomainError> 
                 None
             }
         }
-        MfaConfig::Sms | MfaConfig::Push(_) => None,
+        MfaConfig::Sms(_) | MfaConfig::Push(_) => None,
     };
     Ok(ResolvedSecrets {
         arlo_password,
@@ -248,7 +248,7 @@ fn build_arlo_rs_config(
             preferred_method: Some("email".to_string()),
             imap: None,
         },
-        (MfaConfig::Sms, _) => rs_config::MfaConfig {
+        (MfaConfig::Sms(_), _) => rs_config::MfaConfig {
             preferred_method: Some("sms".to_string()),
             imap: None,
         },
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn build_arlo_rs_config_sms_omits_imap() {
         let mut c = cfg_email_imap();
-        c.mfa = MfaConfig::Sms;
+        c.mfa = MfaConfig::Sms(streamer_domain::config::SmsMfaConfig::default());
         let rs_cfg = build_arlo_rs_config(&c, secrets_stdin(), "/tmp/session.json".to_string());
 
         let mfa = rs_cfg.mfa.expect("mfa present");
