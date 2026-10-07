@@ -279,7 +279,7 @@ Docker's default 10 s, after which the process is killed.
 docker run -d \
   --name arlo-camera-streamer \
   --stop-timeout 30 \
-  -p 8554:8554 -p 9090:9090 -p 9091:9091 \
+  -p 8554:8554 -p 127.0.0.1:9090:9090 -p 127.0.0.1:9091:9091 \
   -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
   -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \
   -e ARLO_PASSWORD \
@@ -296,9 +296,14 @@ Two things the image cannot do for you:
   needs nothing). Otherwise the boot fails on the session cache directory.
 - **`metrics_bind` and `admin_bind` default to `127.0.0.1`**, which inside
   the container is unreachable from the host even with `-p`. To scrape
-  metrics or call `/admin/*` from outside, set them to `0.0.0.0:9090` and
-  `0.0.0.0:9091` in the container's config and publish the ports; keep
-  the admin port off any untrusted network.
+  metrics or call `/admin/*` from the host, set them to `0.0.0.0:9090` and
+  `0.0.0.0:9091` in the container's config and publish the ports **on
+  `127.0.0.1`** as above (or on one LAN address for a Prometheus on
+  another machine). A bare `-p 9090:9090` listens on every interface,
+  and Docker's published ports bypass host firewalls such as ufw.
+  `/metrics` needs no token and tells anyone who reaches it your camera
+  ids and when each one saw motion or went live; keep the admin port off
+  any untrusted network.
 
 Add the encoder device your box has, and `video_encoder = "auto"` will
 use it: `--device /dev/dri` for an Intel/AMD GPU, `--device /dev/video11`
@@ -363,7 +368,7 @@ Stream URL pattern: `rtsp://<host>:<rtsp.bind>/<cameras.stream_name>`.
 | `GET /readyz`  (port 9090)            | None     | Ready iff started **and** Arlo bus connected. |
 | `GET /admin/state` (port 9091)        | Bearer   | System snapshot (JSON); per-camera state as the camera task last published it, so a camera mid-negotiation still answers (`activating`). |
 | `GET /admin/cameras/{id}` (port 9091) | Bearer   | Per-camera snapshot.                   |
-| `POST /admin/cameras/{id}/wake` (port 9091) | Bearer | Inject a synthetic motion event; `429` within 30 s of the previous session's end. Each activation also costs 15 s of the daily budget. |
+| `POST /admin/cameras/{id}/wake` (port 9091) | Bearer | Inject a synthetic motion event; `429` within 30 s of the previous session's end (or failed attempt). Each activation also costs 15 s of the daily budget, and needs 30 s of it left. |
 | `POST /admin/cameras/{id}/idle` (port 9091) | Bearer | Force the camera back to `Idle`. |
 
 ```bash

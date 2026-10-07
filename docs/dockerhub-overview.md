@@ -122,9 +122,13 @@ goes live within a few seconds.
 
 The metrics and admin listeners bind `127.0.0.1` *inside the container* by
 default, so publishing their ports alone exposes nothing. To reach them from
-outside, set `output.metrics_bind = "0.0.0.0:9090"` and
-`output.admin_bind = "0.0.0.0:9091"` in the config, and keep the admin port
-off any untrusted network.
+the host, set `output.metrics_bind = "0.0.0.0:9090"` and
+`output.admin_bind = "0.0.0.0:9091"` in the config and publish them on
+loopback: `-p 127.0.0.1:9090:9090 -p 127.0.0.1:9091:9091`. A bare
+`-p 9090:9090` listens on every interface, and Docker's published ports
+bypass host firewalls such as ufw. `/metrics` needs no token and reveals
+camera ids and motion activity; keep the admin port off any untrusted
+network.
 
 ### Hardware encoding
 

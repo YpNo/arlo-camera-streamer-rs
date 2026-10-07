@@ -4,7 +4,6 @@
 //! [`tokio_util::sync::CancellationToken`] passed to
 //! [`OpsServer::serve`] is cancelled.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
@@ -49,22 +48,19 @@ impl OpsServer {
             .with_state(self.state.clone())
     }
 
-    /// Bind and serve until `shutdown` is cancelled, with the default
+    /// Serve on `listener` (bound at boot, see [`crate::serve::bind`])
+    /// until `shutdown` is cancelled, with the default
     /// [`ServeLimits`](crate::serve::ServeLimits).
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::OpsError`] if the bind address is in use, the
-    /// listener cannot be created, or the server loop fails.
+    /// Returns [`crate::error::OpsError`] if the server loop fails.
     pub async fn serve(
         self,
-        addr: SocketAddr,
+        listener: tokio::net::TcpListener,
         shutdown: CancellationToken,
     ) -> Result<(), crate::error::OpsError> {
         let app = self.router();
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|source| crate::error::OpsError::Bind { addr, source })?;
         crate::serve::serve(
             "ops",
             listener,

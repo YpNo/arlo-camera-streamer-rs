@@ -5,7 +5,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum OpsError {
     /// Server failed to bind to the requested port.
-    #[error("failed to bind ops server to {addr}: {source}")]
+    #[error("failed to bind {addr}: {source}")]
     Bind {
         /// The address that we attempted to bind to.
         addr: SocketAddr,
