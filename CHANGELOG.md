@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The container image applies Debian's pending security updates when it
+  is built. The pinned base only gains them when Docker rebuilds it, and
+  the release gate refused the 0.1.1 image for a critical `perl-base`
+  vulnerability already fixed in `bookworm-security`. The `v0.1.1` image
+  is the first built this way.
+
 ## [0.1.1] - 2026-10-06
 
 Fixes for long-running and battery behaviour found by the second security

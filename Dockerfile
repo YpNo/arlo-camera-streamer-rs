@@ -78,7 +78,14 @@ LABEL org.opencontainers.image.source="https://github.com/YpNo/arlo-camera-strea
 # browser: its default transport is a Chrome-impersonating HTTP client
 # (verified live 2026-09-25). Bring `tini` as PID 1 so signals propagate
 # cleanly.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# `apt-get upgrade` first: the pinned base only gains Debian's security
+# fixes when Docker rebuilds it, every few weeks, and the release gate
+# refuses a CRITICAL vulnerability that already has a fixed package
+# (perl-base, 2026-10-06: fixed in bookworm-security, not yet in the
+# newest bookworm-slim). The digest still pins everything else.
+RUN apt-get update && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
         ca-certificates \
         tini \
         gstreamer1.0-plugins-base \
