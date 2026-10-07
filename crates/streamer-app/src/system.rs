@@ -17,7 +17,11 @@
 //! the token is not cancelled, cancels the token. The composition root
 //! waits on that token next to the signal handler, so the daemon stops
 //! as a whole (and exits non-zero) instead of running without a camera
-//! or without the event bus while `/readyz` keeps answering.
+//! or without the event bus while `/readyz` keeps answering. A panic is
+//! logged and counted ([`StreamerSystem::panic_counter`]) even during the
+//! drain, so a stop that lost a task still exits non-zero; a panicking
+//! orchestrator first releases its camera, since its own exit path
+//! (detach and teardown) never ran.
 //!
 //! # Channel sizing
 //!
@@ -32,13 +36,16 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use futures::FutureExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+use streamer_domain::camera::CameraId;
 
 use streamer_domain::config::StreamerConfig;
 use streamer_domain::error::DomainError;
@@ -56,6 +63,10 @@ use crate::router::EventRouter;
 /// Per-camera mailbox capacity. See module docs for sizing rationale.
 pub const MAILBOX_CAPACITY: usize = 32;
 
+/// How long a panicked orchestrator's camera release may take before the
+/// supervisor gives up on it.
+const PANIC_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Handle to a running streamer system. Keep it alive for the lifetime
 /// of the daemon; drop / call [`StreamerSystem::shutdown`] for graceful
 /// teardown.
@@ -67,6 +78,8 @@ pub struct StreamerSystem {
     /// Shared with the connection-status watcher in `streamer-bin` so
     /// the admin snapshot reflects current bus state.
     arlo_connected: Arc<AtomicBool>,
+    /// Tasks that panicked, during the run or the drain.
+    panics: Arc<AtomicUsize>,
 }
 
 impl StreamerSystem {
@@ -97,6 +110,7 @@ impl StreamerSystem {
         }
 
         let shutdown = CancellationToken::new();
+        let panics = Arc::new(AtomicUsize::new(0));
         let mut event_routes: HashMap<_, mpsc::Sender<CameraEvent>> = HashMap::new();
         let mut admin_routes: HashMap<_, AdminRoute> = HashMap::new();
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
@@ -136,13 +150,19 @@ impl StreamerSystem {
             handles.push(tokio::spawn(supervised(
                 "orchestrator",
                 camera_cfg.arlo_device_id.to_string(),
-                orch.run(),
+                release_on_panic(
+                    orch.run(),
+                    camera_cfg.arlo_device_id.clone(),
+                    media.clone(),
+                    signaler.clone(),
+                ),
                 shutdown.clone(),
+                panics.clone(),
             )));
         }
 
         let events = event_source.subscribe().await?;
-        let router = EventRouter::new(event_routes);
+        let router = EventRouter::new(event_routes, metrics.clone());
         // The router gets the shared token itself: an upstream end must
         // cancel the orchestrators too, which a child token cannot.
         handles.push(tokio::spawn(supervised(
@@ -150,6 +170,7 @@ impl StreamerSystem {
             "event-bus".to_string(),
             router.run(events, shutdown.clone()),
             shutdown.clone(),
+            panics.clone(),
         )));
 
         let arlo_connected = Arc::new(AtomicBool::new(false));
@@ -161,6 +182,7 @@ impl StreamerSystem {
             shutdown,
             admin,
             arlo_connected,
+            panics,
         })
     }
 
@@ -206,6 +228,14 @@ impl StreamerSystem {
         self.arlo_connected.clone()
     }
 
+    /// How many tasks panicked so far, the drain included. Take it before
+    /// [`Self::shutdown`] and read it after: a stop that lost a task must
+    /// not report success.
+    #[must_use]
+    pub fn panic_counter(&self) -> Arc<AtomicUsize> {
+        self.panics.clone()
+    }
+
     /// Cancel all tasks and wait for them to drain. Idempotent.
     pub async fn shutdown(self) {
         info!("shutting down streamer system");
@@ -231,20 +261,65 @@ impl StreamerSystem {
 /// not expect — cancels the shared token so the daemon stops as a whole
 /// instead of running without that actor. An exit after the token was
 /// cancelled is the normal shutdown and stays quiet.
-async fn supervised<F>(task: &'static str, name: String, fut: F, shutdown: CancellationToken)
-where
+async fn supervised<F>(
+    task: &'static str,
+    name: String,
+    fut: F,
+    shutdown: CancellationToken,
+    panics: Arc<AtomicUsize>,
+) where
     F: Future<Output = ()>,
 {
     let outcome = AssertUnwindSafe(fut).catch_unwind().await;
+    // A panic is reported whatever the token says: one during the drain
+    // used to vanish, and the process exited 0 with a session maybe open.
+    if outcome.is_err() {
+        panics.fetch_add(1, Ordering::Relaxed);
+        error!(task, %name, "task panicked");
+    }
     if shutdown.is_cancelled() {
         return;
     }
     if outcome.is_ok() {
         warn!(task, %name, "task ended while the system is running; stopping the system");
     } else {
-        error!(task, %name, "task panicked; stopping the system");
+        error!(task, %name, "stopping the system after the panic");
     }
     shutdown.cancel();
+}
+
+/// Run an orchestrator; if it panics, release its camera (detach the live
+/// source, tear the Arlo session down) before passing the panic on. Its
+/// own exit path never ran, and a session left open keeps the camera
+/// streaming on battery. Both calls are idempotent, so releasing a camera
+/// that was idle costs nothing.
+async fn release_on_panic<F>(
+    fut: F,
+    camera: CameraId,
+    media: Arc<dyn MediaMultiplexer>,
+    signaler: Arc<dyn WebrtcSignaler>,
+) where
+    F: Future<Output = ()>,
+{
+    let Err(panic) = AssertUnwindSafe(fut).catch_unwind().await else {
+        return;
+    };
+    error!(%camera, "orchestrator panicked; releasing its camera");
+    let release = async {
+        if let Err(e) = media.detach_live(&camera).await {
+            warn!(%camera, error = %e, "detach after the panic failed");
+        }
+        if let Err(e) = signaler.teardown(&camera).await {
+            warn!(%camera, error = %e, "teardown after the panic failed");
+        }
+    };
+    if tokio::time::timeout(PANIC_RELEASE_TIMEOUT, release)
+        .await
+        .is_err()
+    {
+        warn!(%camera, "camera release after the panic timed out");
+    }
+    std::panic::resume_unwind(panic);
 }
 
 #[cfg(test)]
@@ -304,7 +379,10 @@ mod tests {
         }
     }
 
-    struct StubSignaler;
+    #[derive(Default)]
+    struct StubSignaler {
+        teardowns: AtomicUsize,
+    }
     #[async_trait]
     impl WebrtcSignaler for StubSignaler {
         async fn negotiate(
@@ -318,6 +396,7 @@ mod tests {
             })
         }
         async fn teardown(&self, _camera: &CameraId) -> Result<(), DomainError> {
+            self.teardowns.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -346,6 +425,7 @@ mod tests {
     #[derive(Default)]
     struct StubMedia {
         notifiers: std::sync::Mutex<Vec<streamer_domain::stream::LiveLossNotifier>>,
+        detaches: AtomicUsize,
     }
     #[async_trait]
     impl MediaMultiplexer for StubMedia {
@@ -379,6 +459,7 @@ mod tests {
             Ok(session)
         }
         async fn detach_live(&self, _camera: &CameraId) -> Result<(), DomainError> {
+            self.detaches.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
         async fn refresh_thumbnail(
@@ -433,7 +514,7 @@ mod tests {
         let err = StreamerSystem::spawn_no_metrics(
             &cfg,
             Arc::new(StubEventSource),
-            Arc::new(StubSignaler),
+            Arc::new(StubSignaler::default()),
             Arc::new(StubThumbnails),
             Arc::new(StubMedia::default()),
             Arc::new(StubUserViews),
@@ -449,7 +530,7 @@ mod tests {
         let err = StreamerSystem::spawn_no_metrics(
             &cfg,
             Arc::new(FailingEventSource),
-            Arc::new(StubSignaler),
+            Arc::new(StubSignaler::default()),
             Arc::new(StubThumbnails),
             Arc::new(StubMedia::default()),
             Arc::new(StubUserViews),
@@ -465,7 +546,7 @@ mod tests {
         let system = StreamerSystem::spawn_no_metrics(
             &cfg,
             Arc::new(StubEventSource),
-            Arc::new(StubSignaler),
+            Arc::new(StubSignaler::default()),
             Arc::new(StubThumbnails),
             Arc::new(StubMedia::default()),
             Arc::new(StubUserViews),
@@ -489,7 +570,7 @@ mod tests {
         let system = StreamerSystem::spawn_no_metrics(
             &cfg,
             Arc::new(EndingEventSource),
-            Arc::new(StubSignaler),
+            Arc::new(StubSignaler::default()),
             Arc::new(StubThumbnails),
             Arc::new(StubMedia::default()),
             Arc::new(StubUserViews),
@@ -509,21 +590,37 @@ mod tests {
     #[tokio::test]
     async fn supervised_cancels_the_token_when_the_task_panics() {
         let token = CancellationToken::new();
+        let panics = Arc::new(AtomicUsize::new(0));
         supervised(
             "test",
             "panicking".to_string(),
             async { panic!("simulated actor bug") },
             token.clone(),
+            panics.clone(),
         )
         .await;
         assert!(token.is_cancelled());
+        assert_eq!(panics.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn supervised_cancels_the_token_when_the_task_ends_early() {
         let token = CancellationToken::new();
-        supervised("test", "quitting".to_string(), async {}, token.clone()).await;
+        let panics = Arc::new(AtomicUsize::new(0));
+        supervised(
+            "test",
+            "quitting".to_string(),
+            async {},
+            token.clone(),
+            panics.clone(),
+        )
+        .await;
         assert!(token.is_cancelled());
+        assert_eq!(
+            panics.load(Ordering::Relaxed),
+            0,
+            "an early end is not a panic"
+        );
     }
 
     #[tokio::test]
@@ -532,7 +629,69 @@ mod tests {
         let inner = token.clone();
         let task = async move { inner.cancelled().await };
         token.cancel();
-        supervised("test", "draining".to_string(), task, token.clone()).await;
+        let panics = Arc::new(AtomicUsize::new(0));
+        supervised(
+            "test",
+            "draining".to_string(),
+            task,
+            token.clone(),
+            panics.clone(),
+        )
+        .await;
         assert!(token.is_cancelled());
+        assert_eq!(panics.load(Ordering::Relaxed), 0);
+    }
+
+    /// A panic during the drain used to return before anything looked at
+    /// it: no log, and the process exited 0.
+    #[tokio::test]
+    async fn supervised_counts_a_panic_during_the_drain() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let panics = Arc::new(AtomicUsize::new(0));
+        supervised(
+            "test",
+            "drain-panic".to_string(),
+            async { panic!("panic in handle_shutdown") },
+            token,
+            panics.clone(),
+        )
+        .await;
+        assert_eq!(panics.load(Ordering::Relaxed), 1);
+    }
+
+    /// A panicking orchestrator never runs its own exit path, so the
+    /// supervisor releases the camera before passing the panic on.
+    #[tokio::test]
+    async fn release_on_panic_detaches_and_tears_down_then_rethrows() {
+        let media = Arc::new(StubMedia::default());
+        let signaler = Arc::new(StubSignaler::default());
+        let outcome = AssertUnwindSafe(release_on_panic(
+            async { panic!("adapter bug while live") },
+            CameraId::new("CAM"),
+            media.clone(),
+            signaler.clone(),
+        ))
+        .catch_unwind()
+        .await;
+
+        assert!(outcome.is_err(), "the panic is passed on to the supervisor");
+        assert_eq!(media.detaches.load(Ordering::Relaxed), 1);
+        assert_eq!(signaler.teardowns.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn release_on_panic_leaves_a_normal_exit_alone() {
+        let media = Arc::new(StubMedia::default());
+        let signaler = Arc::new(StubSignaler::default());
+        release_on_panic(
+            async {},
+            CameraId::new("CAM"),
+            media.clone(),
+            signaler.clone(),
+        )
+        .await;
+        assert_eq!(media.detaches.load(Ordering::Relaxed), 0);
+        assert_eq!(signaler.teardowns.load(Ordering::Relaxed), 0);
     }
 }

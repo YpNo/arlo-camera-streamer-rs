@@ -30,6 +30,7 @@ impl MetricsRecorder for NoopRecorder {
     fn record_splice(&self, _camera: &CameraId, _outcome: SpliceOutcome, _latency_ms: u64) {}
 
     fn record_failure(&self, _camera: &CameraId, _retries: u32) {}
+    fn record_dropped_event(&self, _camera: &CameraId) {}
 }
 
 #[cfg(test)]

@@ -76,6 +76,8 @@ pub struct Metrics {
     /// Per-camera retry counter — incremented each time we enter
     /// `Failed { retries }` (so the rate gives transient-failure rate).
     retries_total: IntCounterVec,
+    /// Bus events dropped per camera because its mailbox was full.
+    events_dropped_total: IntCounterVec,
 }
 
 /// All possible state labels emitted on `streamer_camera_state`.
@@ -177,6 +179,14 @@ impl Metrics {
             &["camera"],
         )?;
 
+        let events_dropped_total = IntCounterVec::new(
+            opts!(
+                "streamer_events_dropped_total",
+                "Bus events dropped per camera because its mailbox was full."
+            ),
+            &["camera"],
+        )?;
+
         registry.register(Box::new(arlo_connected.clone()))?;
         registry.register(Box::new(cameras_configured_g.clone()))?;
         registry.register(Box::new(started_at.clone()))?;
@@ -189,6 +199,7 @@ impl Metrics {
         registry.register(Box::new(splice_attempts_total.clone()))?;
         registry.register(Box::new(splice_latency_ms.clone()))?;
         registry.register(Box::new(retries_total.clone()))?;
+        registry.register(Box::new(events_dropped_total.clone()))?;
 
         // Set the constants once; these don't change at runtime.
         cameras_configured_g.set(i64::from(cameras_configured));
@@ -210,6 +221,7 @@ impl Metrics {
             splice_attempts_total,
             splice_latency_ms,
             retries_total,
+            events_dropped_total,
         })
     }
 
@@ -322,6 +334,12 @@ impl MetricsRecorder for Metrics {
 
     fn record_failure(&self, camera: &CameraId, _retries: u32) {
         self.retries_total
+            .with_label_values(&[camera.as_str()])
+            .inc();
+    }
+
+    fn record_dropped_event(&self, camera: &CameraId) {
+        self.events_dropped_total
             .with_label_values(&[camera.as_str()])
             .inc();
     }

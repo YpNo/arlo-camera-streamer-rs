@@ -86,7 +86,7 @@ use streamer_domain::port::{
 use streamer_domain::state::{CameraState, LiveLossReason, LiveSource, StateTransition};
 use streamer_domain::stream::LiveSession;
 
-use crate::budget::{BudgetVerdict, LiveBudgetTracker};
+use crate::budget::{BudgetVerdict, LiveBudgetTracker, Moment};
 use crate::debouncer::{DebouncerVerdict, MotionDebouncer};
 #[cfg(test)]
 use crate::metrics_noop::NoopRecorder;
@@ -107,9 +107,10 @@ const USER_VIEW_RETRY: Duration = Duration::from_secs(30);
 /// report came 0.34 to 0.8 s after our `TEARDOWN` over four live gates
 /// (2026-10-01/02); the grace is what viewers see as the gap.
 const USER_VIEW_PROBE_GRACE: Duration = Duration::from_secs(2);
-/// A manual wake is refused this long after the previous session ended:
-/// an admin script alternating wake and idle would otherwise negotiate a
-/// WebRTC call every few seconds for next to no quota.
+/// A manual wake is refused this long after the previous session or
+/// activation attempt ended: an admin script alternating wake and idle, or
+/// a wake that keeps failing, would otherwise negotiate a WebRTC call
+/// every few seconds for next to no quota.
 const ADMIN_WAKE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// How long a failed update of the idle frame's user-view notice waits
 /// before it is tried again by time. Without it a past notice expiry
@@ -120,6 +121,10 @@ const SHUTDOWN_DURING_ACTIVATION: &str = "shutdown during activation";
 /// Quota charged for the activation itself (wake-up, negotiation), so
 /// short sessions still cost the battery they really cost.
 const ACTIVATION_SURCHARGE_SECS: i64 = 15;
+/// The shortest session worth waking the camera for. An activation needs
+/// the surcharge plus this much quota left, or the camera would be woken
+/// and negotiated only to be cut at once.
+const MIN_USEFUL_SESSION_SECS: i64 = 15;
 
 /// Per-camera state-machine task.
 pub struct CameraOrchestrator {
@@ -131,6 +136,10 @@ pub struct CameraOrchestrator {
     budget: LiveBudgetTracker,
     /// Set when in [`CameraState::Failed`]; cleared on transition out.
     failed_deadline: Option<Instant>,
+    /// When `BatteryProtect` ends, fixed on entry. Recomputing it from the
+    /// wall clock at every loop let any event push it a day ahead once
+    /// the wall clock had passed the boundary before the monotonic sleep.
+    battery_reset_at: Option<Instant>,
     /// Entries into [`CameraState::Failed`] since the last session that
     /// came up; sizes the backoff. The reducer starts every fresh
     /// `Failed` at 0, so a gateway failing each motion pulse would be
@@ -171,8 +180,8 @@ pub struct CameraOrchestrator {
     /// How often a relay lets go of the stream to learn whether the app
     /// still views (`user_view_probe_secs`); `None` never probes.
     probe_interval: Option<Duration>,
-    /// When the last live session ended; a manual wake within
-    /// [`ADMIN_WAKE_MIN_INTERVAL`] of it is refused.
+    /// When the last live session or activation attempt ended; a manual
+    /// wake within [`ADMIN_WAKE_MIN_INTERVAL`] of it is refused.
     last_session_end: Option<Instant>,
     /// Until when, after a probe, the camera's `idle` report is awaited
     /// in `Idle`; `None` outside a probe.
@@ -245,6 +254,7 @@ impl CameraOrchestrator {
             budget,
             failed_deadline: None,
             failure_streak: 0,
+            battery_reset_at: None,
             live: None,
             user_view_until: None,
             user_view_notice: false,
@@ -491,7 +501,7 @@ impl CameraOrchestrator {
                 let by_debouncer = self.debouncer.next_deadline(now());
                 let by_budget = self
                     .budget
-                    .remaining(Local::now().naive_local())
+                    .remaining(moment())
                     .and_then(|left| left.to_std().ok())
                     .map(|left| now() + left);
                 match (by_debouncer, by_budget) {
@@ -500,16 +510,22 @@ impl CameraOrchestrator {
                 }
             }
             CameraState::Failed { .. } => self.failed_deadline,
-            CameraState::BatteryProtect { .. } => {
-                let wall = Local::now().naive_local();
-                let next_reset = self.budget.next_reset(wall);
-                // Round *up*: firing before the wall-clock boundary would
-                // poll the tracker on the old day and bounce straight
-                // back into BatteryProtect.
-                let delta_ms = (next_reset - wall).num_milliseconds().max(0);
-                Some(now() + Duration::from_millis(u64::try_from(delta_ms).unwrap_or(0) + 1))
-            }
+            CameraState::BatteryProtect { .. } => Some(
+                self.battery_reset_at
+                    .unwrap_or_else(|| self.battery_reset_deadline()),
+            ),
         }
+    }
+
+    /// The monotonic instant of the next wall-clock budget reset. Rounded
+    /// *up*: firing before the boundary would poll the tracker on the old
+    /// day.
+    fn battery_reset_deadline(&self) -> Instant {
+        let wall = now_local();
+        let delta_ms = (self.budget.next_reset(wall) - wall)
+            .num_milliseconds()
+            .max(0);
+        now() + Duration::from_millis(u64::try_from(delta_ms).unwrap_or(0) + 1)
     }
 
     async fn handle_event(&mut self, event: CameraEvent) -> Result<(), DomainError> {
@@ -594,7 +610,16 @@ impl CameraOrchestrator {
                 .record_motion(&self.camera_id, MotionOutcome::Absorbed);
             return None;
         }
-        let signal = self.intercept_budget(StateTransition::MotionDetected);
+        let mut signal = self.intercept_budget(StateTransition::MotionDetected);
+        // The quota is back although the reset deadline has not fired yet
+        // (a wall clock ahead of the monotonic sleep): leave BatteryProtect
+        // now; the next pulse activates.
+        if matches!(self.state, CameraState::BatteryProtect { .. })
+            && signal == StateTransition::MotionDetected
+        {
+            info!("daily budget available again; leaving battery-protect");
+            signal = StateTransition::BudgetReset;
+        }
         // Prime the debouncer only where a session can start or extend,
         // and only for a pulse the budget let through: a pulse refused in
         // `Idle`, or one in BatteryProtect / Failed, would leave a stale
@@ -739,7 +764,22 @@ impl CameraOrchestrator {
         if !matches!(signal, StateTransition::MotionDetected) {
             return signal;
         }
-        match self.budget.poll(Local::now().naive_local()) {
+        let too_little_to_start = |remaining: &chrono::Duration| {
+            *remaining
+                < chrono::Duration::seconds(ACTIVATION_SURCHARGE_SECS + MIN_USEFUL_SESSION_SECS)
+        };
+        match self.budget.poll(moment()) {
+            BudgetVerdict::Available { remaining }
+                if self.state == CameraState::Idle && too_little_to_start(&remaining) =>
+            {
+                debug!(
+                    remaining_secs = remaining.num_seconds(),
+                    "quota left is below an activation's cost; not waking the camera"
+                );
+                self.metrics
+                    .record_budget(&self.camera_id, BudgetDecision::Denied);
+                StateTransition::BudgetExhausted
+            }
             BudgetVerdict::Exhausted => {
                 self.metrics
                     .record_budget(&self.camera_id, BudgetDecision::Denied);
@@ -793,7 +833,7 @@ impl CameraOrchestrator {
                 self.relay_release_signal()
             }
             CameraState::Live => {
-                if self.budget.poll(Local::now().naive_local()) == BudgetVerdict::Exhausted {
+                if self.budget.poll(moment()) == BudgetVerdict::Exhausted {
                     info!("daily live budget exhausted mid-session; releasing the camera");
                     self.metrics
                         .record_budget(&self.camera_id, BudgetDecision::Denied);
@@ -807,7 +847,16 @@ impl CameraOrchestrator {
                 }
             }
             CameraState::Failed { .. } => StateTransition::BackoffElapsed,
-            CameraState::BatteryProtect { .. } => StateTransition::BudgetReset,
+            CameraState::BatteryProtect { .. } => {
+                // The monotonic sleep ended before the wall clock reached
+                // the boundary (it ran slow, or was stepped back): wait for
+                // the boundary again rather than reset on the old day.
+                if self.budget.poll(moment()) == BudgetVerdict::Exhausted {
+                    self.battery_reset_at = Some(self.battery_reset_deadline());
+                    return Ok(());
+                }
+                StateTransition::BudgetReset
+            }
             CameraState::Activating => return Ok(()),
         };
         self.process_signals(VecDeque::from([signal])).await
@@ -839,6 +888,12 @@ impl CameraOrchestrator {
             if let CameraState::Failed { retries, .. } = &to {
                 self.failed_deadline = Some(now() + backoff_duration(*retries));
             }
+            self.battery_reset_at = match &to {
+                CameraState::BatteryProtect { .. } => self
+                    .battery_reset_at
+                    .or_else(|| Some(self.battery_reset_deadline())),
+                _ => None,
+            };
             self.probe_until = match (&to, &signal) {
                 (CameraState::Idle, StateTransition::UserViewProbe) => {
                     Some(now() + USER_VIEW_PROBE_GRACE)
@@ -923,13 +978,14 @@ impl CameraOrchestrator {
                     self.relay_deadline = Some(now() + segment);
                 } else {
                     self.debouncer.on_live_attached(now());
-                    self.budget.on_live_started(Local::now().naive_local());
+                    self.budget.on_live_started(moment());
                 }
             }
             // Attach refused because the user watches in the Arlo app (or,
             // defensively, the quota ran out mid-negotiation): release
             // whatever the attempt left behind, no backoff.
             (CameraState::Activating, CameraState::Idle | CameraState::BatteryProtect { .. }) => {
+                self.last_session_end = Some(now());
                 let _ = self.media.detach_live(&self.camera_id).await;
                 self.stop_arlo_live().await;
                 self.debouncer.on_idle();
@@ -941,9 +997,12 @@ impl CameraOrchestrator {
             }
             // Anywhere → Failed (transient error).
             (CameraState::Activating | CameraState::Live, CameraState::Failed { .. }) => {
+                // A failed attempt starts the manual-wake interval too, or a
+                // wake that keeps failing could repeat every backoff.
+                self.last_session_end = Some(now());
                 let _ = self.media.detach_live(&self.camera_id).await;
                 self.stop_arlo_live().await;
-                self.budget.on_live_ended(Local::now().naive_local());
+                self.budget.on_live_ended(moment());
                 self.debouncer.on_idle();
             }
             // Failed → Idle (backoff elapsed; ready to retry).
@@ -1078,7 +1137,7 @@ impl CameraOrchestrator {
         }
         self.stop_arlo_live().await;
         if self.session_source != Some(LiveSource::UserView) {
-            self.budget.on_live_ended(Local::now().naive_local());
+            self.budget.on_live_ended(moment());
         }
         self.debouncer.on_idle();
         self.refresh_idle_thumbnail().await;
@@ -1111,7 +1170,7 @@ impl CameraOrchestrator {
             if let Err(e) = self.media.detach_live(&self.camera_id).await {
                 warn!(error = %e, "detach on shutdown failed");
             }
-            self.budget.on_live_ended(Local::now().naive_local());
+            self.budget.on_live_ended(moment());
         }
         // Always release any upstream session (also covers `Activating`
         // mid-negotiation) — idempotent; a leaked WebRTC session keeps
@@ -1136,6 +1195,15 @@ impl CameraOrchestrator {
 /// clock.
 fn now() -> Instant {
     tokio::time::Instant::now().into_std()
+}
+
+/// Now, on both clocks: the wall clock for the budget's daily window, the
+/// orchestrator's monotonic clock (paused in tests) for durations.
+fn moment() -> Moment {
+    Moment {
+        wall: now_local(),
+        mono: now(),
+    }
 }
 
 /// Sleep until `deadline` or block forever when `None`. Used inside
@@ -2800,28 +2868,29 @@ mod tests {
     // ---------- Online events ignored ----------
 
     /// The quota used to be checked only when motion arrived, so a session
-    /// started with seconds left ran its full window. The budget counts
-    /// wall-clock time, which a paused test cannot move, so the cut is
-    /// exercised through a quota the activation surcharge alone exhausts:
-    /// the session is cut as soon as it is live.
+    /// started with seconds left ran its full window. Billing is monotonic
+    /// now, so the paused test clock spends the quota for real.
     #[tokio::test(start_paused = true)]
     async fn live_session_is_cut_when_the_daily_budget_runs_out() {
-        let cfg = camera_cfg_budget(300, 300, 10);
+        // 60 s quota: the activation charges 15, the session gets the 45 left.
+        let cfg = camera_cfg_budget(300, 300, 60);
         let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
         let media = RecordingMedia::new();
         let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
         let handle = tokio::spawn(orch.run());
 
         send(&tx, motion()).await;
-        tokio::task::yield_now().await;
-        let calls = media.calls().await;
+        tokio::time::advance(Duration::from_secs(40)).await;
+        settle().await;
         assert!(
-            calls.iter().any(|c| matches!(c, MediaCall::AttachLive(_))),
-            "{calls:?}"
+            !media.calls().await.contains(&MediaCall::DetachLive),
+            "5 s of quota left: still live"
         );
+        tokio::time::advance(Duration::from_secs(6)).await;
+        settle().await;
         assert!(
-            calls.contains(&MediaCall::DetachLive),
-            "cut right after attach: {calls:?}"
+            media.calls().await.contains(&MediaCall::DetachLive),
+            "cut when the quota ran out, not at the 300 s cooldown"
         );
         assert_eq!(sr.stop_count().await, 1, "teardown paired with detach");
         // BatteryProtect: a new pulse starts nothing.
@@ -2833,40 +2902,119 @@ mod tests {
     }
 
     /// Each activation costs 15 s of quota even when the session itself is
-    /// short, so wake/idle churn drains the quota, not the camera.
+    /// short, and one is refused unless the surcharge plus a useful session
+    /// (30 s) is left: the camera used to be woken only to be cut at once.
     #[tokio::test(start_paused = true)]
-    async fn activation_surcharge_makes_short_sessions_spend_quota() {
-        // 20 s quota: the first activation charges 15 (5 left, session runs),
-        // the second charges 15 more (30 > 20, cut at once), the third is refused.
-        let cfg = camera_cfg_budget(1, 300, 20);
+    async fn activation_needs_the_surcharge_plus_a_useful_session_left() {
+        // 50 s quota, 1 s cooldown: each session costs 15 + 1. After two,
+        // 18 s are left, below the 30 an activation needs.
+        let cfg = camera_cfg_budget(1, 300, 50);
         let sr = StubSignaler::with_responses(vec![Ok(ok_answer()), Ok(ok_answer())]);
         let media = RecordingMedia::new();
         let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
         let handle = tokio::spawn(orch.run());
 
-        send(&tx, motion()).await;
-        assert_eq!(sr.call_count().await, 1);
-        tokio::time::advance(Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
-        assert!(
-            media.calls().await.contains(&MediaCall::DetachLive),
-            "cooldown ended it"
-        );
+        for expected_calls in [1, 2] {
+            send(&tx, motion()).await;
+            assert_eq!(sr.call_count().await, expected_calls);
+            tokio::time::advance(Duration::from_secs(2)).await;
+            settle().await;
+            assert!(
+                media.calls().await.contains(&MediaCall::DetachLive),
+                "cooldown ended it"
+            );
+        }
 
         send(&tx, motion()).await;
-        tokio::task::yield_now().await;
         assert_eq!(
             sr.call_count().await,
             2,
-            "5 s left: the second pulse still activates"
-        );
-        assert!(
-            media.calls().await.contains(&MediaCall::DetachLive),
-            "and is cut by the surcharge"
+            "18 s left: the camera is not woken"
         );
 
-        send(&tx, motion()).await;
-        assert_eq!(sr.call_count().await, 2, "BatteryProtect refuses the third");
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    /// The reset deadline was recomputed from the wall clock at every loop:
+    /// once the wall clock had passed the boundary ahead of the monotonic
+    /// sleep, any event moved it a day further.
+    #[tokio::test(start_paused = true)]
+    async fn battery_protect_keeps_the_reset_deadline_it_entered_with() {
+        let cfg = camera_cfg_budget(60, 300, 10);
+        let (mut orch, _tx, _token) = build(
+            &cfg,
+            StubSignaler::with_responses(vec![]),
+            RecordingMedia::new(),
+        );
+        orch.process_signals(VecDeque::from([StateTransition::BudgetExhausted]))
+            .await
+            .unwrap();
+        let deadline = orch.next_deadline();
+        assert!(deadline.is_some());
+
+        tokio::time::advance(Duration::from_mins(5)).await;
+
+        assert_eq!(orch.next_deadline(), deadline, "not recomputed");
+    }
+
+    /// The reset deadline has not fired yet but the quota is back (a wall
+    /// clock ahead of the monotonic sleep): a pulse leaves `BatteryProtect`.
+    #[tokio::test(start_paused = true)]
+    async fn pulse_in_battery_protect_with_the_quota_back_resets() {
+        let cfg = camera_cfg_budget(60, 300, 3600);
+        let (mut orch, _tx, _token) = build(
+            &cfg,
+            StubSignaler::with_responses(vec![]),
+            RecordingMedia::new(),
+        );
+        orch.state = CameraState::BatteryProtect {
+            reset_in: Duration::ZERO,
+        };
+
+        assert_eq!(
+            orch.motion_signal("motion"),
+            Some(StateTransition::BudgetReset)
+        );
+        assert_eq!(
+            orch.debouncer.next_deadline(now()),
+            None,
+            "the reset pulse does not prime the debouncer"
+        );
+    }
+
+    /// Only a session that ended armed the manual-wake interval, so a wake
+    /// that kept failing could be repeated after each 1 s backoff.
+    #[tokio::test(start_paused = true)]
+    async fn failed_activation_starts_the_manual_wake_interval() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![Err(DomainError::AdapterTransport(
+            "gateway".to_string(),
+        ))]);
+        let media = RecordingMedia::new();
+        let (orch, _tx, admin_tx, token) = build_with_admin(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        let wake = |admin_tx: &mpsc::Sender<crate::admin::AdminCommand>| {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let tx = admin_tx.clone();
+            async move {
+                tx.send(crate::admin::AdminCommand::ManualWake { reply })
+                    .await
+                    .unwrap();
+                rx.await.unwrap()
+            }
+        };
+        assert_eq!(wake(&admin_tx).await, WakeOutcome::Accepted);
+        settle().await; // the attach fails
+        tokio::time::advance(backoff_duration(0) + Duration::from_millis(100)).await;
+        settle().await; // the backoff ends
+
+        assert!(
+            matches!(wake(&admin_tx).await, WakeOutcome::TooSoon { .. }),
+            "the failed attempt counts like a session"
+        );
+        assert_eq!(sr.call_count().await, 1);
 
         token.cancel();
         handle.await.unwrap();
