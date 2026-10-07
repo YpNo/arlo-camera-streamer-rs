@@ -37,3 +37,4 @@ url                   = { workspace = true }
 [dev-dependencies]
 # Enables tokio's `test-util` (paused clock) for the setup-race tests.
 tokio-test = { workspace = true }
+rcgen      = { workspace = true }

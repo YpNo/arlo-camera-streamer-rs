@@ -850,7 +850,12 @@ async fn resync(
                 Err(e) => return Err(format!("resync read: {e}")),
             }
         }
-        if let Some((channel, len)) = frame_header_at(&window, channels, stats.rtp_pt) {
+        // A header whose length is shorter than the bytes already read
+        // after it is not a frame boundary: taking it shrank the buffer
+        // below what was probed and the slice panicked.
+        if let Some((channel, len)) = frame_header_at(&window, channels, stats.rtp_pt)
+            .filter(|&(_, len)| len >= window.len() - INTERLEAVED_HEADER_LEN)
+        {
             stats.record_resync(&skipped);
             let mut payload = window.split_off(INTERLEAVED_HEADER_LEN);
             let probed = payload.len();
@@ -955,8 +960,11 @@ async fn read_text_line(io: &mut Reader, buf: &mut Vec<u8>) -> Result<(), String
 }
 
 /// Header lines up to the empty line, at most `MAX_HEADERS` of them.
+/// Every line counts, with a colon or not: lines without one used to be
+/// read and dropped uncounted, so the stated limit did not hold.
 async fn read_headers(io: &mut Reader) -> Result<Vec<(String, String)>, String> {
     let mut headers = Vec::new();
+    let mut lines = 0_usize;
     loop {
         let mut raw = Vec::new();
         read_text_line(io, &mut raw).await?;
@@ -968,9 +976,10 @@ async fn read_headers(io: &mut Reader) -> Result<Vec<(String, String)>, String> 
         if h.is_empty() {
             return Ok(headers);
         }
-        if headers.len() >= MAX_HEADERS {
+        if lines >= MAX_HEADERS {
             return Err(format!("more than {MAX_HEADERS} headers"));
         }
+        lines += 1;
         if let Some((k, v)) = h.split_once(':') {
             headers.push((k.trim().to_string(), v.trim().to_string()));
         }
@@ -1324,17 +1333,38 @@ fn audio_track(sdp: &str) -> Option<AudioTrack> {
     }
     let width =
         |key: &str, default: u32| param(key).and_then(|v| v.parse().ok()).unwrap_or(default);
-    Some(AudioTrack {
+    let format = AacRtpFormat {
+        clock_rate,
+        channels,
+        config: valid_aac_config(param("config")?)?,
+        size_length: width("sizelength", AAC_HBR_SIZE_LENGTH),
+        index_length: width("indexlength", AAC_HBR_INDEX_LENGTH),
+        index_delta_length: width("indexdeltalength", AAC_HBR_INDEX_LENGTH),
+    };
+    plausible_aac(&format).then(|| AudioTrack {
         control: control.unwrap_or_else(|| "*".to_string()),
-        format: AacRtpFormat {
-            clock_rate,
-            channels,
-            config: valid_aac_config(param("config")?)?,
-            size_length: width("sizelength", AAC_HBR_SIZE_LENGTH),
-            index_length: width("indexlength", AAC_HBR_INDEX_LENGTH),
-            index_delta_length: width("indexdeltalength", AAC_HBR_INDEX_LENGTH),
-        },
+        format,
     })
+}
+
+/// AAC sampling rates accepted from an SDP (the `AudioSpecificConfig`
+/// table spans 7350 to 96000 Hz).
+const AAC_CLOCK_RATES: std::ops::RangeInclusive<u32> = 7350..=96_000;
+/// Most audio channels accepted (the `AudioSpecificConfig` maximum).
+const MAX_AAC_CHANNELS: u32 = 8;
+/// Bit widths RFC 3640 allows for the AU size and index fields.
+const AAC_SIZE_LENGTHS: std::ops::RangeInclusive<u32> = 1..=16;
+const AAC_INDEX_LENGTHS: std::ops::RangeInclusive<u32> = 0..=8;
+
+/// Whether the SDP's numbers make sense for the depayloader. They reach
+/// its caps unchecked otherwise, `0` included; out of range, the audio
+/// track is left out and the video relayed alone.
+fn plausible_aac(format: &AacRtpFormat) -> bool {
+    AAC_CLOCK_RATES.contains(&format.clock_rate)
+        && (1..=MAX_AAC_CHANNELS).contains(&format.channels)
+        && AAC_SIZE_LENGTHS.contains(&format.size_length)
+        && AAC_INDEX_LENGTHS.contains(&format.index_length)
+        && AAC_INDEX_LENGTHS.contains(&format.index_delta_length)
 }
 
 /// Longest `config=` (`AudioSpecificConfig` hex) accepted from an SDP.
@@ -1985,5 +2015,138 @@ mod tests {
             panic!("plaintext rtsp to a remote host was accepted");
         };
         assert!(err.to_string().contains("plaintext"), "{err}");
+    }
+
+    /// A crafted RTCP `$` header one byte into the 16 bytes handed over by
+    /// the bare-AAC path: its length (8) is below the 11 bytes already
+    /// read after it, and the resync panicked the read task.
+    #[tokio::test]
+    async fn resync_skips_a_header_shorter_than_the_bytes_already_read() {
+        let mut carried = vec![0x80, b'$', 1, 0, 8, 0x80, 200];
+        carried.resize(BARE_AAC_HEAD_LEN, 0);
+        let mut reader = reader_fed_with(&[]);
+        let mut stats = FrameStats::default();
+
+        let outcome = resync(&mut reader, carried, both_tracks(), &mut stats).await;
+
+        assert!(
+            matches!(outcome, Ok(Incoming::Closed)),
+            "no panic, end of stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_headers_counts_lines_without_a_colon() {
+        let mut flood = b"RTSP/1.0 200 OK\r\n".to_vec();
+        for i in 0..(MAX_HEADERS + 10) {
+            flood.extend_from_slice(format!("junk-{i}\r\n").as_bytes());
+        }
+        flood.extend_from_slice(b"\r\n");
+        let mut reader = reader_fed_with(&flood);
+        let err = match read_response(&mut reader).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("colon-less lines count against the limit too"),
+        };
+        assert!(err.contains("headers"), "{err}");
+    }
+
+    /// Any u32 reached the depayloader caps, `0` included.
+    #[test]
+    fn audio_track_with_implausible_numbers_is_left_out() {
+        for (from, to) in [
+            ("MPEG4-GENERIC/16000/1", "MPEG4-GENERIC/0/1"),
+            ("MPEG4-GENERIC/16000/1", "MPEG4-GENERIC/16000/0"),
+            ("MPEG4-GENERIC/16000/1", "MPEG4-GENERIC/16000/64"),
+            ("sizelength=13", "sizelength=0"),
+            ("indexlength=3", "indexlength=4000000000"),
+        ] {
+            let sdp = SDP.replace(from, to);
+            assert_ne!(sdp, SDP, "fixture holds {from}");
+            assert!(audio_track(&sdp).is_none(), "{to} must leave the track out");
+        }
+        assert!(audio_track(SDP).is_some());
+    }
+
+    // ---------- Watch-along certificate verifier ----------
+
+    fn test_ca() -> rcgen::CertifiedIssuer<'static, rcgen::KeyPair> {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        rcgen::CertifiedIssuer::self_signed(params, rcgen::KeyPair::generate().unwrap()).unwrap()
+    }
+
+    fn leaf_of(
+        ca: &rcgen::CertifiedIssuer<'_, rcgen::KeyPair>,
+        expired: bool,
+    ) -> CertificateDer<'static> {
+        let mut params =
+            rcgen::CertificateParams::new(vec!["watch-along.example".to_string()]).unwrap();
+        if expired {
+            params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+        }
+        let key = rcgen::KeyPair::generate().unwrap();
+        params.signed_by(&key, ca).unwrap().der().clone()
+    }
+
+    fn verifier_trusting(
+        ca: &CertificateDer<'static>,
+        pinned: Option<[u8; 32]>,
+    ) -> WatchAlongVerifier {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.clone()).unwrap();
+        let chain = WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .build()
+        .unwrap();
+        WatchAlongVerifier { chain, pinned }
+    }
+
+    /// The relay dials a raw IP, as Arlo's watch-along URLs do.
+    fn verify(
+        v: &WatchAlongVerifier,
+        cert: &CertificateDer<'_>,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let ip = ServerName::IpAddress(std::net::IpAddr::from([203, 0, 113, 7]).into());
+        v.verify_server_cert(cert, &[], &ip, &[], UnixTime::now())
+    }
+
+    /// Only the name mismatch of a raw-IP dial is waived.
+    #[test]
+    fn verifier_accepts_a_trusted_chain_on_a_raw_ip() {
+        let ca = test_ca();
+        let v = verifier_trusting(ca.der(), None);
+        assert!(verify(&v, &leaf_of(&ca, false)).is_ok());
+    }
+
+    #[test]
+    fn verifier_refuses_a_chain_it_does_not_trust() {
+        let (trusted, other) = (test_ca(), test_ca());
+        let v = verifier_trusting(trusted.der(), None);
+        assert!(
+            verify(&v, &leaf_of(&other, false)).is_err(),
+            "unknown issuer"
+        );
+        assert!(verify(&v, other.der()).is_err(), "self-signed");
+    }
+
+    #[test]
+    fn verifier_refuses_an_expired_certificate() {
+        let ca = test_ca();
+        let v = verifier_trusting(ca.der(), None);
+        assert!(verify(&v, &leaf_of(&ca, true)).is_err());
+    }
+
+    /// A pin replaces the chain check: the pinned certificate passes even
+    /// self-signed, any other fails even with a trusted chain.
+    #[test]
+    fn verifier_with_a_pin_accepts_that_certificate_only() {
+        let ca = test_ca();
+        let pinned_leaf = test_ca();
+        let v = verifier_trusting(ca.der(), Some(cert_sha256(pinned_leaf.der())));
+        assert!(verify(&v, pinned_leaf.der()).is_ok());
+        assert!(verify(&v, &leaf_of(&ca, false)).is_err());
     }
 }

@@ -31,6 +31,8 @@ use std::thread::JoinHandle;
 /// A home deployment has a handful; the cap stops a client flood from
 /// growing the pool without bound.
 pub const MAX_RTSP_SESSIONS: u32 = 64;
+/// How long [`RtspServer::start`] waits for its main loop to dispatch.
+const LOOP_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 use gstreamer::glib;
 use gstreamer_rtsp_server::prelude::*;
@@ -57,6 +59,12 @@ impl RtspServer {
     /// Start an RTSP server bound to `host:port` and attach to the
     /// default main context. A dedicated thread runs the main loop so
     /// incoming clients are dispatched independently of Tokio.
+    ///
+    /// Returns only once the loop is dispatching: a [`Self::stop`] that
+    /// came before the loop ran was lost (`quit` on a loop not running
+    /// yet does nothing), and dropping the server then joined a thread
+    /// that never ended — a boot that failed right after this call hung
+    /// the process instead of exiting.
     ///
     /// `bind` accepts the same syntax as the TOML `[output.rtsp] bind`
     /// field (e.g. `"0.0.0.0:8554"`).
@@ -86,6 +94,12 @@ impl RtspServer {
             .map_err(|e| MediaError::Rtsp(format!("RTSPServer::attach failed: {e}")))?;
 
         let main_loop = glib::MainLoop::new(None, false);
+        // Dispatched by the loop once it runs: proof that a later `quit`
+        // will be seen.
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        glib::idle_add_once(move || {
+            let _ = ready_tx.send(());
+        });
         let loop_for_thread = main_loop.clone();
         let join = std::thread::Builder::new()
             .name("arlo-rtsp-loop".to_string())
@@ -95,6 +109,13 @@ impl RtspServer {
                 debug!("rtsp main loop exited");
             })
             .map_err(|e| MediaError::Rtsp(format!("failed to spawn main-loop thread: {e}")))?;
+        if ready_rx.recv_timeout(LOOP_START_TIMEOUT).is_err() {
+            main_loop.quit();
+            return Err(MediaError::Rtsp(format!(
+                "rtsp main loop did not start within {} s",
+                LOOP_START_TIMEOUT.as_secs()
+            )));
+        }
 
         info!(host = %host, port = %port, "rtsp server started");
         Ok(Arc::new(Self {

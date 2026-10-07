@@ -212,7 +212,7 @@ fn build_hls_branch(name: &StreamName, hls: &HlsOutput) -> HlsBranchConfig {
         ),
         target_duration: hls.effective_segment_secs(),
         playlist_length,
-        max_files: playlist_length + HLS_SEGMENTS_BEYOND_PLAYLIST,
+        max_files: playlist_length.saturating_add(HLS_SEGMENTS_BEYOND_PLAYLIST),
         dir,
     }
 }

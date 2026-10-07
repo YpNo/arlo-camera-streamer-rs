@@ -318,6 +318,32 @@ async fn user_view_notice_switches_the_caption_without_interrupting_the_client()
     );
 }
 
+/// A stop right after the start used to be lost when the loop thread had
+/// not entered `run()` yet; the drop then joined it for ever and a boot
+/// failing at that point hung instead of exiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rtsp_server_stopped_right_after_start_drops_promptly() {
+    let _serial = SERIAL.lock().await;
+    if !gstreamer_ready() {
+        return;
+    }
+    for _ in 0..20 {
+        let server = streamer_infra_media::RtspServer::start("127.0.0.1:0").expect("rtsp server");
+        server.stop();
+        // A detached thread, not `spawn_blocking`: if the drop hangs, the
+        // test must fail, not leave the runtime waiting on it for ever.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(server);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the loop thread must end"
+        );
+    }
+}
+
 /// gdk-pixbuf decodes at the declared size: a 2.6 KB file declaring
 /// 12000×12000 took about 1 GB. The refresh refuses it before any decode,
 /// and the client keeps its picture.

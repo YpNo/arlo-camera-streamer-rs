@@ -67,7 +67,9 @@ impl From<MediaError> for DomainError {
         match err {
             MediaError::UnknownCamera(c) => Self::UnknownCamera(c),
             MediaError::Signaling(e) => e,
-            other => Self::AdapterTransport(other.to_string()),
+            // Sanitized: a webrtcbin rejection reason can quote the
+            // gateway's SDP, and the text reaches the log and /admin.
+            other => Self::adapter_transport(other.to_string()),
         }
     }
 }
@@ -143,5 +145,19 @@ mod tests {
         let err = MediaError::InvalidThumbnail("not a JPEG".to_string());
         let domain: DomainError = err.into();
         assert!(matches!(domain, DomainError::AdapterTransport(_)));
+    }
+
+    /// The reason used to reach the log and `/admin` with whatever the
+    /// gateway's SDP held, newlines included.
+    #[test]
+    fn media_errors_are_sanitized_on_their_way_to_the_domain() {
+        let err = MediaError::Pipeline("rejected\na=ice-pwd:x\u{202E}".to_string());
+        let DomainError::AdapterTransport(reason) = err.into() else {
+            panic!("adapter transport expected");
+        };
+        assert!(
+            !reason.contains('\n') && !reason.contains('\u{202E}'),
+            "{reason:?}"
+        );
     }
 }
