@@ -634,19 +634,30 @@ GitHub Actions workflows live in [`.github/workflows/`](./.github/workflows/).
 The `ci.yml` pipeline is staged: format → clippy → tests (with the GStreamer
 integration tests) → coverage gate (86 %; raised deliberately, never above
 what is held) and SonarCloud, with the rustdoc check beside the tests and
-cargo-deny in parallel. A failed stage skips the costlier ones, docs-only
-changes do not run it, the weekly schedule runs cargo-deny only, and
-Renovate's PRs skip coverage and SonarCloud. After every gate, a push to
-`main` whose `Cargo.toml` version has no release yet gets a GitHub release
-tagged `v<version>`, then the container image for that version: built per
-platform on native runners, each platform scanned with Trivy (a fixable
-CRITICAL finding stops the release), pushed by digest, and tagged
-`v<version>`, `latest` and `sha-<commit>` on `ghcr.io/ypno/arlo-camera-streamer-rs`
-and on `docker.io/ypno/arlo-camera-streamer-rs` (Docker Hub needs the
-repository variable `DOCKERHUB_USERNAME` and the secret `DOCKERHUB_TOKEN`;
-without them GHCR alone is published). A push without a version bump
-publishes nothing, and no crate is ever published: the workspace is
-`publish = false`.
+cargo-deny (a checksum-pinned binary) in parallel. A failed stage skips
+the costlier ones, docs-only changes do not run it, the weekly schedule
+runs cargo-deny only, and Renovate's PRs skip coverage and SonarCloud.
+`secret-scan.yml` runs gitleaks (checksum-pinned, rules in
+`.gitleaks.toml`) on every push and PR, docs included, over every commit
+the push brings (merged side branches too), and weekly over the whole
+history.
+
+After every gate, a push to `main` whose `Cargo.toml` version has no
+release yet gets a GitHub release tagged `v<version>`, then the container
+image for that version, built from the tag's commit: per platform on
+native runners, into a local archive scanned with Trivy before any
+registry login (a fixable CRITICAL or HIGH finding stops the release;
+reviewed exceptions go in `.trivyignore`), then pushed by digest and
+tagged `v<version>`, `latest` and `sha-<commit>` on
+`ghcr.io/ypno/arlo-camera-streamer-rs` and on
+`docker.io/ypno/arlo-camera-streamer-rs` (Docker Hub needs the repository
+variable `DOCKERHUB_USERNAME` and the secret `DOCKERHUB_TOKEN`; without
+them GHCR alone is published). A version whose image is missing a
+platform in any registry is rebuilt from its tag on the next push to
+`main`; a registry error fails the run instead of being read as "absent".
+A fix to the image itself (the `Dockerfile`) therefore ships with a new
+version. A push without a version bump publishes nothing, and no crate is
+ever published: the workspace is `publish = false`.
 
 Releasing is therefore: bump `version` in `Cargo.toml`, move the
 `[Unreleased]` changelog entries under the new version, merge.

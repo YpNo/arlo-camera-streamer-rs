@@ -52,7 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
           toolchain: 1.99.0
           components: rustfmt
@@ -73,7 +73,7 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
           toolchain: 1.99.0
           components: clippy
@@ -101,7 +101,7 @@ jobs:
             gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
             gstreamer1.0-libav gstreamer1.0-nice
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
           toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -109,33 +109,35 @@ jobs:
         env:
           STREAMER_REQUIRE_GST_IT: "1"
 
+  # Licences, advisories, bans and sources. The secret scan has its own
+  # workflow (secret-scan.yml), which runs on docs-only pushes too.
   security:
     name: Security & License Audit
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # On pull_request events gitleaks lists the PR's commits through the
-    # API, which needs pull-requests: read (the restricted default token
-    # carries contents and packages only). Comments are off so write access
-    # is never required; findings fail the job and show in the log.
     permissions:
       contents: read
-      pull-requests: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # gitleaks scans the whole history, not the checked-out tree only.
-          fetch-depth: 0
-      - name: Secret scan
-        # Rules and allow-list live in .gitleaks.toml. No license key is
-        # needed for a personal-account repository.
-        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_CONFIG: .gitleaks.toml
-          GITLEAKS_ENABLE_COMMENTS: "false"
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
-          command: check
+          toolchain: 1.99.0
+      - name: Install cargo-deny (pinned binary release, checksum-verified)
+        # The action fetched its release asset with curl | tar and no
+        # checksum; this is the same binary, verified like tarpaulin below.
+        env:
+          CARGO_DENY_VERSION: "0.20.2"
+          CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+        run: |
+          name="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          curl -sSfL -o cargo-deny.tar.gz \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${name}.tar.gz"
+          echo "${CARGO_DENY_SHA256}  cargo-deny.tar.gz" | sha256sum --check --strict
+          tar xzf cargo-deny.tar.gz --strip-components=1 -C /usr/local/bin "${name}/cargo-deny"
+          rm cargo-deny.tar.gz
+      - run: cargo deny check
 
   doc:
     name: Documentation Check
@@ -151,7 +153,7 @@ jobs:
             cmake build-essential libssl-dev libclang-dev nasm golang-go \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
           toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -181,7 +183,7 @@ jobs:
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
             gstreamer1.0-libav gstreamer1.0-nice
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
           toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -271,6 +273,9 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       created: ${{ steps.exists.outputs.created }}
       image_missing: ${{ steps.image.outputs.missing }}
+      # The commit the version's tag points at: the image is built from
+      # it, never from whatever main holds when a rebuild runs.
+      commit: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -289,11 +294,16 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          if gh release view "$VERSION" >/dev/null 2>&1; then
+          # Only "not found" means absent: an API error used to count as
+          # absent too and could cut a second release of a version.
+          if out=$(gh release view "$VERSION" --json tagName 2>&1); then
             echo "Release $VERSION already exists. Skipping."
             echo "created=false" >> "$GITHUB_OUTPUT"
-          else
+          elif printf '%s' "$out" | grep -qi "release not found"; then
             echo "created=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::cannot tell whether $VERSION is released: $out"
+            exit 1
           fi
 
       # The image jobs key on this, not on `created`: a run cancelled or
@@ -303,32 +313,50 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Is the image for this version published for every platform?
+      - name: Is the image for this version published for every platform, in every registry?
         id: image
         env:
-          REF: ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+          GHCR: ghcr.io/${{ github.repository }}
+          HUB_USER: ${{ vars.DOCKERHUB_USERNAME }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          VERSION: ${{ steps.version.outputs.version }}
           PLATFORMS: ${{ vars.IMAGE_PLATFORMS || '["linux/amd64"]' }}
         run: |
-          # Lowercase for the same reason as the image names below.
-          REF=$(printf '%s' "$REF" | tr '[:upper:]' '[:lower:]')
-          expected=$(printf '%s' "$PLATFORMS" | jq -r '.[]' | sort -u)
-          if manifest=$(docker manifest inspect "$REF" 2>/dev/null); then
-            # Attestation manifests carry os/arch "unknown"; skip them.
-            have=$(printf '%s' "$manifest" \
-              | jq -r '.manifests[]? | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture)"' \
-              | sort -u)
-            lacking=$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$have"))
-            if [ -z "$lacking" ]; then
-              echo "Image $REF exists for: $(printf '%s' "$have" | tr '\n' ' ')"
-              echo "missing=false" >> "$GITHUB_OUTPUT"
-            else
-              echo "Image $REF lacks: $(printf '%s' "$lacking" | tr '\n' ' '); rebuilding every platform."
-              echo "missing=true" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "No image for $REF yet."
-            echo "missing=true" >> "$GITHUB_OUTPUT"
+          # Every registry the image job publishes to: a tag pushed to GHCR
+          # but refused by Docker Hub used to look complete. Lowercase for
+          # the same reason as the image names below. Docker Hub's public
+          # repository is read anonymously.
+          refs="$GHCR:$VERSION"
+          if [ -n "$HUB_USER" ]; then
+            refs="$refs docker.io/$HUB_USER/$REPO_NAME:$VERSION"
           fi
+          refs=$(printf '%s' "$refs" | tr '[:upper:]' '[:lower:]')
+          expected=$(printf '%s' "$PLATFORMS" | jq -r '.[]' | sort -u)
+          missing=false
+          for REF in $refs; do
+            if manifest=$(docker manifest inspect "$REF" 2>/tmp/inspect.err); then
+              # Attestation manifests carry os/arch "unknown"; skip them.
+              have=$(printf '%s' "$manifest" \
+                | jq -r '.manifests[]? | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture)"' \
+                | sort -u)
+              lacking=$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$have"))
+              if [ -z "$lacking" ]; then
+                echo "Image $REF exists for: $(printf '%s' "$have" | tr '\n' ' ')"
+              else
+                echo "Image $REF lacks: $(printf '%s' "$lacking" | tr '\n' ' ')"
+                missing=true
+              fi
+            elif grep -qiE 'manifest unknown|no such manifest|not found' /tmp/inspect.err; then
+              echo "No image for $REF yet."
+              missing=true
+            else
+              # Any other error (an outage, a rate limit) is not "absent":
+              # a guess here rebuilt and re-tagged a released version.
+              echo "::error::cannot inspect $REF: $(cat /tmp/inspect.err)"
+              exit 1
+            fi
+          done
+          echo "missing=$missing" >> "$GITHUB_OUTPUT"
 
       - name: Create Release
         if: steps.exists.outputs.created == 'true'
@@ -338,6 +366,21 @@ jobs:
           name: Release ${{ steps.version.outputs.version }}
           generate_release_notes: true
           target_commitish: ${{ github.sha }}
+
+      - name: Commit the version is built from
+        id: commit
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CREATED: ${{ steps.exists.outputs.created }}
+        run: |
+          # A new release tags this commit; an existing one keeps its tag.
+          if [ "$CREATED" = "true" ]; then
+            sha="$GITHUB_SHA"
+          else
+            sha=$(git rev-list -n 1 "refs/tags/$VERSION")
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "$VERSION is built from $sha"
 
   # The container image, one per released version, to GHCR as
   # ghcr.io/<owner>/<repo>:<version>, :latest and :sha-<commit>, and to
@@ -352,7 +395,12 @@ jobs:
   # QEMU build of the Rust + BoringSSL stage would take hours, hence native
   # runners. The release job rebuilds and re-tags a version whose published
   # manifest list lacks any configured platform, so adding a platform needs
-  # no version bump. No crate is ever published: `publish = false`.
+  # no version bump; the rebuild checks out the version's tag, not main.
+  # Each image is built into a local OCI archive and scanned there, before
+  # any registry login: a digest that fails the gate is never pushed, and
+  # the scanner never runs next to push credentials. The push then takes
+  # the same build from the builder's cache. No crate is ever published:
+  # `publish = false`.
   image:
     name: Container image (${{ matrix.platform }})
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
@@ -368,18 +416,14 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.commit }}
+          persist-credentials: false
+      - name: Reproducible timestamps
+        # The scan build and the push build below share them, so the
+        # pushed image is the scanned one, layer for layer.
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        if: vars.DOCKERHUB_USERNAME != ''
-        with:
-          registry: docker.io
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Image names
         id: names
         env:
@@ -407,7 +451,55 @@ jobs:
             org.opencontainers.image.description=Battery-safe bridge from Arlo cameras to a local RTSP / HLS output for Frigate and other NVRs
             org.opencontainers.image.licenses=MIT
             org.opencontainers.image.version=${{ needs.release.outputs.version }}
-      - name: Build and push by digest
+            org.opencontainers.image.revision=${{ needs.release.outputs.commit }}
+      - name: Build for the scan
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+          outputs: type=oci,dest=/tmp/image.tar
+      # Report HIGH and CRITICAL; stop on any fixable one (.trivyignore
+      # holds the reviewed exceptions, none so far).
+      - name: Vulnerability report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          # The archive is a one-platform index (the image plus its
+          # attestations); without this Trivy looks for linux/amd64 in it
+          # and fails on the arm64 leg. The action has no platform input,
+          # Trivy reads TRIVY_PLATFORM for --platform.
+          TRIVY_PLATFORM: ${{ matrix.platform }}
+        with:
+          input: /tmp/image.tar
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+      - name: Vulnerability gate
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: ${{ matrix.platform }}
+        with:
+          input: /tmp/image.tar
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          exit-code: '1'
+      - run: rm /tmp/image.tar
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: vars.DOCKERHUB_USERNAME != ''
+        with:
+          registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push by digest
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -420,31 +512,6 @@ jobs:
           # One build, pushed by digest to every registry in the list (the
           # quoted name field is buildx's CSV form for several names).
           outputs: type=image,"name=${{ steps.names.outputs.list }}",push-by-digest=true,name-canonical=true,push=true
-      # Every platform's image is scanned before its digest can be tagged:
-      # report HIGH and CRITICAL, stop on a fixable CRITICAL.
-      - name: Vulnerability report
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        env:
-          # The digest is a one-platform index (the image plus its
-          # attestations); without this Trivy looks for linux/amd64 in it
-          # and fails on the arm64 leg. The action has no platform input,
-          # Trivy reads TRIVY_PLATFORM for --platform.
-          TRIVY_PLATFORM: ${{ matrix.platform }}
-        with:
-          image-ref: ${{ steps.names.outputs.ghcr }}@${{ steps.build.outputs.digest }}
-          format: table
-          severity: CRITICAL,HIGH
-          exit-code: '0'
-      - name: Vulnerability gate
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        env:
-          TRIVY_PLATFORM: ${{ matrix.platform }}
-        with:
-          image-ref: ${{ steps.names.outputs.ghcr }}@${{ steps.build.outputs.digest }}
-          format: table
-          severity: CRITICAL
-          ignore-unfixed: true
-          exit-code: '1'
       - name: Keep the digest for the manifest job
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -507,14 +574,18 @@ jobs:
         env:
           NAMES: ${{ steps.names.outputs.list }}
           VERSION: ${{ needs.release.outputs.version }}
-          SHA: ${{ github.sha }}
+          SHA: ${{ needs.release.outputs.commit }}
         run: |
           cd /tmp/digests
           # The per-platform digests are identical in every registry: the
           # build pushed the same manifests to each one by digest.
           for IMAGE in ${NAMES//,/ }; do
+            sources=()
+            for digest in *; do
+              sources+=("$IMAGE@sha256:$digest")
+            done
             docker buildx imagetools create \
               -t "$IMAGE:$VERSION" -t "$IMAGE:latest" -t "$IMAGE:sha-${SHA::7}" \
-              $(printf "$IMAGE@sha256:%s " *)
+              "${sources[@]}"
             docker buildx imagetools inspect "$IMAGE:$VERSION"
           done

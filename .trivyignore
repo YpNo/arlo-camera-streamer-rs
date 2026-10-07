@@ -1,0 +1,4 @@
+# Reviewed exceptions to the release image's vulnerability gate (fixable
+# CRITICAL and HIGH findings stop a release; see .github/workflows/ci.yml).
+# One CVE id per line, each with a comment saying why it does not apply
+# and when to look again. None so far.
