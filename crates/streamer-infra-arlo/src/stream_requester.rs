@@ -61,6 +61,16 @@ impl ArloWebrtcSignalerAdapter {
     /// Remove a camera's signaling socket under the lock, then
     /// `disconnect()` it *outside* the lock (disconnect awaits a WS
     /// round-trip — must not block other cameras' negotiate/teardown).
+    /// Pass `e` on, forgetting `camera`'s cached device first unless the
+    /// camera is merely busy: a stale device (re-paired to another base
+    /// station) fails here, and the next attempt refetches it.
+    fn failed_for(&self, camera: &CameraId, e: DomainError) -> DomainError {
+        if !matches!(e, DomainError::CameraBusy(_)) {
+            self.devices.invalidate(camera);
+        }
+        e
+    }
+
     async fn take_and_disconnect(&self, key: &str) {
         let sock = self.sessions.lock().await.remove(key);
         if let Some(s) = sock {
@@ -83,7 +93,7 @@ impl WebrtcSignaler for ArloWebrtcSignalerAdapter {
             .client
             .sip_info(&device)
             .await
-            .map_err(arlo_to_domain)?;
+            .map_err(|e| self.failed_for(camera, arlo_to_domain(e)))?;
         let offer_sdp = offer
             .build_offer(&usable_ice_servers(&sip.ice_servers))
             .await?;

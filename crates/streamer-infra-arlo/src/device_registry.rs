@@ -7,7 +7,12 @@
 //! (`device_id` / `parent_id` / `x_cloud_id`) are **stable** for the
 //! life of a device, so we cache the device list once and only re-fetch
 //! on a cache miss — a camera provisioned after boot is still picked up
-//! on its first stream request.
+//! on its first stream request. A camera re-paired to another base
+//! station does change `parent_id`: the adapters [`invalidate`] its entry
+//! when a call for it fails, so the next attempt refetches instead of
+//! failing until a restart. Concurrent misses share one refetch.
+//!
+//! [`invalidate`]: DeviceRegistry::invalidate
 //!
 //! The cache stores `Arc<Device>` (arlo-rs's `Device` is not `Clone`):
 //! [`DeviceRegistry::resolve`] clones the cheap `Arc`, releases the
@@ -48,6 +53,9 @@ impl DeviceLister for ArloClient {
 pub struct DeviceRegistry {
     lister: Arc<dyn DeviceLister>,
     cache: RwLock<HashMap<String, Arc<Device>>>,
+    /// Held across a refetch, so misses that arrive together wait for
+    /// one device-list call instead of each making their own.
+    refresh: tokio::sync::Mutex<()>,
 }
 
 impl DeviceRegistry {
@@ -63,6 +71,7 @@ impl DeviceRegistry {
         Self {
             lister,
             cache: RwLock::new(HashMap::new()),
+            refresh: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -79,9 +88,23 @@ impl DeviceRegistry {
         if let Some(device) = self.lookup(camera) {
             return Ok(device);
         }
+        let _single_flight = self.refresh.lock().await;
+        // Another miss may have refetched while this one waited.
+        if let Some(device) = self.lookup(camera) {
+            return Ok(device);
+        }
         self.refresh().await?;
         self.lookup(camera)
             .ok_or_else(|| DomainError::UnknownCamera(camera.to_string()))
+    }
+
+    /// Forget `camera`'s cached device, so the next [`Self::resolve`]
+    /// refetches the list. Called when a cloud call for the camera fails.
+    pub fn invalidate(&self, camera: &CameraId) {
+        self.cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(camera.as_str());
     }
 
     fn lookup(&self, camera: &CameraId) -> Option<Arc<Device>> {
@@ -229,5 +252,51 @@ mod tests {
             .expect_err("fetch failure propagates");
 
         assert!(matches!(err, DomainError::AdapterTransport(_)));
+    }
+
+    /// A camera re-paired to another base station kept failing on its
+    /// stale `parent_id` until a restart.
+    #[tokio::test]
+    async fn invalidate_makes_the_next_resolve_refetch() {
+        let lister = Arc::new(FakeLister {
+            devices: vec!["CAM1"],
+            calls: AtomicUsize::new(0),
+        });
+        let registry = DeviceRegistry::with_lister(lister.clone());
+        let cam = CameraId::new("CAM1");
+
+        registry.resolve(&cam).await.expect("first");
+        registry.invalidate(&cam);
+        registry.resolve(&cam).await.expect("after invalidate");
+
+        assert_eq!(lister.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Takes a while to answer, so concurrent misses overlap.
+    struct SlowLister {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DeviceLister for SlowLister {
+        async fn list(&self) -> Result<Vec<Device>, DomainError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(vec![device("CAM1"), device("CAM2")])
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_misses_share_one_refetch() {
+        let lister = Arc::new(SlowLister {
+            calls: AtomicUsize::new(0),
+        });
+        let registry = DeviceRegistry::with_lister(lister.clone());
+        let (a, b) = (CameraId::new("CAM1"), CameraId::new("CAM2"));
+
+        let (ra, rb) = tokio::join!(registry.resolve(&a), registry.resolve(&b));
+
+        assert!(ra.is_ok() && rb.is_ok());
+        assert_eq!(lister.calls.load(Ordering::SeqCst), 1);
     }
 }

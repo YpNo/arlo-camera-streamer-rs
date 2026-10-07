@@ -3,15 +3,18 @@
 //!
 //! Arlo lists STUN, UDP TURN and TCP TURN. libnice + Arlo's gateway
 //! only ever connect over UDP TURN; the TCP TURN negotiates flakily
-//! (proven live), so it is dropped here. STUN entries never carry
-//! credentials, even if the payload has some.
+//! (proven live), so TURN is kept only over UDP (an allow-list: a
+//! deny-list of `tcp` let `"tcp "` or `tls` through). STUN entries never
+//! carry credentials, even if the payload has some. The URL is rebuilt
+//! from the validated parts (arlo-rs checks the type, an Arlo host and a
+//! numeric port), never with the cloud's raw transport string.
 
 use arlo_rs::models::sip::IceServers;
 
 use streamer_domain::stream::IceServer;
 
 const TURN: &str = "turn";
-const TCP: &str = "tcp";
+const UDP: &str = "udp";
 
 /// `turn` and `turns`, whatever the case: both carry credentials and
 /// both are refused over TCP.
@@ -22,8 +25,10 @@ fn is_turn(kind: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(TURN))
 }
 
-fn is_tcp(transport: Option<&str>) -> bool {
-    transport.is_some_and(|t| t.eq_ignore_ascii_case(TCP))
+/// Whether a TURN entry may be used: no transport stated (UDP by
+/// default) or exactly `udp`.
+fn is_udp_or_default(transport: Option<&str>) -> bool {
+    transport.is_none_or(|t| t.eq_ignore_ascii_case(UDP))
 }
 
 /// The usable ICE servers of one call, in Arlo's order.
@@ -32,11 +37,16 @@ pub fn usable_ice_servers(servers: &IceServers) -> Vec<IceServer> {
     servers
         .data
         .iter()
-        .filter(|s| !(is_turn(&s.kind) && is_tcp(s.transport.as_deref())))
+        .filter(|s| !is_turn(&s.kind) || is_udp_or_default(s.transport.as_deref()))
         .map(|s| {
             let is_turn = is_turn(&s.kind);
+            let kind = s.kind.to_ascii_lowercase();
+            let url = match s.transport.as_deref() {
+                Some(_) if is_turn => format!("{kind}:{}:{}?transport={UDP}", s.domain, s.port),
+                _ => format!("{kind}:{}:{}", s.domain, s.port),
+            };
             IceServer {
-                url: s.url(),
+                url,
                 username: if is_turn { s.username.clone() } else { None },
                 credential: if is_turn { s.credential.clone() } else { None },
             }
@@ -127,5 +137,36 @@ mod tests {
         assert_eq!(kept.len(), 1, "{kept:?}");
         assert!(kept[0].url.contains("3478"));
         assert_eq!(kept[0].credential.as_deref(), Some("c"));
+    }
+
+    /// Only an exact `tcp` used to be dropped: `"tcp "` or `tls` passed,
+    /// and went raw into the TURN URL.
+    #[test]
+    fn usable_ice_servers_keeps_turn_only_over_udp_and_rebuilds_the_url() {
+        let list = servers(
+            r#"{"data":[
+                {"type":"turn","domain":"turn.example","port":"443","transport":"tcp ",
+                 "username":"u","credential":"c"},
+                {"type":"turn","domain":"turn.example","port":"443","transport":"tls",
+                 "username":"u","credential":"c"},
+                {"type":"turn","domain":"turn.example","port":"3478","transport":"Udp",
+                 "username":"u","credential":"c"},
+                {"type":"turn","domain":"turn.example","port":"3479",
+                 "username":"u","credential":"c"},
+                {"type":"stun","domain":"stun.example","port":"19302","transport":"x&y"}
+            ]}"#,
+        );
+        let urls: Vec<String> = usable_ice_servers(&list)
+            .into_iter()
+            .map(|s| s.url)
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "turn:turn.example:3478?transport=udp",
+                "turn:turn.example:3479",
+                "stun:stun.example:19302",
+            ]
+        );
     }
 }
