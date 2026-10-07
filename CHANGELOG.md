@@ -7,7 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The image is built on Debian 13 (trixie) with GStreamer 1.26 and Mesa
+  25, the versions development and the live gates use; Debian 12 left
+  regular security support on 2026-07-12. It holds no setuid or setgid
+  binary any more.
+- An activation needs the 15 s surcharge plus 15 s of session left in the
+  daily quota; with less, the camera is not woken.
+- A failed activation starts the 30 s manual-wake interval like a session.
+- `kind = "sms"` refuses stray keys; HLS `segment_secs` (<= 60) and
+  `playlist_length` (<= 1000) have ceilings; the three listen addresses
+  are checked when the config loads.
+- The ops and admin listeners are bound before the Arlo login, so a port
+  in use fails the boot; `/healthz` answers during the login.
+- An admin token with whitespace or characters a Bearer header cannot
+  carry is refused at boot (a trailing newline used to boot and never
+  match).
+- Release pipeline: the image is built from the version's tag, scanned
+  before it is pushed, and a fixable HIGH finding stops it too; secret
+  scanning runs on every push, docs-only included.
+
+### Added
+- `scripts/measure.sh`: CPU, memory, threads and RTSP clients of the
+  running daemon over time, per number of live cameras, for the
+  multi-camera performance check.
+- `streamer_events_dropped_total{camera}`: bus events dropped because a
+  camera's mailbox was full (warned about once a minute).
+
+### Security
+- Snapshot fetches stay off the LAN: a presigned URL must name a public
+  host (no IP literal or local name), the resolver drops private
+  addresses, every redirect hop is re-checked, and no `Referer` carries
+  the presigned URL.
+- Ops/admin listeners: a connection lives at most 30 s, a remote peer
+  holds at most 8 of the 64 slots, and 4 are kept for loopback (the
+  container health check). Admin authentication is one layer over every
+  route; rejections log the peer, rate-limited.
+- Cloud strings no longer forge log lines or config: raw bus values are
+  logged escaped, `sanitize_reason` drops bidi and invisible characters,
+  watch-along URLs refuse control characters, `list-devices` sanitises
+  device names and skips malformed ids, ICE TURN is kept over UDP only.
+- Secrets stay out of output: a non-UTF-8 admin token, a config parse
+  error and `SignalingAnswer`'s `Debug` no longer print the value; media
+  errors are sanitised before they reach the log and `/admin`.
+- The relay's certificate verifier is unit-tested (trusted chain, unknown
+  issuer, self-signed, expired, pin); a crafted short RTCP header no
+  longer panics the relay's read task; SDP AAC numbers are range-checked;
+  every RTSP header line counts against the limit.
+
 ### Fixed
+- Live time is billed by the monotonic clock; a clock step used to bill
+  hours (or nothing). Battery-protect keeps the reset instant it entered
+  with and leaves on a pulse once the quota is back.
+- A panicking camera task releases its camera; a panic during the drain
+  is logged and makes the exit non-zero. The runtime exits within 10 s
+  even if a blocking teardown hangs. An RTSP server stopped right after
+  it started no longer hangs the exit.
+- An invalid `RUST_LOG` falls back to `info` with a warning, not silently
+  to the debug default.
+- The HLS stop-time cleanup re-checks its directory (a swapped symlink
+  was followed).
+- A camera re-paired to another base station is refetched after a failed
+  call instead of failing until a restart.
 - The container image applies Debian's pending security updates when it
   is built. The pinned base only gains them when Docker rebuilds it, and
   the release gate refused the 0.1.1 image for a critical `perl-base`

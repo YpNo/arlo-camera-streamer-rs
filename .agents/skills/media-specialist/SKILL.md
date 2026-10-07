@@ -102,6 +102,15 @@ Arlo-specific behaviour with the `live-validation` skill.
   webrtcbin's reason instead of surfacing as a splice timeout.
 - HLS: `prepare_dir` refuses a symlink at the stream dir and a dir not directly under
   `HlsBranchConfig::root`; `%` in the root is escaped in the segment pattern only.
+- `RtspServer::start` returns only once the GLib loop dispatches (an idle callback
+  proves it): a `stop()` before `run()` was lost and the drop joined for ever.
+- Relay resync: a `$` header whose length is below the bytes already read after it is
+  not a boundary (the buffer shrank under the probe and the slice panicked). Every
+  header line counts against `MAX_HEADERS`, colon or not. SDP AAC numbers must pass
+  `plausible_aac` or the audio track is left out.
+- `WatchAlongVerifier` is unit-tested with `rcgen` certificates (dev-dependency):
+  trusted chain on a raw IP passes, unknown issuer / self-signed / expired fail, a pin
+  replaces the chain check. Keep those tests green when the M1 hostname rule lands.
 - The relay refuses plaintext `rtsp://` unless the `RelayTls` policy was built with
   `allowing_plaintext_to_loopback()` (the test harness does), and then only to loopback
   (`is_loopback_host`), with a warning per dial; production never allows it.

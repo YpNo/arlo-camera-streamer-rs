@@ -40,7 +40,7 @@ them.
 | `UserViewStarted` / `UserViewEnded` / `UserViewUnavailable` | Relay of the app view (ADR 0007): `Idle → Activating`, `Live → Idle`, `Activating → Idle` without backoff |
 | `UserViewProbe` | The relay lets go (`Live → Idle`) to let the camera report `idle`; `probe_until` arms a 2 s grace in `Idle`, after which `UserViewStarted` relays again unless the report came |
 | `Failure(reason)` | `→ Failed` from any state; `process_signals` arms `failed_deadline` on **every** entry (an `Offline` while idle used to strand the camera), then `BackoffElapsed → Idle`; an `Online` report in `Failed` emits `BackoffElapsed` at once. The backoff (1/5/30/60 s) is sized by `failure_streak`, which `count_failure` writes into `retries` (the reducer's fresh `Failed` is always 0) and which resets on `Activating → Live` |
-| `BudgetExhausted` / `BudgetReset` | `→ BatteryProtect` / back to `Idle`. Emitted on a motion pulse **and** from `handle_deadline` while `Live`: `next_deadline` takes `min(debouncer, now + budget.remaining())`, so a session is cut when the quota runs out. Every `Idle → Activating` for motion charges `ACTIVATION_SURCHARGE_SECS` (15) through `budget.charge`. The budget is wall-clock (chrono): paused-clock tests cannot move its in-flight time, so test it with quotas the surcharge exhausts |
+| `BudgetExhausted` / `BudgetReset` | `→ BatteryProtect` / back to `Idle`. Emitted on a motion pulse **and** from `handle_deadline` while `Live`: `next_deadline` takes `min(debouncer, now + budget.remaining())`, so a session is cut when the quota runs out. Every `Idle → Activating` for motion charges `ACTIVATION_SURCHARGE_SECS` (15) through `budget.charge`, and `intercept_budget` refuses an activation from `Idle` with less than surcharge + `MIN_USEFUL_SESSION_SECS` (30 s) left. Session time is billed by the monotonic clock (`budget::Moment { wall, mono }`, the orchestrator's `moment()`): the wall clock only places the daily reset, so paused-clock tests spend quota for real. `BatteryProtect` keeps `battery_reset_at` (fixed on entry); a deadline that fires before the wall boundary re-arms; a pulse with the quota back emits `BudgetReset` |
 
 The metric `signal` label is `signal_label(&StateTransition)`; `LiveLost` carries its
 reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix row,
@@ -95,7 +95,9 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   a closed event mailbox — the router drops the senders only when the system stops or
   died, and nothing may stay streaming either way. `StreamerSystem` runs every task
   under `supervised()`: an exit or panic while the token is live cancels the token,
-  the composition root exits non-zero. An upstream bus end is fatal the same way
+  the composition root exits non-zero. A panic is counted (`panic_counter`) even during
+  the drain, and an orchestrator runs inside `release_on_panic`, which detaches and
+  tears its camera down before re-raising: its own exit path never ran. An upstream bus end is fatal the same way
   (`EventRouter` cancels the shared token, so it gets `shutdown.clone()`, not a child).
 - **Snapshots are published, not requested**: `publish_snapshot()` right after a
   transition is committed in `process_signals` (before its side effect awaits) and at
@@ -115,7 +117,8 @@ reason as `live-lost-<reason>`. Adding a signal means: reducer row, doc matrix r
   timeout is 2 s and a WebRTC negotiation takes longer. Manual wake goes through
   `motion_signal()` like a real motion, and is refused (`WakeOutcome::TooSoon` →
   `AdminError::RateLimited` → HTTP 429) within `ADMIN_WAKE_MIN_INTERVAL` (30 s) of
-  `last_session_end`, set in `detach_and_refresh`. The actor enqueues with `try_send`:
+  `last_session_end`, set in `detach_and_refresh` and on every exit from `Activating`
+  (a wake that keeps failing must not repeat every backoff). The actor enqueues with `try_send`:
   a full mailbox (`ADMIN_MAILBOX_CAPACITY` = 2) is `AdminError::Unavailable` (503)
   at once, never a wait. A command whose reply channel is already closed (its
   caller timed out and answered 503) is dropped unapplied.

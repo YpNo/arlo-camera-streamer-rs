@@ -465,3 +465,25 @@ Checked:  runtime stage built locally (podman): perl-base deb12u4; Trivy
           0.75.0 with the CI gate's settings: 0 vulnerabilities.
 Next:     merge → the release job sees no v0.1.1 image and builds it from
           that commit (Dockerfile fix included; code identical to the tag).
+
+## 2026-10-07 — Trixie image, measure.sh, the rest of sweep #2
+Changed:  Image on Debian 13 (GStreamer 1.26, Mesa 25), setuid bits
+          stripped; scripts/measure.sh. Then the sweep's remaining
+          findings in batches (domain, app, ops/bin, arlo, media, CI), one
+          commit each, every fix with a test that fails when it is
+          reverted (mutation-checked batch by batch).
+CI:       secret-scan.yml (gitleaks CLI pinned, every push incl. docs,
+          side branches); cargo-deny binary pinned; toolchain action on a
+          master commit; the image is built from the version's tag,
+          scanned from a local OCI archive before any login, gate on
+          fixable CRITICAL+HIGH (.trivyignore for reviewed exceptions);
+          absence = "not found" only; every registry checked. actionlint
+          and shellcheck clean; untested on Actions until pushed.
+Not done: M1 (relay hostname waiver) waits for the TLS live gate; the
+          verifier tests are in place for it. L15 (RTSP per-peer limit):
+          gstreamer-rtsp-server 0.25 does not bind the client's
+          connection, and this crate forbids unsafe; options: a loopback-
+          only second server for the segmenters, or the FFI in a small
+          audited module.
+Policy:   an image fix now ships with a version bump (rebuilds use the
+          tag's Dockerfile).
