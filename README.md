@@ -136,9 +136,9 @@ sudo install -m 0755 target/release/arlo-camera-streamer /usr/local/bin/
 
 The daemon ships as a container image only; no crate is published.
 Every release pushes the same image, built from the `Dockerfile` at the
-repo root (non-root, `tini` as PID 1, every GStreamer plugin the
-pipelines need, scanned with Trivy before it is tagged), to GitHub's
-registry and to Docker Hub:
+repo root (Debian 13 with GStreamer 1.26, non-root, no setuid binaries,
+`tini` as PID 1, every GStreamer plugin the pipelines need, scanned with
+Trivy before it is tagged), to GitHub's registry and to Docker Hub:
 
 ```bash
 docker pull ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.1
@@ -582,6 +582,27 @@ detection, not this daemon's encoding. Details and the measured paths:
 > The `gupnp … 1900: Address already in use` warnings at live start are
 > harmless — libnice's UPnP probe colliding with local bridge
 > interfaces; live streaming is unaffected.
+
+### Measuring your own box
+
+The figures above come from one camera. [`scripts/measure.sh`](./scripts/measure.sh)
+samples the running daemon from `/proc` (nothing to install in the image,
+no root for a container you started) and writes one CSV row per sample:
+CPU (100 = one core), RSS, threads, connected RTSP clients, and how many
+cameras are live, activating or idle.
+
+```bash
+scripts/measure.sh -c arlo-camera-streamer -i 5 -d 1800
+```
+
+At the end, or on Ctrl-C, it prints the CPU and memory per number of live
+cameras, and how threads and RSS moved over the run: a count that only
+grows across many sessions is a leak. The camera columns need `/metrics`
+from the host (`metrics_bind = "0.0.0.0:9090"` and the port published
+on `127.0.0.1`); without it they stay empty and the rest still works.
+`CONTAINER_ENGINE=podman` for podman; `-p <pid>` for a daemon run
+outside a container. The client count includes the HLS segmenter (one
+loopback client per camera) when HLS is on.
 
 ## Testing
 

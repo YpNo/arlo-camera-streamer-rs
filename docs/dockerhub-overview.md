@@ -46,9 +46,11 @@ and 5, Apple silicon hosts) in one manifest list; `docker pull` picks yours.
 ## What is in the image
 
 - The `arlo-camera-streamer` binary, statically configured by one TOML file.
-- GStreamer 1.22 with the plugins the pipelines need: base, good, bad, ugly,
-  libav, `gst-rtsp-server`, libnice for WebRTC, VA-API drivers for Intel/AMD
-  hardware encoding.
+- Debian 13 (trixie) with GStreamer 1.26 and the plugins the pipelines
+  need: base, good, bad, ugly, libav, `gst-rtsp-server`, libnice for WebRTC,
+  Mesa 25 and Intel VA-API drivers for hardware encoding. Debian's pending
+  security updates are applied at build time.
+- No setuid or setgid binaries.
 - `tini` as PID 1. No shell tools: the health check is the binary's own
   `healthcheck` subcommand.
 - Runs as uid/gid `10001`, non-root, with a `HEALTHCHECK` built in.
