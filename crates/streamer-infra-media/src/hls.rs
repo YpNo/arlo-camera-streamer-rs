@@ -98,6 +98,19 @@ pub(crate) fn prepare_dir(hls: &HlsBranchConfig) -> Result<(), MediaError> {
     let dir = Path::new(&hls.dir);
     std::fs::create_dir_all(dir)
         .map_err(|e| MediaError::Pipeline(format!("create HLS dir {}: {e}", hls.dir)))?;
+    validate_dir(hls)?;
+    clear_dir(dir)
+}
+
+/// The HLS dir is a real directory (not a symlink) directly under the HLS
+/// root. Checked before every clear, not only at preparation: a symlink
+/// swapped in while the segmenter ran would otherwise be followed.
+///
+/// # Errors
+///
+/// [`MediaError::Pipeline`] naming what is wrong.
+fn validate_dir(hls: &HlsBranchConfig) -> Result<(), MediaError> {
+    let dir = Path::new(&hls.dir);
     let meta = std::fs::symlink_metadata(dir)
         .map_err(|e| MediaError::Pipeline(format!("stat HLS dir {}: {e}", hls.dir)))?;
     if !meta.file_type().is_dir() {
@@ -116,7 +129,18 @@ pub(crate) fn prepare_dir(hls: &HlsBranchConfig) -> Result<(), MediaError> {
             hls.dir, hls.root
         )));
     }
-    clear_dir(dir)
+    Ok(())
+}
+
+/// The stop-time clear, after the same checks as [`prepare_dir`].
+///
+/// # Errors
+///
+/// [`MediaError::Pipeline`] when the dir is no longer a real directory
+/// directly under the root, or cannot be read.
+fn clear_on_stop(hls: &HlsBranchConfig) -> Result<(), MediaError> {
+    validate_dir(hls)?;
+    clear_dir(Path::new(&hls.dir))
 }
 
 /// Remove our playlist and segments from `dir`; other files stay.
@@ -182,8 +206,8 @@ fn supervise(
         }
         backoff = next_backoff(backoff);
     }
-    if let Err(e) = clear_dir(Path::new(&hls.dir)) {
-        debug!(%camera, error = %e, "HLS directory not cleared on stop");
+    if let Err(e) = clear_on_stop(hls) {
+        warn!(%camera, error = %e, "HLS directory not cleared on stop");
     }
     info!(%camera, "HLS segmenter stopped");
 }
@@ -323,6 +347,36 @@ mod tests {
         assert!(err.to_string().contains("not a directory"), "{err}");
         let err = prepare_dir(&hls(&elsewhere.join("deeper"))).unwrap_err();
         assert!(err.to_string().contains("not directly under"), "{err}");
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    /// The stop-time clear followed a symlink swapped in after the
+    /// preparation checks, and removed files outside the HLS root.
+    #[test]
+    fn clear_on_stop_refuses_a_dir_swapped_for_a_symlink() {
+        let base = std::env::temp_dir().join(format!("hls-stop-swap-{}", std::process::id()));
+        let root = base.join("root");
+        let elsewhere = base.join("elsewhere");
+        let dir = root.join("front_door");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+        let hls = HlsBranchConfig {
+            root: root.to_string_lossy().into_owned(),
+            dir: dir.to_string_lossy().into_owned(),
+            playlist_location: String::new(),
+            segment_location: String::new(),
+            target_duration: 2,
+            playlist_length: 3,
+            max_files: 5,
+        };
+        prepare_dir(&hls).expect("prepared while sound");
+        std::fs::remove_dir(&dir).expect("swap: remove");
+        std::os::unix::fs::symlink(&elsewhere, &dir).expect("swap: symlink");
+        let victim = elsewhere.join(HLS_PLAYLIST_FILE);
+        std::fs::write(&victim, "#EXTM3U").expect("victim");
+
+        assert!(clear_on_stop(&hls).is_err());
+        assert!(victim.exists(), "nothing outside the root is removed");
         std::fs::remove_dir_all(base).expect("cleanup");
     }
 }

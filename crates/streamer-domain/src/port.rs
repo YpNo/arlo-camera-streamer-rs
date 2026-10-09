@@ -279,6 +279,10 @@ pub trait MetricsRecorder: Send + Sync {
 
     /// Camera entered `Failed { retries }` — track for alerting.
     fn record_failure(&self, camera: &CameraId, retries: u32);
+
+    /// The event router dropped a bus event for `camera`: its mailbox was
+    /// full (the orchestrator busy, e.g. inside a negotiation).
+    fn record_dropped_event(&self, camera: &CameraId);
 }
 
 /// Inbound application-layer port for the admin HTTP surface.

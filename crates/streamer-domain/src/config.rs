@@ -126,12 +126,19 @@ pub enum MfaConfig {
     /// prompts for the OTP on stdin.
     Email(EmailMfaConfig),
     /// SMS MFA. Prompts via stdin. Not suitable for headless environments.
-    Sms,
+    Sms(SmsMfaConfig),
     /// Push MFA. Arlo sends an approval prompt to the account's Arlo
     /// mobile app; the streamer polls until the user taps "Approve".
     /// Fully headless once the app is installed and signed in.
     Push(PushMfaConfig),
 }
+
+/// SMS MFA takes no settings. A struct rather than a unit variant so a
+/// stray key (an IMAP setting left behind after switching to `sms`) is
+/// refused like everywhere else instead of silently ignored.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SmsMfaConfig {}
 
 /// Email MFA configuration. Password is **never** stored in the TOML
 /// file — only the name of the env var holding it.
@@ -271,18 +278,50 @@ pub const MIN_HLS_SEGMENT_SECS: u32 = 1;
 /// Shortest HLS playlist accepted: RFC 8216 §6.3.3 wants a client to
 /// find at least three segments.
 pub const MIN_HLS_PLAYLIST_LENGTH: u32 = 3;
+/// Longest HLS segment accepted: past a minute a viewer waits that long
+/// for the first picture.
+pub const MAX_HLS_SEGMENT_SECS: u32 = 60;
+/// Longest HLS playlist accepted. Retention is computed from it, and a
+/// value near `u32::MAX` wrapped to "keep every segment" (a full disk).
+pub const MAX_HLS_PLAYLIST_LENGTH: u32 = 1000;
 
 impl HlsOutput {
-    /// Target segment duration, raised to [`MIN_HLS_SEGMENT_SECS`].
+    /// Target segment duration, within
+    /// [`MIN_HLS_SEGMENT_SECS`]..=[`MAX_HLS_SEGMENT_SECS`].
     #[must_use]
     pub fn effective_segment_secs(&self) -> u32 {
-        self.segment_secs.max(MIN_HLS_SEGMENT_SECS)
+        self.segment_secs
+            .clamp(MIN_HLS_SEGMENT_SECS, MAX_HLS_SEGMENT_SECS)
     }
 
-    /// Playlist window, raised to [`MIN_HLS_PLAYLIST_LENGTH`].
+    /// Playlist window, within
+    /// [`MIN_HLS_PLAYLIST_LENGTH`]..=[`MAX_HLS_PLAYLIST_LENGTH`].
     #[must_use]
     pub fn effective_playlist_length(&self) -> u32 {
-        self.playlist_length.max(MIN_HLS_PLAYLIST_LENGTH)
+        self.playlist_length
+            .clamp(MIN_HLS_PLAYLIST_LENGTH, MAX_HLS_PLAYLIST_LENGTH)
+    }
+
+    /// Refuse a segment duration or playlist length above its ceiling,
+    /// so a typo fails the boot instead of being clamped unnoticed.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::InvalidConfig`] naming the value and its ceiling.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.segment_secs > MAX_HLS_SEGMENT_SECS {
+            return Err(DomainError::InvalidConfig(format!(
+                "output.hls.segment_secs = {} is above {MAX_HLS_SEGMENT_SECS}",
+                self.segment_secs
+            )));
+        }
+        if self.playlist_length > MAX_HLS_PLAYLIST_LENGTH {
+            return Err(DomainError::InvalidConfig(format!(
+                "output.hls.playlist_length = {} is above {MAX_HLS_PLAYLIST_LENGTH}",
+                self.playlist_length
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -413,9 +452,10 @@ impl StreamerConfig {
     /// Cross-field checks the parser cannot express: no two cameras may
     /// share an `arlo_device_id` (the second would replace the first's
     /// routes) or a `stream_name` (the second would replace the first's
-    /// RTSP mount and share its HLS directory), and every cooldown value
-    /// must be in range. Called by the loader so a bad file fails the boot
-    /// before anything is spawned.
+    /// RTSP mount and share its HLS directory), every cooldown and HLS
+    /// value must be in range, and the three listen addresses must parse.
+    /// Called by the loader so a bad file fails the boot before anything
+    /// is spawned (or any Arlo login).
     ///
     /// # Errors
     ///
@@ -438,6 +478,20 @@ impl StreamerConfig {
                 )));
             }
             camera.cooldown.validate(&camera.arlo_device_id)?;
+        }
+        if let Some(hls) = &self.output.hls {
+            hls.validate()?;
+        }
+        for (name, bind) in [
+            ("output.rtsp.bind", &self.output.rtsp.bind),
+            ("output.metrics_bind", &self.output.metrics_bind),
+            ("output.admin_bind", &self.output.admin_bind),
+        ] {
+            bind.parse::<std::net::SocketAddr>().map_err(|_| {
+                DomainError::InvalidConfig(format!(
+                    "{name} = '{bind}' is not an address:port (e.g. 127.0.0.1:9090)"
+                ))
+            })?;
         }
         Ok(())
     }
@@ -641,7 +695,7 @@ mod tests {
                 assert_eq!(email_cfg.host.as_deref(), Some("imap.example.com"));
                 assert_eq!(email_cfg.port, 993);
             }
-            MfaConfig::Sms | MfaConfig::Push(_) => panic!("expected email mfa"),
+            MfaConfig::Sms(_) | MfaConfig::Push(_) => panic!("expected email mfa"),
         }
     }
 
@@ -669,7 +723,7 @@ mod tests {
                 assert_eq!(email_cfg.user.as_deref(), Some("u@example.com"));
                 assert_eq!(email_cfg.port, 993);
             }
-            MfaConfig::Sms | MfaConfig::Push(_) => panic!("expected email mfa"),
+            MfaConfig::Sms(_) | MfaConfig::Push(_) => panic!("expected email mfa"),
         }
     }
 
@@ -692,7 +746,7 @@ mod tests {
                 assert_eq!(push.poll_interval_secs, 3);
                 assert_eq!(push.timeout_secs, 120);
             }
-            MfaConfig::Email(_) | MfaConfig::Sms => panic!("expected push mfa"),
+            MfaConfig::Email(_) | MfaConfig::Sms(_) => panic!("expected push mfa"),
         }
     }
 
@@ -717,7 +771,7 @@ mod tests {
                 assert_eq!(push.poll_interval_secs, 5);
                 assert_eq!(push.timeout_secs, 90);
             }
-            MfaConfig::Email(_) | MfaConfig::Sms => panic!("expected push mfa"),
+            MfaConfig::Email(_) | MfaConfig::Sms(_) => panic!("expected push mfa"),
         }
     }
 
@@ -897,5 +951,71 @@ mod tests {
         "#;
         let err = toml::from_str::<StreamerConfig>(toml_input).unwrap_err();
         assert!(err.to_string().contains("invalid stream name"));
+    }
+
+    /// `kind = "sms"` was a unit variant: serde skipped any other key, so
+    /// IMAP settings left behind looked active.
+    #[test]
+    fn sms_mfa_refuses_stray_keys() {
+        #[derive(Debug, Deserialize)]
+        struct M {
+            mfa: MfaConfig,
+        }
+        let ok: M = toml::from_str("[mfa]\nkind = \"sms\"").unwrap();
+        assert!(matches!(ok.mfa, MfaConfig::Sms(_)));
+        let err = toml::from_str::<M>("[mfa]\nkind = \"sms\"\nhost = \"imap.example.com\"")
+            .expect_err("a stray key must be refused");
+        assert!(err.to_string().contains("host"), "{err}");
+    }
+
+    /// `playlist_length + 2` wrapped near `u32::MAX` to "keep every
+    /// segment".
+    #[test]
+    fn hls_values_above_their_ceiling_are_refused_and_clamped() {
+        let hls = |segment_secs, playlist_length| HlsOutput {
+            dir: PathBuf::from("/tmp/hls"),
+            segment_secs,
+            playlist_length,
+        };
+        assert!(
+            hls(MAX_HLS_SEGMENT_SECS, MAX_HLS_PLAYLIST_LENGTH)
+                .validate()
+                .is_ok()
+        );
+        assert!(hls(MAX_HLS_SEGMENT_SECS + 1, 6).validate().is_err());
+        let wrap = hls(2, u32::MAX - 1);
+        assert!(
+            wrap.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("playlist_length")
+        );
+        assert_eq!(wrap.effective_playlist_length(), MAX_HLS_PLAYLIST_LENGTH);
+        assert_eq!(
+            hls(u32::MAX, 6).effective_segment_secs(),
+            MAX_HLS_SEGMENT_SECS
+        );
+    }
+
+    /// The binds used to be parsed after the Arlo login, in the tasks that
+    /// serve them; a typo surfaced late or not at all.
+    #[test]
+    fn validate_refuses_a_listen_address_that_does_not_parse() {
+        let raw = include_str!("../../../config/streamer.example.toml");
+        let cfg: StreamerConfig = toml::from_str(raw).expect("parses");
+        for (patch, name) in [
+            (|c: &mut StreamerConfig| c.output.metrics_bind = "localhost:9090".into())
+                as fn(&mut StreamerConfig),
+            |c: &mut StreamerConfig| c.output.admin_bind = "0.0.0.0".into(),
+            |c: &mut StreamerConfig| c.output.rtsp.bind = "8554".into(),
+        ]
+        .into_iter()
+        .zip(["metrics_bind", "admin_bind", "rtsp.bind"])
+        {
+            let mut bad = cfg.clone();
+            patch(&mut bad);
+            let err = bad.validate().expect_err(name).to_string();
+            assert!(err.contains(name), "{err}");
+        }
     }
 }

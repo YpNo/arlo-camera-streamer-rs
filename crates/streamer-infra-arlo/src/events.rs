@@ -42,6 +42,7 @@ use futures::stream::{BoxStream, StreamExt};
 use tokio_stream::wrappers::{BroadcastStream, WatchStream};
 use tracing::{debug, trace, warn};
 
+use streamer_domain::camera::CameraId;
 use streamer_domain::error::DomainError;
 use streamer_domain::event::{CameraEvent, ConnectionStatus};
 use streamer_domain::port::ArloEventSource;
@@ -98,10 +99,19 @@ impl ArloEventSource for ArloEventSourceAdapter {
 
 /// Map one bus event, recording its snapshot URL (if any) on the way.
 fn translate(event: &ArloEvent, snapshots: &SnapshotUrlCache) -> Option<CameraEvent> {
-    if let Some((device_id, url)) = snapshot_url(event)
-        && !snapshots.record(device_id, url, Instant::now())
-    {
-        debug!(%device_id, "snapshot URL rejected (not https)");
+    if let Some((device_id, url)) = snapshot_url(event) {
+        // Recorded only under a valid camera id: the raw resource suffix
+        // is cloud input, and every distinct one used to stay in the map.
+        if let Ok(camera) = CameraId::parse(device_id) {
+            if !snapshots.record(&camera, url, Instant::now()) {
+                debug!(%camera, "snapshot URL rejected (not https to a public host)");
+            }
+        } else {
+            debug!(
+                device_id_bytes = device_id.len(),
+                "snapshot URL for a malformed device id ignored"
+            );
+        }
     }
     let mapped = map_event(event);
     observe_raw(event, mapped.as_ref());
@@ -113,9 +123,12 @@ fn translate(event: &ArloEvent, snapshots: &SnapshotUrlCache) -> Option<CameraEv
 fn observe_raw(event: &ArloEvent, mapped: Option<&CameraEvent>) {
     let keys = property_keys(event.properties.as_ref());
     let activity = activity_state(event.properties.as_ref());
+    // Raw cloud strings go out through `Debug`, which escapes newlines
+    // and control characters: the text format would print them as is,
+    // and a resource like `cameras/x\nINFO …` forged a log line.
     trace!(
-        action = %event.action,
-        resource = %event.resource,
+        action = ?event.action,
+        resource = ?event.resource,
         source = ?event.source,
         ?keys,
         ?activity,
@@ -123,10 +136,10 @@ fn observe_raw(event: &ArloEvent, mapped: Option<&CameraEvent>) {
         "arlo bus event"
     );
     if let Some(kind) = mapped.and_then(pulse_kind) {
-        debug!(resource = %event.resource, kind, "camera trigger pulse");
+        debug!(resource = ?event.resource, kind, "camera trigger pulse");
     } else if mapped.is_none() && event.resource.starts_with("cameras/") {
         debug!(
-            resource = %event.resource,
+            resource = ?event.resource,
             ?keys,
             ?activity,
             "unmapped camera event"

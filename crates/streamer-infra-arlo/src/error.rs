@@ -21,10 +21,26 @@ pub fn arlo_to_domain(err: ArloError) -> DomainError {
     if is_stream_busy(&err) {
         return DomainError::CameraBusy(sanitize_reason(&err.to_string()));
     }
+    if is_rate_limited(&err) {
+        return DomainError::RateLimited(sanitize_reason(&err.to_string()));
+    }
     match err {
         ArloError::DeviceNotFound(d) => DomainError::UnknownCamera(sanitize_reason(&d)),
         // Cloud-sourced text: control characters removed, length bounded.
         other => DomainError::adapter_transport(other),
+    }
+}
+
+/// HTTP 429 Too Many Requests, from Arlo itself or its Cloudflare edge.
+const TOO_MANY_REQUESTS: u16 = 429;
+
+/// A 429, whether as a bare HTTP failure (Cloudflare's 1015 block page) or
+/// in an Arlo envelope.
+fn is_rate_limited(err: &ArloError) -> bool {
+    match err {
+        ArloError::HttpError { status, .. } => status.as_u16() == TOO_MANY_REQUESTS,
+        ArloError::ApiError { code, .. } => *code == i32::from(TOO_MANY_REQUESTS),
+        _ => false,
     }
 }
 
@@ -103,5 +119,36 @@ mod tests {
             DomainError::AdapterTransport(msg) => assert!(msg.contains("captcha")),
             other => panic!("expected AdapterTransport, got {other:?}"),
         }
+    }
+
+    /// Cloudflare's 1015 block arrives as a bare 429; Arlo can also put
+    /// 429 in its envelope.
+    #[test]
+    fn a_429_maps_to_rate_limited() {
+        let cloudflare = ArloError::HttpError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body: r#"{"cloudflare_error":true,"error_code":1015}"#.to_string(),
+        };
+        assert!(matches!(
+            arlo_to_domain(cloudflare),
+            DomainError::RateLimited(_)
+        ));
+        let envelope = ArloError::ApiError {
+            code: 429,
+            error: None,
+            message: "Too many requests".to_string(),
+        };
+        assert!(matches!(
+            arlo_to_domain(envelope),
+            DomainError::RateLimited(_)
+        ));
+        let other = ArloError::HttpError {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body: String::new(),
+        };
+        assert!(matches!(
+            arlo_to_domain(other),
+            DomainError::AdapterTransport(_)
+        ));
     }
 }

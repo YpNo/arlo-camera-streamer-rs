@@ -55,12 +55,33 @@ impl std::fmt::Debug for IceServer {
 
 /// The Arlo gateway's WebRTC SDP answer to our offer, plus the session
 /// id it echoed back (needed for teardown / `sessionDisconnected`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` shows the session id's last characters and the SDP's length
+/// only: the SDP carries the call's ICE password.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SignalingAnswer {
     /// `FreeSWITCH`'s SDP answer, applied verbatim by the media adapter.
     pub answer_sdp: String,
     /// Opaque session id the gateway assigned to this live call.
     pub session_id: String,
+}
+
+/// Characters of the session id `Debug` keeps, enough to tell calls apart.
+const SESSION_ID_TAIL_CHARS: usize = 4;
+
+impl std::fmt::Debug for SignalingAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let chars = self.session_id.chars().count();
+        let tail: String = self
+            .session_id
+            .chars()
+            .skip(chars.saturating_sub(SESSION_ID_TAIL_CHARS))
+            .collect();
+        f.debug_struct("SignalingAnswer")
+            .field("answer_sdp_bytes", &self.answer_sdp.len())
+            .field("session_id", &format_args!("…{tail}"))
+            .finish()
+    }
 }
 
 /// Video codec emitted by an Arlo camera.
@@ -100,14 +121,23 @@ pub enum IceAddressFamily {
 pub struct WatchAlongUrl(String);
 
 impl WatchAlongUrl {
-    /// Accept an `rtsp://` or `rtsps://` URL with a host.
+    /// Accept an `rtsp://` or `rtsps://` URL with a host made of host and
+    /// port characters only, and no control character or whitespace
+    /// anywhere: the host is logged ([`Self::redacted`]), and a newline
+    /// there would forge a log line.
     ///
     /// # Errors
     ///
-    /// [`DomainError::InvalidConfig`] for any other scheme or a missing
-    /// host; the message never includes the URL.
+    /// [`DomainError::InvalidConfig`] for any other scheme, a missing or
+    /// malformed host, or a control or whitespace character; the message
+    /// never includes the URL.
     pub fn parse(raw: impl Into<String>) -> Result<Self, DomainError> {
         let raw = raw.into();
+        if raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(DomainError::InvalidConfig(
+                "watch-along URL holds a control or whitespace character".into(),
+            ));
+        }
         let (scheme, rest) = raw
             .split_once("://")
             .ok_or_else(|| DomainError::InvalidConfig("watch-along URL has no scheme".into()))?;
@@ -116,9 +146,15 @@ impl WatchAlongUrl {
                 "watch-along URL scheme is not rtsp or rtsps".into(),
             ));
         }
-        if host_port(rest).is_empty() {
+        let host = host_port(rest);
+        if host.is_empty() {
             return Err(DomainError::InvalidConfig(
                 "watch-along URL has no host".into(),
+            ));
+        }
+        if !host.chars().all(is_host_port_char) {
+            return Err(DomainError::InvalidConfig(
+                "watch-along URL host is not a host name, an IP address or a port".into(),
             ));
         }
         Ok(Self(raw))
@@ -138,6 +174,11 @@ impl WatchAlongUrl {
             None => "<watch-along url>".to_string(),
         }
     }
+}
+
+/// Characters of a DNS name, an IPv4 or bracketed IPv6 address, and a port.
+fn is_host_port_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')
 }
 
 /// `host[:port]` of what follows `scheme://`, without any `user:pw@`.
@@ -352,5 +393,51 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!err.contains("http") && !err.contains("evil"), "{err}");
+    }
+
+    /// The SDP carries the call's ICE password: `?answer` must not print it.
+    #[test]
+    fn signaling_answer_debug_shows_neither_the_sdp_nor_the_session_id() {
+        let answer = SignalingAnswer {
+            answer_sdp: "v=0\r\na=ice-pwd:SECRETPWD\r\n".to_string(),
+            session_id: "sess-0123456789-ABCD".to_string(),
+        };
+        let shown = format!("{answer:?}");
+        assert!(!shown.contains("SECRETPWD"), "{shown}");
+        assert!(!shown.contains("0123456789"), "{shown}");
+        assert!(shown.contains("…ABCD"), "{shown}");
+        assert!(
+            shown.contains(&answer.answer_sdp.len().to_string()),
+            "{shown}"
+        );
+    }
+
+    /// The host is logged through `redacted()`: a newline there forged a
+    /// log line.
+    #[test]
+    fn watch_along_url_rejects_control_characters_and_odd_hosts() {
+        for raw in [
+            "rtsps://1.2.3.4\nINFO forged/x",
+            "rtsps://1.2.3.4/x\r",
+            "rtsps://1.2.3.4/x y",
+            "rtsps://host\u{7f}/x",
+            "rtsps://ho%st/x",
+            "rtsps://ho\"st/x",
+        ] {
+            assert!(
+                WatchAlongUrl::parse(raw).is_err(),
+                "{raw:?} must be refused"
+            );
+        }
+        for raw in [
+            "rtsps://1.2.3.4:443/live/x?token=a%2Fb",
+            "rtsp://[2001:db8::1]:554/x",
+            "rtsps://edge-1.arlo.example/x",
+        ] {
+            assert!(
+                WatchAlongUrl::parse(raw).is_ok(),
+                "{raw:?} must be accepted"
+            );
+        }
     }
 }

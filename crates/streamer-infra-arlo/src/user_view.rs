@@ -55,7 +55,15 @@ impl UserViewSource for ArloUserViewSourceAdapter {
             .client
             .get_stream_url_as(&device, Some(&self.user_agent))
             .await
-            .map_err(arlo_to_domain)?;
+            .map_err(|e| {
+                let e = arlo_to_domain(e);
+                // A stale device (re-paired to another base station) fails
+                // here; the next attempt refetches it. Busy is not stale.
+                if !matches!(e, DomainError::CameraBusy(_)) {
+                    self.devices.invalidate(camera);
+                }
+                e
+            })?;
         let url = watch_along_from(answer.as_ref().map(arlo_rs::models::api::StreamUrl::as_str))?;
         debug!(%camera, url = %url, "watch-along stream obtained");
         Ok(url)

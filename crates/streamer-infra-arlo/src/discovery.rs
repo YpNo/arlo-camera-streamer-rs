@@ -3,12 +3,19 @@
 //! Lists the devices on the Arlo account through the authenticated
 //! client and keeps the ones the streamer can serve. Read-only: the
 //! device list is a cloud query that does not reach the cameras.
+//!
+//! The values are cloud input printed to a terminal and into a TOML
+//! snippet the operator pastes: ids must pass [`CameraId::parse`] (a
+//! device that fails is skipped with a warning), and names, kinds and
+//! models lose their control and invisible characters, so a device named
+//! with a newline cannot add lines to the configuration.
 
 use arlo_rs::client::ArloClient;
 use arlo_rs::models::api::Device;
 
 use streamer_domain::camera::{CameraId, DiscoveredDevice};
-use streamer_domain::error::DomainError;
+use streamer_domain::error::{DomainError, sanitize_reason};
+use tracing::warn;
 
 use crate::error::arlo_to_domain;
 
@@ -28,16 +35,30 @@ pub async fn discover_devices(client: &ArloClient) -> Result<Vec<DiscoveredDevic
 }
 
 fn streamable(devices: &[Device]) -> Vec<DiscoveredDevice> {
-    let mut found: Vec<DiscoveredDevice> = devices
+    let candidates = devices
         .iter()
-        .filter(|d| STREAMABLE_KINDS.contains(&d.device_type.as_str()))
-        .map(|d| DiscoveredDevice {
-            id: CameraId::new(d.device_id.as_str()),
-            name: d.device_name.clone(),
-            kind: d.device_type.clone(),
-            model: d.model_id.clone(),
+        .filter(|d| STREAMABLE_KINDS.contains(&d.device_type.as_str()));
+    let mut skipped = 0_usize;
+    let mut found: Vec<DiscoveredDevice> = candidates
+        .filter_map(|d| {
+            let Ok(id) = CameraId::parse(&d.device_id) else {
+                skipped += 1;
+                return None;
+            };
+            Some(DiscoveredDevice {
+                id,
+                name: sanitize_reason(&d.device_name),
+                kind: sanitize_reason(&d.device_type),
+                model: d.model_id.as_deref().map(sanitize_reason),
+            })
         })
         .collect();
+    if skipped > 0 {
+        warn!(
+            skipped,
+            "devices with an id outside [A-Za-z0-9_-]{{1,64}} were left out"
+        );
+    }
     found.sort_by_key(|d| d.name.to_lowercase());
     found
 }
@@ -85,5 +106,27 @@ mod tests {
     #[test]
     fn streamable_of_an_account_without_cameras_is_empty() {
         assert_eq!(streamable(&[]).len(), 0);
+    }
+
+    /// A device name with a newline added live lines to the snippet the
+    /// operator pastes; a quote in an id escaped its TOML string.
+    #[test]
+    fn streamable_strips_control_characters_and_skips_malformed_ids() {
+        let devices: Vec<Device> = serde_json::from_str(
+            r#"[
+            {"deviceId":"CAM1","parentId":"CAM1","deviceType":"camera",
+             "deviceName":"Attic\n[output.hls]\ndir = \"/etc\"\u001b[31m",
+             "uniqueId":"u1","state":"provisioned"},
+            {"deviceId":"CAM\"2","parentId":"CAM2","deviceType":"camera","deviceName":"Bad id",
+             "uniqueId":"u2","state":"provisioned"}
+        ]"#,
+        )
+        .expect("fixture parses");
+
+        let found = streamable(&devices);
+
+        assert_eq!(found.len(), 1, "the malformed id is left out");
+        assert!(!found[0].name.contains('\n'), "{:?}", found[0].name);
+        assert!(!found[0].name.contains('\u{1b}'), "{:?}", found[0].name);
     }
 }

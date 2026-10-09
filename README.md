@@ -136,16 +136,16 @@ sudo install -m 0755 target/release/arlo-camera-streamer /usr/local/bin/
 
 The daemon ships as a container image only; no crate is published.
 Every release pushes the same image, built from the `Dockerfile` at the
-repo root (non-root, `tini` as PID 1, every GStreamer plugin the
-pipelines need, scanned with Trivy before it is tagged), to GitHub's
-registry and to Docker Hub:
+repo root (Debian 13 with GStreamer 1.26, non-root, no setuid binaries,
+`tini` as PID 1, every GStreamer plugin the pipelines need, scanned with
+Trivy before it is tagged), to GitHub's registry and to Docker Hub:
 
 ```bash
-docker pull ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.1
+docker pull ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.0
 ```
 
 ```bash
-docker pull docker.io/ypno/arlo-camera-streamer-rs:v0.1.1
+docker pull docker.io/ypno/arlo-camera-streamer-rs:v0.2.0
 ```
 
 Tags: `v<version>` (pin this one), `latest` (the newest release), and
@@ -242,7 +242,7 @@ the OTP is typed on stdin:
 docker run --rm -it -e ARLO_PASSWORD -e ARLO_IMAP_PASSWORD \
   -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
   -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \
-  ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.1 list-devices --config /etc/arlo-streamer/streamer.toml
+  ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.0 list-devices --config /etc/arlo-streamer/streamer.toml
 ```
 
 It also warns about configured `arlo_device_id` values the account does
@@ -279,26 +279,32 @@ Docker's default 10 s, after which the process is killed.
 docker run -d \
   --name arlo-camera-streamer \
   --stop-timeout 30 \
-  -p 8554:8554 -p 9090:9090 -p 9091:9091 \
+  -p 8554:8554 -p 127.0.0.1:9090:9090 -p 127.0.0.1:9091:9091 \
   -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
   -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \
   -e ARLO_PASSWORD \
   -e ARLO_IMAP_PASSWORD \
   -e STREAMER_ADMIN_TOKEN \
-  ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.1
+  ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.0
 ```
 
 Two things the image cannot do for you:
 
 - **The state directory must be writable by uid 10001**, the user the
   image runs as. A host bind mount keeps the host's ownership, so run
-  `sudo chown -R 10001:10001 /var/lib/arlo-streamer` once (a named volume
-  needs nothing). Otherwise the boot fails on the session cache directory.
+  `sudo chown -R 10001:10001 /var/lib/arlo-streamer` once (a Docker named
+  volume needs nothing). The daemon checks this before it logs in to Arlo
+  and stops with the command to run if it cannot write there.
 - **`metrics_bind` and `admin_bind` default to `127.0.0.1`**, which inside
   the container is unreachable from the host even with `-p`. To scrape
-  metrics or call `/admin/*` from outside, set them to `0.0.0.0:9090` and
-  `0.0.0.0:9091` in the container's config and publish the ports; keep
-  the admin port off any untrusted network.
+  metrics or call `/admin/*` from the host, set them to `0.0.0.0:9090` and
+  `0.0.0.0:9091` in the container's config and publish the ports **on
+  `127.0.0.1`** as above (or on one LAN address for a Prometheus on
+  another machine). A bare `-p 9090:9090` listens on every interface,
+  and Docker's published ports bypass host firewalls such as ufw.
+  `/metrics` needs no token and tells anyone who reaches it your camera
+  ids and when each one saw motion or went live; keep the admin port off
+  any untrusted network.
 
 Add the encoder device your box has, and `video_encoder = "auto"` will
 use it: `--device /dev/dri` for an Intel/AMD GPU, `--device /dev/video11`
@@ -316,10 +322,13 @@ subcommand against `metrics_bind`.
 ### Docker Compose
 
 [`docker-compose.yml`](./docker-compose.yml) runs the same image with the
-settings above built in: the 30 s stop grace period, `restart: on-failure`,
-a named state volume (no `chown` needed), a read-only root filesystem, no
-capabilities, rotated logs, and commented blocks for the hardware encoders
-and the ops ports. Its header lists the three files to prepare —
+settings above built in: the 30 s stop grace period, a restart policy,
+the state in `./data` beside the file (owned by uid 10001: `sudo chown -R
+10001:10001 data`, or `podman unshare chown -R 10001:10001 data`), a
+read-only root filesystem, no capabilities, rotated logs, a VA-API device
+with its render group (adjust the gid to `getent group render`, or remove
+both lines on a box without a GPU), and commented blocks for the other
+encoders and the ops ports. Its header lists the three files to prepare —
 `config/streamer.toml`, a `.env` with the secrets (gitignored), and the one
 interactive `list-devices` login:
 
@@ -330,6 +339,32 @@ docker compose run --rm arlo-camera-streamer list-devices --config /etc/arlo-str
 ```bash
 docker compose up -d
 ```
+
+### Podman
+
+`podman compose` and `podman run` take the same file and flags, with two
+differences:
+
+- **Rootless podman maps uid 10001 to another host uid**, so neither a
+  plain `chown 10001` nor a named volume gives the daemon its state
+  directory. Use a host directory owned inside podman's user namespace,
+  and mount it in place of the `arlo-state` volume (`./state:/var/lib/arlo-streamer`):
+
+  ```bash
+  mkdir -p state && podman unshare chown -R 10001:10001 state
+  ```
+
+  `podman unshare ls -ln state` shows the ownership the container sees.
+- **On an SELinux host** (Fedora, RHEL, Alma), add `,Z` to the bind
+  mounts (`./config:/etc/arlo-streamer:ro,Z`, `./state:/var/lib/arlo-streamer:Z`);
+  "Permission denied" with correct ownership is the sign.
+
+A boot that keeps failing does not keep logging in: each failed Arlo login
+is recorded in the state directory, and the next attempt waits 1, 5, 15,
+then 60 minutes (at least 15 after Arlo answers "too many requests"),
+however often the container restarts. The log says how long it waits.
+Arlo's Cloudflare edge blocks an address that logs in too often (HTTP 429,
+error 1015); the block lifts by itself after a while without attempts.
 
 ### Frigate integration
 
@@ -363,7 +398,7 @@ Stream URL pattern: `rtsp://<host>:<rtsp.bind>/<cameras.stream_name>`.
 | `GET /readyz`  (port 9090)            | None     | Ready iff started **and** Arlo bus connected. |
 | `GET /admin/state` (port 9091)        | Bearer   | System snapshot (JSON); per-camera state as the camera task last published it, so a camera mid-negotiation still answers (`activating`). |
 | `GET /admin/cameras/{id}` (port 9091) | Bearer   | Per-camera snapshot.                   |
-| `POST /admin/cameras/{id}/wake` (port 9091) | Bearer | Inject a synthetic motion event; `429` within 30 s of the previous session's end. Each activation also costs 15 s of the daily budget. |
+| `POST /admin/cameras/{id}/wake` (port 9091) | Bearer | Inject a synthetic motion event; `429` within 30 s of the previous session's end (or failed attempt). Each activation also costs 15 s of the daily budget, and needs 30 s of it left. |
 | `POST /admin/cameras/{id}/idle` (port 9091) | Bearer | Force the camera back to `Idle`. |
 
 ```bash
@@ -510,6 +545,9 @@ on `/metrics` the same for a dashboard.
 |---|---|---|
 | Boot stops at the session cache | `session_cache_path directory … cannot be created` | Directory not writable by the daemon user (uid 10001 in the image). |
 | A code is asked at every restart | the login runbook's symptom table | Session cache on a non-persistent path, or the Arlo password changed. |
+| Boot stops with `session_cache_path directory … is not writable` | that line | The state directory is not owned by uid 10001: `sudo chown -R 10001:10001 <dir>`, or `podman unshare chown -R 10001:10001 <dir>` with rootless podman ([Podman](#podman)). |
+| `429 Too Many Requests` / `rate_limited` (Cloudflare error 1015) at login | `Arlo login failed rate_limited=true next_login_in_secs=…` | Too many logins from your address, usually a crash loop before the session cache could be written. Stop the container, fix the first error, wait an hour, start once. The daemon waits by itself between failed logins. |
+| `an earlier Arlo login failed; waiting before the next one` | `wait_secs=…` | The pause after a failed login (`login-backoff.json` in the state directory). It ends on its own; delete that file to log in at once, if you are sure the cause is fixed. |
 | Boot stops on the encoder | `is not usable on this host` | An explicit `video_encoder` whose device or plugin is missing; use `auto` or install the plugin. |
 | VLC connects, idle frame shows, never goes live | `to=Activating` then `attach_live failed …` | Read the reason: `webrtcbin has no sink request pad` is the missing `gstreamer1.0-nice`; `camera busy` is the Arlo app viewing; `splice timeout` is no RTP from Arlo (firewall on UDP, try `ice_address_family = "ipv4"`). |
 | Live starts and drops after ~10 s | `live source stalled` | UDP to Arlo's TURN blocked after the handshake, or the camera's own network. |
@@ -583,6 +621,27 @@ detection, not this daemon's encoding. Details and the measured paths:
 > harmless — libnice's UPnP probe colliding with local bridge
 > interfaces; live streaming is unaffected.
 
+### Measuring your own box
+
+The figures above come from one camera. [`scripts/measure.sh`](./scripts/measure.sh)
+samples the running daemon from `/proc` (nothing to install in the image,
+no root for a container you started) and writes one CSV row per sample:
+CPU (100 = one core), RSS, threads, connected RTSP clients, and how many
+cameras are live, activating or idle.
+
+```bash
+scripts/measure.sh -c arlo-camera-streamer -i 5 -d 1800
+```
+
+At the end, or on Ctrl-C, it prints the CPU and memory per number of live
+cameras, and how threads and RSS moved over the run: a count that only
+grows across many sessions is a leak. The camera columns need `/metrics`
+from the host (`metrics_bind = "0.0.0.0:9090"` and the port published
+on `127.0.0.1`); without it they stay empty and the rest still works.
+`CONTAINER_ENGINE=podman` for podman; `-p <pid>` for a daemon run
+outside a container. The client count includes the HLS segmenter (one
+loopback client per camera) when HLS is on.
+
 ## Testing
 
 ```bash
@@ -608,19 +667,32 @@ GitHub Actions workflows live in [`.github/workflows/`](./.github/workflows/).
 The `ci.yml` pipeline is staged: format → clippy → tests (with the GStreamer
 integration tests) → coverage gate (86 %; raised deliberately, never above
 what is held) and SonarCloud, with the rustdoc check beside the tests and
-cargo-deny in parallel. A failed stage skips the costlier ones, docs-only
-changes do not run it, the weekly schedule runs cargo-deny only, and
-Renovate's PRs skip coverage and SonarCloud. After every gate, a push to
-`main` whose `Cargo.toml` version has no release yet gets a GitHub release
-tagged `v<version>`, then the container image for that version: built per
-platform on native runners, each platform scanned with Trivy (a fixable
-CRITICAL finding stops the release), pushed by digest, and tagged
-`v<version>`, `latest` and `sha-<commit>` on `ghcr.io/ypno/arlo-camera-streamer-rs`
-and on `docker.io/ypno/arlo-camera-streamer-rs` (Docker Hub needs the
-repository variable `DOCKERHUB_USERNAME` and the secret `DOCKERHUB_TOKEN`;
-without them GHCR alone is published). A push without a version bump
-publishes nothing, and no crate is ever published: the workspace is
-`publish = false`.
+cargo-deny (a checksum-pinned binary) in parallel. A failed stage skips
+the costlier ones, docs-only changes do not run it, the weekly schedule
+runs cargo-deny only, and Renovate's PRs skip coverage and SonarCloud.
+`secret-scan.yml` runs gitleaks (checksum-pinned, rules in
+`.gitleaks.toml`) on every push and PR, docs included, over every commit
+the push brings (merged side branches too), and weekly over the whole
+history.
+
+After every gate, a push to `main` whose `Cargo.toml` version has no
+release yet gets a GitHub release tagged `v<version>`, then the container
+image for that version, built from the tag's commit: per platform on
+native runners, into a local archive scanned with Trivy before any
+registry login (a fixable CRITICAL or HIGH finding stops the release;
+reviewed exceptions go in `.trivyignore`), then pushed by digest and
+tagged `v<version>`, `latest` and `sha-<commit>` on
+`ghcr.io/ypno/arlo-camera-streamer-rs` and on
+`docker.io/ypno/arlo-camera-streamer-rs` (Docker Hub needs the repository
+variable `DOCKERHUB_USERNAME` and the secret `DOCKERHUB_TOKEN`; without
+them GHCR alone is published). The image build keeps its layers in the
+Actions cache per platform, so the dependency layer (only changed by
+`Cargo.lock`) is not recompiled at every release. A version whose image
+is missing a platform in any registry is rebuilt from its tag on the next
+push to `main`; a registry error fails the run instead of being read as "absent".
+A fix to the image itself (the `Dockerfile`) therefore ships with a new
+version. A push without a version bump publishes nothing, and no crate is
+ever published: the workspace is `publish = false`.
 
 Releasing is therefore: bump `version` in `Cargo.toml`, move the
 `[Unreleased]` changelog entries under the new version, merge.

@@ -13,18 +13,29 @@
 //!
 //! All routes require a `Authorization: Bearer <token>` header that
 //! matches the token configured on [`AdminServer::new`]. A constant-
-//! time comparison guards against timing-leak side channels.
+//! time comparison guards against timing-leak side channels. The check
+//! is one layer over every route (`require_bearer`), so a route added
+//! later cannot forget it, and it runs before any extractor.
 //!
 //! Tokens shorter than [`MIN_ADMIN_TOKEN_BYTES`] are rejected at
 //! construction (a daemon should never expose write endpoints behind a
-//! guessable token — fail fast at boot).
+//! guessable token — fail fast at boot), and so are tokens a `Bearer`
+//! header cannot carry (whitespace, a trailing newline from a file),
+//! which would boot fine and never match.
+//!
+//! A rejected request is logged with its route and the peer's address,
+//! at most once a minute per address at `warn` (a scan cannot flood the
+//! log); never with the presented token.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, MatchedPath, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use secrecy::{ExposeSecret, SecretString};
@@ -43,6 +54,11 @@ const AUTH_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
 /// Shortest admin token accepted (128 bits of a random token).
 pub const MIN_ADMIN_TOKEN_BYTES: usize = 16;
+/// Shortest gap between two `warn` lines for one peer's rejections.
+const REJECTION_WARN_INTERVAL: Duration = Duration::from_mins(1);
+/// Peers remembered for the rejection rate limit; the map is cleared past
+/// it, so a scan from many addresses cannot grow it without bound.
+const MAX_TRACKED_PEERS: usize = 1024;
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -51,6 +67,8 @@ struct AppState {
     /// Bearer token expected on every request. Kept as a secret (zeroed
     /// on drop, never printed) and exposed only for the comparison.
     token: Arc<SecretString>,
+    /// When each peer's last rejection was logged at `warn`.
+    rejections: Arc<Mutex<HashMap<IpAddr, Instant>>>,
 }
 
 /// Errors raised by [`AdminServer::new`].
@@ -62,6 +80,43 @@ pub enum AdminServerError {
     /// The configured admin token is shorter than [`MIN_ADMIN_TOKEN_BYTES`].
     #[error("admin token must be at least {MIN_ADMIN_TOKEN_BYTES} bytes")]
     ShortToken,
+    /// The token holds whitespace (a trailing newline from a file) or a
+    /// character a `Bearer` header cannot carry; it could never match.
+    #[error(
+        "admin token may only hold letters, digits and - . _ ~ + / = (no spaces or newline); generate one with `openssl rand -hex 32`"
+    )]
+    MalformedToken,
+}
+
+/// Check an admin token the way [`AdminServer::new`] does, so the boot
+/// can refuse a bad one before the Arlo login.
+///
+/// # Errors
+///
+/// [`AdminServerError::EmptyToken`], [`AdminServerError::MalformedToken`]
+/// or [`AdminServerError::ShortToken`]; none carries the token.
+pub fn check_admin_token(token: &SecretString) -> Result<(), AdminServerError> {
+    let raw = token.expose_secret();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AdminServerError::EmptyToken);
+    }
+    if !is_bearer_token(raw) {
+        return Err(AdminServerError::MalformedToken);
+    }
+    if trimmed.len() < MIN_ADMIN_TOKEN_BYTES {
+        return Err(AdminServerError::ShortToken);
+    }
+    Ok(())
+}
+
+/// Whether `token` is a `token68` (RFC 7235), what a `Bearer` header
+/// carries: hyper also strips surrounding whitespace from header values,
+/// so a token with any would never match.
+fn is_bearer_token(token: &str) -> bool {
+    token
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b))
 }
 
 /// HTTP server for the admin write surface.
@@ -87,47 +142,63 @@ impl AdminServer {
         admin: Arc<dyn AdminControl>,
         token: SecretString,
     ) -> Result<Self, AdminServerError> {
-        let trimmed = token.expose_secret().trim();
-        if trimmed.is_empty() {
-            return Err(AdminServerError::EmptyToken);
-        }
-        if trimmed.len() < MIN_ADMIN_TOKEN_BYTES {
-            return Err(AdminServerError::ShortToken);
-        }
+        check_admin_token(&token)?;
         Ok(Self {
             state: AppState {
                 admin,
                 token: Arc::new(token),
+                rejections: Arc::default(),
             },
         })
     }
 
-    /// Build the axum router. Exposed for tests.
+    /// Build the axum router: every route behind `require_bearer`.
+    /// Exposed for tests.
     pub fn router(&self) -> Router {
         Router::new()
             .route("/admin/state", get(handle_state))
             .route("/admin/cameras/{id}", get(handle_camera_state))
             .route("/admin/cameras/{id}/wake", post(handle_wake))
             .route("/admin/cameras/{id}/idle", post(handle_idle))
+            .route_layer(middleware::from_fn_with_state(
+                self.state.clone(),
+                require_bearer,
+            ))
             .with_state(self.state.clone())
     }
 
-    /// Bind and serve until `shutdown` is cancelled.
+    /// Serve on `listener` (bound at boot, see [`crate::serve::bind`])
+    /// until `shutdown` is cancelled.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::OpsError`] on bind / serve failure.
+    /// Returns [`crate::error::OpsError`] on serve failure.
     pub async fn serve(
         self,
-        addr: SocketAddr,
+        listener: tokio::net::TcpListener,
         shutdown: CancellationToken,
     ) -> Result<(), crate::error::OpsError> {
         let app = self.router();
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|source| crate::error::OpsError::Bind { addr, source })?;
         crate::serve::serve("admin", listener, app, ServeLimits::default(), shutdown).await
     }
+}
+
+/// The authentication layer over every admin route: a request without the
+/// right bearer token gets the 401 before any extractor or handler runs.
+async fn require_bearer(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if check_auth(req.headers(), &state.token).is_some() {
+        return next.run(req).await;
+    }
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or("?", MatchedPath::as_str)
+        .to_owned();
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr);
+    unauthorized(&state, req.method().as_str(), &route, peer)
 }
 
 /// Constant-time comparison of two byte slices (`subtle`). Returns
@@ -157,15 +228,41 @@ fn bad_camera_id(e: &streamer_domain::error::DomainError) -> Response {
     (StatusCode::BAD_REQUEST, format!("invalid camera id: {e}")).into_response()
 }
 
-/// The 401 answer. The route template is logged (never the presented
-/// token or the caller-chosen path parameters) so a scan or a stale
-/// token shows up in the log.
-fn unauthorized(route: &'static str) -> Response {
-    warn!(route, "admin: rejected unauthenticated request");
+/// The 401 answer. The method, route template and peer are logged (never
+/// the presented token or the caller-chosen path parameters) so a scan or
+/// a stale token shows up in the log — at `warn` at most once a minute
+/// per peer, at `debug` in between.
+fn unauthorized(state: &AppState, method: &str, route: &str, peer: Option<SocketAddr>) -> Response {
+    let ip = peer.map(|p| p.ip());
+    if should_warn(&state.rejections, ip) {
+        warn!(method, route, peer = ?peer, "admin: rejected unauthenticated request (next report for this peer in a minute at most)");
+    } else {
+        debug!(method, route, peer = ?peer, "admin: rejected unauthenticated request");
+    }
     let mut resp = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     resp.headers_mut()
         .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
     resp
+}
+
+/// Whether a rejection from `ip` gets a `warn` line now.
+fn should_warn(rejections: &Mutex<HashMap<IpAddr, Instant>>, ip: Option<IpAddr>) -> bool {
+    let Some(ip) = ip else {
+        return true;
+    };
+    let now = Instant::now();
+    let mut seen = rejections.lock().unwrap_or_else(PoisonError::into_inner);
+    if seen
+        .get(&ip)
+        .is_some_and(|at| now.duration_since(*at) < REJECTION_WARN_INTERVAL)
+    {
+        return false;
+    }
+    if seen.len() >= MAX_TRACKED_PEERS {
+        seen.clear();
+    }
+    seen.insert(ip, now);
+    true
 }
 
 fn admin_error_to_response(err: AdminError) -> Response {
@@ -208,10 +305,7 @@ fn json_response<T: serde::Serialize>(value: &T) -> Response {
     }
 }
 
-async fn handle_state(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if check_auth(&headers, &state.token).is_none() {
-        return unauthorized("GET /admin/state");
-    }
+async fn handle_state(State(state): State<AppState>) -> Response {
     debug!("GET /admin/state");
     match state.admin.snapshot().await {
         Ok(s) => json_response(&s),
@@ -219,14 +313,7 @@ async fn handle_state(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
 }
 
-async fn handle_camera_state(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    if check_auth(&headers, &state.token).is_none() {
-        return unauthorized("GET /admin/cameras/{id}");
-    }
+async fn handle_camera_state(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let id = match CameraId::parse(&id) {
         Ok(id) => id,
         Err(e) => return bad_camera_id(&e),
@@ -238,14 +325,7 @@ async fn handle_camera_state(
     }
 }
 
-async fn handle_wake(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    if check_auth(&headers, &state.token).is_none() {
-        return unauthorized("POST /admin/cameras/{id}/wake");
-    }
+async fn handle_wake(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let id = match CameraId::parse(&id) {
         Ok(id) => id,
         Err(e) => return bad_camera_id(&e),
@@ -257,14 +337,7 @@ async fn handle_wake(
     }
 }
 
-async fn handle_idle(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    if check_auth(&headers, &state.token).is_none() {
-        return unauthorized("POST /admin/cameras/{id}/idle");
-    }
+async fn handle_idle(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let id = match CameraId::parse(&id) {
         Ok(id) => id,
         Err(e) => return bad_camera_id(&e),
@@ -364,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn short_token_is_rejected_at_construction() {
         let admin = StubAdmin::arc();
-        let err = AdminServer::new(admin, SecretString::from("fifteen-bytes!!")).unwrap_err();
+        let err = AdminServer::new(admin, SecretString::from("fifteen-bytes-x")).unwrap_err();
         assert!(matches!(err, AdminServerError::ShortToken));
     }
 
@@ -571,5 +644,77 @@ mod tests {
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"abcd"));
         assert!(ct_eq(b"", b""));
+    }
+
+    /// Authentication used to be a call in each handler, and a route added
+    /// without it would be open. Every route, with a valid camera id and
+    /// with one outside the rule, answers 401 without the token.
+    #[tokio::test]
+    async fn every_admin_route_requires_the_token_before_anything_else() {
+        let (server, admin) = make_server();
+        for (method, uri) in [
+            ("GET", "/admin/state"),
+            ("GET", "/admin/cameras/CAM"),
+            ("GET", "/admin/cameras/bad%20id"),
+            ("POST", "/admin/cameras/CAM/wake"),
+            ("POST", "/admin/cameras/CAM/idle"),
+            ("POST", "/admin/cameras/bad%0Aid/idle"),
+        ] {
+            for auth in [
+                None,
+                Some("Bearer wrong-token-of-enough-bytes"),
+                Some(TOKEN),
+            ] {
+                let mut req = Request::builder().method(method).uri(uri);
+                if let Some(value) = auth {
+                    req = req.header(header::AUTHORIZATION, value);
+                }
+                let response = server
+                    .router()
+                    .oneshot(req.body(String::new()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {uri} with {auth:?}"
+                );
+            }
+        }
+        assert!(admin.wake_calls.lock().await.is_empty());
+        assert!(admin.force_idle_calls.lock().await.is_empty());
+    }
+
+    /// A token read from a file kept its newline: it booted and could
+    /// never match, since header values lose surrounding whitespace.
+    #[tokio::test]
+    async fn token_a_bearer_header_cannot_carry_is_rejected_at_construction() {
+        for bad in [
+            "0123456789abcdef0123\n",
+            " 0123456789abcdef0123",
+            "0123456789 abcdef0123",
+            "0123456789abcdef0123é",
+        ] {
+            let err = AdminServer::new(StubAdmin::arc(), SecretString::from(bad)).unwrap_err();
+            assert!(matches!(err, AdminServerError::MalformedToken), "{bad:?}");
+        }
+        assert!(
+            AdminServer::new(
+                StubAdmin::arc(),
+                SecretString::from("aZ09-._~+/=aZ09-._~+/=")
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejections_warn_once_per_peer_per_interval() {
+        let seen = std::sync::Mutex::new(HashMap::new());
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+        assert!(should_warn(&seen, Some(a)));
+        assert!(!should_warn(&seen, Some(a)), "same peer within the minute");
+        assert!(should_warn(&seen, Some(b)), "another peer");
+        assert!(should_warn(&seen, None), "an unknown peer always warns");
     }
 }

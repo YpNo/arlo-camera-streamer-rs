@@ -33,7 +33,7 @@ Source, full documentation, changelog and issues:
 
 | Tag | Meaning |
 |---|---|
-| `v<version>` (e.g. `v0.1.1`) | A release. **Pin this one.** |
+| `v<version>` (e.g. `v0.2.0`) | A release. **Pin this one.** |
 | `latest` | The newest release. |
 | `sha-<commit>` | The exact commit a release was built from. |
 
@@ -46,9 +46,11 @@ and 5, Apple silicon hosts) in one manifest list; `docker pull` picks yours.
 ## What is in the image
 
 - The `arlo-camera-streamer` binary, statically configured by one TOML file.
-- GStreamer 1.22 with the plugins the pipelines need: base, good, bad, ugly,
-  libav, `gst-rtsp-server`, libnice for WebRTC, VA-API drivers for Intel/AMD
-  hardware encoding.
+- Debian 13 (trixie) with GStreamer 1.26 and the plugins the pipelines
+  need: base, good, bad, ugly, libav, `gst-rtsp-server`, libnice for WebRTC,
+  Mesa 25 and Intel VA-API drivers for hardware encoding. Debian's pending
+  security updates are applied at build time.
+- No setuid or setgid binaries.
 - `tini` as PID 1. No shell tools: the health check is the binary's own
   `healthcheck` subcommand.
 - Runs as uid/gid `10001`, non-root, with a `HEALTHCHECK` built in.
@@ -79,7 +81,7 @@ only when the one-time code is typed on stdin.
 docker run --rm -it -e ARLO_PASSWORD -e ARLO_IMAP_PASSWORD \
   -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
   -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \
-  ypno/arlo-camera-streamer-rs:v0.1.1 list-devices --config /etc/arlo-streamer/streamer.toml
+  ypno/arlo-camera-streamer-rs:v0.2.0 list-devices --config /etc/arlo-streamer/streamer.toml
 ```
 
 **4. Run the daemon.**
@@ -90,12 +92,19 @@ docker run -d --name arlo-camera-streamer --restart on-failure --stop-timeout 30
   -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
   -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \
   -e ARLO_PASSWORD -e ARLO_IMAP_PASSWORD -e STREAMER_ADMIN_TOKEN \
-  ypno/arlo-camera-streamer-rs:v0.1.1
+  ypno/arlo-camera-streamer-rs:v0.2.0
 ```
 
 Or with Compose: the repository's
 [`docker-compose.yml`](https://github.com/YpNo/arlo-camera-streamer-rs/blob/main/docker-compose.yml)
 has the same settings plus a read-only root filesystem and no capabilities.
+
+With rootless podman, own the state directory inside podman's user
+namespace instead of with `sudo chown`:
+`podman unshare chown -R 10001:10001 /var/lib/arlo-streamer` (add `:Z` to
+the mounts on an SELinux host). The daemon checks it can write there before
+it logs in, and waits between failed logins (1, 5, 15, 60 minutes), so a
+restart loop cannot get your address rate-limited by Arlo.
 
 **5. Watch.** `rtsp://<host>:8554/<stream_name>` in VLC or as a Frigate input.
 The idle frame shows at once; walk in front of the camera and the picture
@@ -120,9 +129,13 @@ goes live within a few seconds.
 
 The metrics and admin listeners bind `127.0.0.1` *inside the container* by
 default, so publishing their ports alone exposes nothing. To reach them from
-outside, set `output.metrics_bind = "0.0.0.0:9090"` and
-`output.admin_bind = "0.0.0.0:9091"` in the config, and keep the admin port
-off any untrusted network.
+the host, set `output.metrics_bind = "0.0.0.0:9090"` and
+`output.admin_bind = "0.0.0.0:9091"` in the config and publish them on
+loopback: `-p 127.0.0.1:9090:9090 -p 127.0.0.1:9091:9091`. A bare
+`-p 9090:9090` listens on every interface, and Docker's published ports
+bypass host firewalls such as ufw. `/metrics` needs no token and reveals
+camera ids and motion activity; keep the admin port off any untrusted
+network.
 
 ### Hardware encoding
 

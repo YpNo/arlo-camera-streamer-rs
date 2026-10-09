@@ -1,6 +1,7 @@
-# gitleaks configuration — the security CI job runs it over the pushed
-# or PR commit range; `gitleaks detect --log-opts=--all` runs it over the
-# whole history locally.
+# gitleaks configuration — the secret-scan workflow runs it over every
+# pushed or PR commit range (merged side branches included) and weekly
+# over the whole history; `gitleaks git --log-opts=--all` does the same
+# locally.
 title = "arlo-camera-streamer-rs"
 
 [extend]
@@ -29,14 +30,15 @@ regex = '''STREAMER_ADMIN_TOKEN=["\']?[A-Za-z0-9+/=_-]{32,}'''
 
 [allowlist]
 description = "Documented placeholders and synthetic fixtures"
+# Only the banner image by path (binary); everything else is scanned, the
+# example config and a committed .security/ included. Placeholders are
+# matched whole: a real token that merely starts like one must not pass.
 paths = [
-  '''^config/streamer\.example\.toml$''',
-  '''^\.security/''',
-  '''^docs/banner''',
+  '''^docs/banner\.jpeg$''',
 ]
 regexes = [
-  '''X-Amz-Signature=(s|SECRET)\b''',
-  '''egressToken=(t|T|SECRET)\b''',
+  '''X-Amz-Signature=(s|SECRET)([^0-9A-Za-z]|$)''',
+  '''egressToken=(t|T|SECRET)([^A-Za-z0-9%._-]|$)''',
   '''secret-token-of-sixteen-bytes-or-more''',
   '''openssl rand -hex 32''',
 ]

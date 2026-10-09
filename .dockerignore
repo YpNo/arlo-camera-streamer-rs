@@ -47,6 +47,12 @@ renovate.json
 # Examples and test fixtures
 config/streamer.example.toml
 
+# Deployment state beside the compose file: the session cache and the
+# thumbnails must never reach a build context.
+data/
+state/
+arlo-state/
+
 # Compose / dev orchestration files (not needed at build time)
 docker-compose*.yml
 compose.*.yml

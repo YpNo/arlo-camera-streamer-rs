@@ -39,7 +39,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -53,17 +53,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use secrecy::SecretString;
 use streamer_app::system::StreamerSystem;
 use streamer_domain::config::StreamerConfig;
+use streamer_domain::error::DomainError;
 use streamer_domain::event::ConnectionStatus;
 use streamer_domain::port::{
     AdminControl, ArloEventSource, ArloThumbnailSource, MetricsRecorder, UserViewSource,
     WebrtcSignaler,
 };
+use streamer_infra_arlo::login_backoff::delay_after;
 use streamer_infra_arlo::{
-    ArloEventSourceAdapter, ArloThumbnailSourceAdapter, ArloUserViewSourceAdapter,
-    ArloWebrtcSignalerAdapter, DeviceRegistry, SnapshotUrlCache, boot::boot,
+    ArloClient, ArloEventSourceAdapter, ArloThumbnailSourceAdapter, ArloUserViewSourceAdapter,
+    ArloWebrtcSignalerAdapter, DeviceRegistry, LoginBackoff, SnapshotUrlCache, boot::boot,
 };
 use streamer_infra_media::{GstMediaMultiplexer, GstPipelineRegistry, RtspServer};
-use streamer_infra_ops::admin_server::MIN_ADMIN_TOKEN_BYTES;
+use streamer_infra_ops::admin_server::check_admin_token;
 use streamer_infra_ops::{AdminServer, Metrics, OpsServer, Readiness};
 
 use crate::signals::ShutdownSignals;
@@ -76,6 +78,12 @@ const ADMIN_TOKEN_ENV: &str = "STREAMER_ADMIN_TOKEN";
 /// (e.g. a WebRTC WS close that never acks) can never wedge process
 /// exit. Generous enough for a clean drain under normal conditions.
 const SHUTDOWN_STAGE_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long the runtime waits for blocking tasks at exit.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// The log filter when `RUST_LOG` is unset.
+const DEFAULT_LOG_FILTER: &str = "info,arlo_camera_streamer=debug";
+/// The log filter when `RUST_LOG` is set but does not parse.
+const FALLBACK_LOG_FILTER: &str = "info";
 /// Subdirectory beside the session cache that holds the idle thumbnails.
 const THUMBNAIL_DIR_NAME: &str = "thumbnails";
 
@@ -121,8 +129,20 @@ enum Command {
     Healthcheck,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?;
+    let outcome = runtime.block_on(async_main());
+    // Dropping the runtime waits without limit for blocking tasks, such as
+    // a pipeline teardown: one that hangs would hold the exit, and the
+    // restart it should trigger, for ever.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    outcome
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing()?;
     let config = load_config(&cli.config).await?;
@@ -172,23 +192,33 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
     // -- Admin token --
     let admin_token = read_admin_token().context("failed to read admin token")?;
 
-    // -- Arlo adapters --
-    let ArloAdapters {
-        event_source,
-        signaler,
-        thumbnails,
-        user_views,
-    } = arlo_adapters(&config).await?;
+    // -- Listeners, before the Arlo login --
+    //
+    // A port in use fails the boot here instead of leaving the daemon
+    // running without its health check or admin endpoint. The ops server
+    // needs nothing from Arlo, so it serves at once: `/healthz` answers
+    // during a long first login, `/readyz` reports not ready until the bus
+    // is up.
+    let ops_listener = bind_listener("metrics_bind", &config.output.metrics_bind).await?;
+    let admin_listener = bind_listener("admin_bind", &config.output.admin_bind).await?;
+    let ops_shutdown = CancellationToken::new();
+    let ops_server = OpsServer::new(metrics.clone(), readiness.clone());
+    let ops_task = {
+        let ops_shutdown = ops_shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ops_server.serve(ops_listener, ops_shutdown).await {
+                error!(error = %e, "ops HTTP server exited with error");
+            }
+        })
+    };
 
-    // -- Media adapter --
-    let rtsp_server =
-        RtspServer::start(&config.output.rtsp.bind).context("failed to start RTSP server")?;
-    // The encoder is probed on this host (ADR 0008): `auto` takes the first
-    // working backend, an explicit one must work or the boot fails here.
-    let video_encoder = streamer_infra_media::encoder::resolve(config.output.video_encoder)
-        .context("no usable H.264 encoder")?;
+    // -- State directory, before the Arlo login --
+    //
     // Idle thumbnails live beside the session cache (owner-only), never
-    // in the shared temp directory where another user could plant one.
+    // in the shared temp directory where another user could plant one. An
+    // unwritable state directory fails here, before any request reaches
+    // Arlo: failing after the login made a restart policy log in again and
+    // again until Cloudflare blocked the address.
     let thumbnail_dir = thumbnail_dir(&config);
     {
         // Filesystem work stays off the runtime's worker threads.
@@ -198,6 +228,26 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
             .context("thumbnail directory task")?
             .with_context(|| format!("thumbnail directory {}", thumbnail_dir.display()))?;
     }
+
+    // -- Arlo login, paced, then the adapters --
+    let Some(arlo_client) = login_paced(&config, &mut signals).await? else {
+        info!("stopped before the Arlo login");
+        return Ok(());
+    };
+    let ArloAdapters {
+        event_source,
+        signaler,
+        thumbnails,
+        user_views,
+    } = arlo_adapters(&config, arlo_client)?;
+
+    // -- Media adapter --
+    let rtsp_server =
+        RtspServer::start(&config.output.rtsp.bind).context("failed to start RTSP server")?;
+    // The encoder is probed on this host (ADR 0008): `auto` takes the first
+    // working backend, an explicit one must work or the boot fails here.
+    let video_encoder = streamer_infra_media::encoder::resolve(config.output.video_encoder)
+        .context("no usable H.264 encoder")?;
     let pipeline_registry = Arc::new(GstPipelineRegistry::new(
         rtsp_server.clone(),
         video_encoder,
@@ -243,35 +293,17 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
         shutdown.clone(),
     );
 
-    // -- Ops HTTP --
-    let ops_addr: SocketAddr = config
-        .output
-        .metrics_bind
-        .parse()
-        .with_context(|| format!("invalid metrics_bind '{}'", config.output.metrics_bind))?;
-    let ops_server = OpsServer::new(metrics.clone(), readiness.clone());
-    let ops_shutdown = shutdown.clone();
-    let ops_task = tokio::spawn(async move {
-        if let Err(e) = ops_server.serve(ops_addr, ops_shutdown).await {
-            error!(error = %e, "ops HTTP server exited with error");
-        }
-    });
-
     // -- Admin HTTP --
-    let admin_addr: SocketAddr = config
-        .output
-        .admin_bind
-        .parse()
-        .with_context(|| format!("invalid admin_bind '{}'", config.output.admin_bind))?;
+    let admin_addr = admin_listener.local_addr().ok();
     let admin_server =
         AdminServer::new(admin_actor, admin_token).context("failed to construct admin server")?;
     let admin_shutdown = shutdown.clone();
     let admin_task = tokio::spawn(async move {
-        if let Err(e) = admin_server.serve(admin_addr, admin_shutdown).await {
+        if let Err(e) = admin_server.serve(admin_listener, admin_shutdown).await {
             error!(error = %e, "admin HTTP server exited with error");
         }
     });
-    info!(%admin_addr, "admin endpoints available under /admin/*");
+    info!(admin_addr = ?admin_addr, "admin endpoints available under /admin/*");
 
     info!("daemon ready; waiting for shutdown signal");
 
@@ -301,7 +333,11 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
     // `RtspServer` drop joins its thread — otherwise that join blocks
     // forever on a still-running loop.
     shutdown.cancel();
+    ops_shutdown.cancel();
 
+    // Taken before the drain consumes the system: a task that panicked,
+    // even during the drain, makes the exit non-zero.
+    let panics = system.panic_counter();
     drain_stage("streamer-system", system.shutdown()).await;
     drain_stage("connection-watcher", async {
         let _ = conn_task.await;
@@ -324,6 +360,10 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
     rtsp_server.stop();
     drop(rtsp_server);
 
+    let panicked = panics.load(Ordering::Relaxed);
+    if panicked > 0 {
+        anyhow::bail!("{panicked} task(s) panicked; see the log");
+    }
     if !requested {
         anyhow::bail!(
             "the streamer system stopped on its own (an actor ended or the event bus closed); see the log"
@@ -354,18 +394,35 @@ async fn drain_stage<F: std::future::Future<Output = ()>>(name: &str, fut: F) {
 /// drop). Empty or short tokens fail the boot here, before anything
 /// listens; the server re-checks the same rule.
 fn read_admin_token() -> Result<SecretString> {
-    let token = std::env::var(ADMIN_TOKEN_ENV).with_context(|| {
-        format!("environment variable {ADMIN_TOKEN_ENV} must be set to enable /admin/*")
-    })?;
-    if token.trim().is_empty() {
-        anyhow::bail!("environment variable {ADMIN_TOKEN_ENV} must not be empty");
-    }
-    if token.trim().len() < MIN_ADMIN_TOKEN_BYTES {
-        anyhow::bail!(
-            "environment variable {ADMIN_TOKEN_ENV} must hold at least {MIN_ADMIN_TOKEN_BYTES} bytes"
-        );
-    }
-    Ok(SecretString::from(token))
+    admin_token_from(std::env::var(ADMIN_TOKEN_ENV))
+}
+
+/// Check the admin token read from the environment. The errors never
+/// carry the value: `VarError::NotUnicode` prints it, and the boot error
+/// chain is printed in full.
+fn admin_token_from(value: Result<String, std::env::VarError>) -> Result<SecretString> {
+    let token = match value {
+        Ok(token) => SecretString::from(token),
+        Err(std::env::VarError::NotPresent) => {
+            anyhow::bail!("environment variable {ADMIN_TOKEN_ENV} must be set to enable /admin/*")
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("environment variable {ADMIN_TOKEN_ENV} is not valid UTF-8")
+        }
+    };
+    check_admin_token(&token)
+        .map_err(|e| anyhow::anyhow!("environment variable {ADMIN_TOKEN_ENV}: {e}"))?;
+    Ok(token)
+}
+
+/// Bind one ops listener from its config value (validated at load).
+async fn bind_listener(name: &str, bind: &str) -> Result<tokio::net::TcpListener> {
+    let addr: SocketAddr = bind
+        .parse()
+        .with_context(|| format!("invalid {name} '{bind}'"))?;
+    streamer_infra_ops::serve::bind(addr)
+        .await
+        .with_context(|| format!("{name} {addr} cannot be bound"))
 }
 
 /// Subscribe to Arlo's `connection_status` watch and mirror it into
@@ -418,10 +475,73 @@ struct ArloAdapters {
 }
 
 /// Boot the Arlo client and build the four adapters on it.
-async fn arlo_adapters(config: &StreamerConfig) -> Result<ArloAdapters> {
-    let arlo_client = boot(&config.arlo)
-        .await
-        .context("failed to boot arlo-rs client")?;
+/// Log in to Arlo, not sooner than the persisted back-off allows, and
+/// record the outcome (`streamer_infra_arlo::login_backoff`): a restart
+/// policy must not turn a failing boot into a login per restart. `None`
+/// when a stop signal arrives during the wait. Errors that never reached
+/// Arlo (configuration, the state directory) do not count.
+async fn login_paced(
+    config: &StreamerConfig,
+    signals: &mut ShutdownSignals,
+) -> Result<Option<Arc<ArloClient>>> {
+    let backoff = LoginBackoff::beside(&config.arlo.session_cache_path);
+    let wait = backoff.remaining(SystemTime::now()).await;
+    if !wait.is_zero() {
+        warn!(
+            wait_secs = wait.as_secs(),
+            "an earlier Arlo login failed; waiting before the next one (a restart does not shorten it)"
+        );
+        if !pause_unless_stopped(wait, signals).await {
+            return Ok(None);
+        }
+    }
+    let error = match boot(&config.arlo).await {
+        Ok(client) => {
+            backoff.clear().await;
+            return Ok(Some(client));
+        }
+        Err(e) => e,
+    };
+    if !matches!(error, DomainError::InvalidConfig(_)) {
+        let rate_limited = matches!(error, DomainError::RateLimited(_));
+        match backoff
+            .record_failure(SystemTime::now(), rate_limited)
+            .await
+        {
+            Ok(pause) => error!(
+                rate_limited,
+                next_login_in_secs = pause.as_secs(),
+                "Arlo login failed"
+            ),
+            Err(io) => {
+                // Nothing persisted: pause here, or the restart that
+                // follows logs in again at once.
+                let pause = delay_after(if rate_limited { 3 } else { 1 });
+                warn!(
+                    error = %io,
+                    pause_secs = pause.as_secs(),
+                    "login back-off not recorded; pausing before exiting"
+                );
+                pause_unless_stopped(pause, signals).await;
+            }
+        }
+    }
+    Err(anyhow::Error::new(error).context("failed to boot arlo-rs client"))
+}
+
+/// Sleep `pause`, or less when a stop signal arrives. Returns whether the
+/// whole pause elapsed.
+async fn pause_unless_stopped(pause: Duration, signals: &mut ShutdownSignals) -> bool {
+    tokio::select! {
+        () = tokio::time::sleep(pause) => true,
+        signal = signals.recv() => {
+            warn!(signal, "stop requested while waiting to log in");
+            false
+        }
+    }
+}
+
+fn arlo_adapters(config: &StreamerConfig, arlo_client: Arc<ArloClient>) -> Result<ArloAdapters> {
     // One shared HTTP client (https only, bounded in time and redirects)
     // so connection pooling kicks in across cameras when fetching
     // presigned thumbnail URLs.
@@ -481,16 +601,33 @@ async fn load_config(path: &std::path::Path) -> Result<StreamerConfig> {
     let raw = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
-    let cfg: StreamerConfig = toml::from_str(&raw)
-        .with_context(|| format!("failed to parse config: {}", path.display()))?;
+    // toml's own error text quotes the offending line, and with it a
+    // password typed into the file; only its message and position go out.
+    let cfg: StreamerConfig = toml::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to parse config {}: {}{}",
+            path.display(),
+            e.message(),
+            e.span()
+                .map(|span| line_and_column(&raw, span.start))
+                .unwrap_or_default()
+        )
+    })?;
     cfg.validate()
         .with_context(|| format!("invalid config: {}", path.display()))?;
     Ok(cfg)
 }
 
+/// ` (line L, column C)` of a byte offset in `text`, both 1-based.
+fn line_and_column(text: &str, offset: usize) -> String {
+    let before = text.get(..offset).unwrap_or(text);
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    format!(" (line {line}, column {column})")
+}
+
 fn init_tracing() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,arlo_camera_streamer=debug"));
+    let (filter, invalid) = log_filter(std::env::var(EnvFilter::DEFAULT_ENV).ok());
     // stderr keeps stdout for command output (`list-devices`).
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -498,5 +635,93 @@ fn init_tracing() -> Result<()> {
         .with_writer(std::io::stderr)
         .try_init()
         .map_err(|e| anyhow::anyhow!("failed to init tracing: {e}"))?;
+    if let Some(e) = invalid {
+        warn!(error = %e, "RUST_LOG does not parse; logging at {FALLBACK_LOG_FILTER}");
+    }
     Ok(())
+}
+
+/// The filter for `RUST_LOG`: the default when unset, and plain `info`
+/// (plus the parse error, to report) when set but invalid. A typo used to
+/// fall back silently to the debug default, more verbose than asked.
+fn log_filter(spec: Option<String>) -> (EnvFilter, Option<String>) {
+    match spec {
+        None => (EnvFilter::new(DEFAULT_LOG_FILTER), None),
+        Some(spec) => match EnvFilter::try_new(&spec) {
+            Ok(filter) => (filter, None),
+            Err(e) => (EnvFilter::new(FALLBACK_LOG_FILTER), Some(e.to_string())),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `VarError::NotUnicode` prints the value, and the boot error chain
+    /// is printed in full: the token reached the container log.
+    #[cfg(unix)]
+    #[test]
+    fn admin_token_that_is_not_utf8_is_refused_without_printing_it() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = std::ffi::OsString::from_vec(b"SECRET-0123456789\xff".to_vec());
+        let err = admin_token_from(Err(std::env::VarError::NotUnicode(raw))).unwrap_err();
+        let shown = format!("{err:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        assert!(shown.contains("UTF-8"), "{shown}");
+    }
+
+    #[test]
+    fn admin_token_with_a_trailing_newline_is_refused_at_boot() {
+        let err = admin_token_from(Ok("0123456789abcdef0123\n".to_string())).unwrap_err();
+        assert!(format!("{err}").contains("no spaces or newline"), "{err}");
+        assert!(admin_token_from(Ok("0123456789abcdef0123".to_string())).is_ok());
+        assert!(admin_token_from(Err(std::env::VarError::NotPresent)).is_err());
+    }
+
+    /// toml's error text quotes the offending line, password included.
+    #[tokio::test]
+    async fn config_parse_error_shows_the_position_not_the_line() {
+        let dir = std::env::temp_dir().join(format!("load-config-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("streamer.toml");
+        let example = include_str!("../../../config/streamer.example.toml");
+        let leaked = example.replacen("[arlo]", "[arlo]\npassword = \"hunter2-secret\"", 1);
+        tokio::fs::write(&path, leaked).await.unwrap();
+
+        let err = load_config(&path).await.unwrap_err().to_string();
+
+        assert!(!err.contains("hunter2"), "{err}");
+        assert!(err.contains("password"), "names the key: {err}");
+        assert!(err.contains("line "), "points at the line: {err}");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn line_and_column_count_from_one() {
+        assert_eq!(line_and_column("ab\ncd", 0), " (line 1, column 1)");
+        assert_eq!(line_and_column("ab\ncd", 4), " (line 2, column 2)");
+    }
+
+    /// A typo in `RUST_LOG` used to fall back silently to the debug default.
+    #[test]
+    fn log_filter_falls_back_to_info_and_reports_an_invalid_spec() {
+        let (_, unset) = log_filter(None);
+        assert!(unset.is_none());
+        let (_, valid) = log_filter(Some("info,streamer_app=debug".to_string()));
+        assert!(valid.is_none());
+        let (filter, invalid) = log_filter(Some("info,streamer_app=verbose[".to_string()));
+        assert!(invalid.is_some(), "the parse error is reported");
+        assert_eq!(filter.to_string(), FALLBACK_LOG_FILTER);
+    }
+
+    /// The listeners were bound inside their tasks: a port in use left
+    /// the daemon running without its health check.
+    #[tokio::test]
+    async fn bind_listener_fails_on_a_port_in_use() {
+        let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = taken.local_addr().unwrap().to_string();
+        let err = bind_listener("metrics_bind", &addr).await.unwrap_err();
+        assert!(format!("{err:#}").contains("metrics_bind"), "{err:#}");
+    }
 }

@@ -10,7 +10,7 @@ members  = [
 ]
 
 [workspace.package]
-version      = "0.1.1"
+version      = "0.2.0"
 edition      = "2024"
 rust-version = "1.99.0"
 license      = "MIT"
@@ -100,6 +100,8 @@ gstreamer-sdp         = "0.25"
 mockall    = "0.15"
 rstest     = "0.27"
 tokio-test = "0.4"
+# Test certificates for the relay TLS verifier (dev only).
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 
 # To build against a local ../arlo-rs before a release, uncomment this block
 # (never commit it on: CI, Docker and a fresh clone have no sibling tree).

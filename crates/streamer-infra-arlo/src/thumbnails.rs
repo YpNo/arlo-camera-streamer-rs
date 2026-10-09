@@ -8,15 +8,19 @@
 //! that fails to fetch (expired) is forgotten and the device list is
 //! used instead. URLs are presigned credentials and are never logged.
 //!
-//! The fetch treats the storage endpoint as untrusted: only `https` URLs
-//! with a host are followed (both sources go through
-//! [`is_https_with_host`]), the client built by [`http_client`] bounds
-//! the request in time and redirects, the body is read up to
-//! [`THUMBNAIL_MAX_BYTES`] and must start with the JPEG magic before it
-//! reaches the image loader.
+//! The fetch treats the storage endpoint as untrusted, and remembers the
+//! daemon sits in the user's LAN: only `https` URLs with a public DNS
+//! name are followed (both sources go through [`is_snapshot_url`], and
+//! so does every redirect hop), the resolver of [`http_client`] drops
+//! private, loopback and link-local addresses, no `Referer` carries the
+//! presigned URL to a redirect target, the request is bounded in time
+//! and hops, and the body is read up to [`THUMBNAIL_MAX_BYTES`] and must
+//! be a JPEG of a sane declared size before it reaches the image loader.
+//! The storage host (never the URL) is logged at debug.
 //!
 //! [`SNAPSHOT_URL_MAX_AGE`]: crate::snapshot_cache::SNAPSHOT_URL_MAX_AGE
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,7 +36,7 @@ use streamer_domain::port::ArloThumbnailSource;
 use streamer_domain::thumbnail::check_thumbnail;
 
 use crate::error::arlo_to_domain;
-use crate::snapshot_cache::{SnapshotUrlCache, is_https_with_host};
+use crate::snapshot_cache::{SnapshotUrlCache, is_snapshot_url};
 
 /// Largest thumbnail body accepted. Arlo stills are a few hundred KiB;
 /// anything bigger is not a snapshot and is not kept in memory.
@@ -48,8 +52,10 @@ pub const THUMBNAIL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const THUMBNAIL_MAX_REDIRECTS: usize = 2;
 
 /// Build the HTTP client the thumbnail adapter fetches with: `https`
-/// only, bounded in time and in redirect hops. Shared across cameras so
-/// connection pooling applies to the storage endpoints.
+/// only, public addresses only, bounded in time and in redirect hops,
+/// each hop held to [`is_snapshot_url`], and no `Referer` (it would carry
+/// the presigned URL's signature to the redirect target). Shared across
+/// cameras so connection pooling applies to the storage endpoints.
 ///
 /// # Errors
 ///
@@ -59,9 +65,77 @@ pub fn http_client(user_agent: &str) -> Result<reqwest::Client, reqwest::Error> 
         .user_agent(user_agent)
         .timeout(THUMBNAIL_HTTP_TIMEOUT)
         .connect_timeout(THUMBNAIL_CONNECT_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(THUMBNAIL_MAX_REDIRECTS))
+        .redirect(redirect_policy())
+        .referer(false)
+        .dns_resolver(Arc::new(PublicOnlyResolver))
         .https_only(true)
         .build()
+}
+
+/// Follow at most [`THUMBNAIL_MAX_REDIRECTS`] hops, each to a URL that
+/// passes [`is_snapshot_url`]; anything else ends the fetch.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > THUMBNAIL_MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else if !is_snapshot_url(attempt.url().as_str()) {
+            attempt.error("redirect to a host a snapshot may not come from")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// The system resolver, minus every address that is not public: a name
+/// the cloud hands us must not lead the fetch into the user's network.
+struct PublicOnlyResolver;
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let public: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|addr| is_public_ip(addr.ip()))
+                .collect();
+            if public.is_empty() {
+                return Err("the name resolves to no public address".into());
+            }
+            let addrs: reqwest::dns::Addrs = Box::new(public.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+/// Whether `ip` is reachable on the public internet: not loopback,
+/// private, link-local, shared (CGNAT), unspecified, broadcast,
+/// documentation or multicast; IPv4-mapped IPv6 judged as its IPv4.
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            let shared_cgnat = a == 100 && (64..128).contains(&b);
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || shared_cgnat
+                || a == 0)
+        }
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_public_ip(IpAddr::V4(v4)),
+            None => {
+                !(v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || v6.is_unique_local()
+                    || v6.is_unicast_link_local())
+            }
+        },
+    }
 }
 
 /// Adapter that exposes the Arlo snapshot as the domain
@@ -91,6 +165,11 @@ impl ArloThumbnailSourceAdapter {
     }
 
     async fn fetch_jpeg(&self, url: &str, camera: &CameraId) -> Result<Bytes, DomainError> {
+        // The host only: the path and query are the presigned credential.
+        let host = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned));
+        debug!(%camera, storage_host = ?host, "fetching the idle snapshot");
         fetch_jpeg(&self.http, url, camera).await
     }
 
@@ -103,9 +182,9 @@ impl ArloThumbnailSourceAdapter {
             .find(|d| d.device_id == camera.as_str())
             .and_then(|d| d.presigned_last_image_url.clone());
         Ok(match url {
-            Some(u) if is_https_with_host(&u) => Some(u),
+            Some(u) if is_snapshot_url(&u) => Some(u),
             Some(_) => {
-                debug!(%camera, "device list thumbnail url refused: not https with a host");
+                debug!(%camera, "device list thumbnail url refused: not https to a public host");
                 None
             }
             None => None,
@@ -176,7 +255,7 @@ async fn read_body_capped(
 #[async_trait]
 impl ArloThumbnailSource for ArloThumbnailSourceAdapter {
     async fn last_thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, DomainError> {
-        if let Some(url) = self.snapshots.fresh(camera.as_str(), Instant::now()) {
+        if let Some(url) = self.snapshots.fresh(camera, Instant::now()) {
             match self.fetch_jpeg(&url, camera).await {
                 Ok(bytes) => {
                     debug!(%camera, source = "bus", bytes = bytes.len(), "idle snapshot fetched");
@@ -184,7 +263,7 @@ impl ArloThumbnailSource for ArloThumbnailSourceAdapter {
                 }
                 Err(e) => {
                     debug!(%camera, error = %e, "cached snapshot URL failed; using the device list");
-                    self.snapshots.forget(camera.as_str());
+                    self.snapshots.forget(camera);
                 }
             }
         }
@@ -383,5 +462,61 @@ mod tests {
             "{wrapped}"
         );
         assert!(wrapped.contains("thumbnail GET failed"), "{wrapped}");
+    }
+
+    #[test]
+    fn is_public_ip_refuses_every_local_range() {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "192.0.2.1",
+            "224.0.0.1",
+            "::1",
+            "::",
+            "fd00::1",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:192.168.1.1",
+        ] {
+            assert!(!is_public_ip(ip.parse().unwrap()), "{ip} must be refused");
+        }
+        for ip in ["52.216.0.1", "2600:1f18::1", "::ffff:52.216.0.1"] {
+            assert!(is_public_ip(ip.parse().unwrap()), "{ip} is public");
+        }
+    }
+
+    /// A public-looking name that resolves into the LAN must not be
+    /// fetched: `localhost` stands in for one.
+    #[tokio::test]
+    async fn public_only_resolver_refuses_a_name_with_only_local_addresses() {
+        use reqwest::dns::Resolve;
+        let name: reqwest::dns::Name = "localhost".parse().unwrap();
+        assert!(PublicOnlyResolver.resolve(name).await.is_err());
+    }
+
+    /// The production client: a redirect to a local host is not followed,
+    /// and the presigned URL is never sent as `Referer`.
+    #[tokio::test]
+    async fn redirect_policy_refuses_a_hop_to_a_local_host() {
+        let policy_client = reqwest::Client::builder()
+            .redirect(redirect_policy())
+            .referer(false)
+            .build()
+            .unwrap();
+        // A loopback server that redirects to the router.
+        let url = one_shot_server(
+            "302 Found",
+            "Location: https://192.168.1.1/last.jpg\r\nContent-Length: 0\r\n".to_string(),
+            vec![],
+        )
+        .await;
+        let err = policy_client.get(&url).send().await.unwrap_err();
+        assert!(err.is_redirect(), "{err}");
     }
 }
