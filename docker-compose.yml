@@ -11,15 +11,14 @@
 #        ARLO_IMAP_PASSWORD=…     # only for an IMAP mailbox second factor
 #        STREAMER_ADMIN_TOKEN=…   # at least 16 bytes: openssl rand -hex 32
 #   3. The one interactive login, which pairs the second factor, stores the
-#      session in the state volume and lists the device ids:
+#      session in the data volume and lists the device ids:
 #        docker compose run --rm arlo-camera-streamer list-devices --config /etc/arlo-streamer/streamer.toml
 #
 # Then: docker compose up -d && docker compose logs -f
 #
 # Podman: `podman compose` reads this file too. Rootless podman maps the
 # container's uid 10001 to another host uid, so use a host directory for
-# the state (replace `arlo-state:` below with `./state:` and delete the
-# `volumes:` block at the end), owned inside podman's user namespace:
+# the data folder, owned inside podman's user namespace:
 #   mkdir -p state && podman unshare chown -R 10001:10001 state
 # On an SELinux host (Fedora, RHEL, Alma) add `,Z` to both bind mounts.
 # Stream URL: rtsp://<host>:8554/<stream_name>, or
@@ -36,7 +35,7 @@ services:
     # ended, a camera task died) after releasing every live session. A failed
     # Arlo login is paced by the daemon itself (1, 5, 15, then 60 minutes,
     # recorded in the state directory), so a restart loop cannot hammer Arlo.
-    restart: on-failure
+    restart: on-failure:2
     # SIGTERM drains: every live session is released first, but the whole
     # drain can take longer than Docker's default 10 s before the kill.
     stop_grace_period: 30s
@@ -54,7 +53,7 @@ services:
       # uid 10001 with Docker; a host directory instead needs
       # `sudo chown -R 10001:10001 <dir>` once (rootless podman: see the
       # header). The daemon checks it can write here before logging in.
-      - arlo-state:/var/lib/arlo-streamer
+      - ./data:/var/lib/arlo-streamer
     ports:
       - "8554:8554"
       # /metrics, /healthz, /readyz and /admin/*: only with metrics_bind /
@@ -80,6 +79,10 @@ services:
     #         - driver: nvidia
     #           count: 1
     #           capabilities: [gpu, video]
+    device:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    group_add:
+      - "992"
     read_only: true
     tmpfs:
       - /tmp
@@ -94,4 +97,5 @@ services:
         max-file: "3"
 
 volumes:
-  arlo-state:
+  data:
+

@@ -48,3 +48,6 @@ session.json
 
 # Security sweep reports and baseline (local; see /security-sweep)
 .security/
+
+# Data
+data/
