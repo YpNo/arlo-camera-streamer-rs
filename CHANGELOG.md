@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-09
+
+The first published 0.2 image: 0.2.0 was tagged but its image never
+passed the release scan, and would have streamed no idle picture.
+
+### Fixed
+- The image installs `gstreamer1.0-x`, the Debian package of the pango
+  plugin. Without its `textoverlay` (the idle caption), every image so far
+  tore the idle stream down at each client connection; the binary built
+  on a desktop host was unaffected.
+- The daemon checks, before the Arlo login, that every GStreamer element
+  its pipelines use is installed, and refuses to start naming the missing
+  ones (the HLS segmenter's only with `[output.hls]`). The encoder probe
+  also runs before the login now.
+- The release pipeline scans the image from an OCI layout directory:
+  Trivy cannot open an OCI tarball, which failed the 0.2.0 image job.
+
 ## [0.2.0] - 2026-10-09
 
 A Debian 13 image, the rest of the second security sweep, and a boot that
@@ -415,7 +432,8 @@ First release: the daemon as validated on the owner's camera and box.
 - Documentation still described the retired SSE bus and a Chromium
   requirement; both are gone since the move to `arlo-rs` 0.2.0.
 
-[Unreleased]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/YpNo/arlo-camera-streamer-rs/releases/tag/v0.1.0

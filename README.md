@@ -141,11 +141,11 @@ repo root (Debian 13 with GStreamer 1.26, non-root, no setuid binaries,
 Trivy before it is tagged), to GitHub's registry and to Docker Hub:
 
 ```bash
-docker pull ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.0
+docker pull ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.1
 ```
 
 ```bash
-docker pull docker.io/ypno/arlo-camera-streamer-rs:v0.2.0
+docker pull docker.io/ypno/arlo-camera-streamer-rs:v0.2.1
 ```
 
 Tags: `v<version>` (pin this one), `latest` (the newest release), and
@@ -242,7 +242,7 @@ the OTP is typed on stdin:
 docker run --rm -it -e ARLO_PASSWORD -e ARLO_IMAP_PASSWORD \
   -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
   -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \
-  ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.0 list-devices --config /etc/arlo-streamer/streamer.toml
+  ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.1 list-devices --config /etc/arlo-streamer/streamer.toml
 ```
 
 It also warns about configured `arlo_device_id` values the account does
@@ -285,7 +285,7 @@ docker run -d \
   -e ARLO_PASSWORD \
   -e ARLO_IMAP_PASSWORD \
   -e STREAMER_ADMIN_TOKEN \
-  ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.0
+  ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.1
 ```
 
 Two things the image cannot do for you:
