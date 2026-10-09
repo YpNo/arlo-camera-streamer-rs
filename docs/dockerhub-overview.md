@@ -33,7 +33,7 @@ Source, full documentation, changelog and issues:
 
 | Tag | Meaning |
 |---|---|
-| `v<version>` (e.g. `v0.1.1`) | A release. **Pin this one.** |
+| `v<version>` (e.g. `v0.2.0`) | A release. **Pin this one.** |
 | `latest` | The newest release. |
 | `sha-<commit>` | The exact commit a release was built from. |
 
@@ -81,7 +81,7 @@ only when the one-time code is typed on stdin.
 docker run --rm -it -e ARLO_PASSWORD -e ARLO_IMAP_PASSWORD \
   -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
   -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \
-  ypno/arlo-camera-streamer-rs:v0.1.1 list-devices --config /etc/arlo-streamer/streamer.toml
+  ypno/arlo-camera-streamer-rs:v0.2.0 list-devices --config /etc/arlo-streamer/streamer.toml
 ```
 
 **4. Run the daemon.**
@@ -92,12 +92,19 @@ docker run -d --name arlo-camera-streamer --restart on-failure --stop-timeout 30
   -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
   -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \
   -e ARLO_PASSWORD -e ARLO_IMAP_PASSWORD -e STREAMER_ADMIN_TOKEN \
-  ypno/arlo-camera-streamer-rs:v0.1.1
+  ypno/arlo-camera-streamer-rs:v0.2.0
 ```
 
 Or with Compose: the repository's
 [`docker-compose.yml`](https://github.com/YpNo/arlo-camera-streamer-rs/blob/main/docker-compose.yml)
 has the same settings plus a read-only root filesystem and no capabilities.
+
+With rootless podman, own the state directory inside podman's user
+namespace instead of with `sudo chown`:
+`podman unshare chown -R 10001:10001 /var/lib/arlo-streamer` (add `:Z` to
+the mounts on an SELinux host). The daemon checks it can write there before
+it logs in, and waits between failed logins (1, 5, 15, 60 minutes), so a
+restart loop cannot get your address rate-limited by Arlo.
 
 **5. Watch.** `rtsp://<host>:8554/<stream_name>` in VLC or as a Frigate input.
 The idle frame shows at once; walk in front of the camera and the picture

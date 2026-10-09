@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-09
+
+A Debian 13 image, the rest of the second security sweep, and a boot that
+cannot get the Arlo account rate-limited. Stricter defaults (admin token
+format, quota floor, config ceilings) make it a minor release.
+
 ### Changed
 - The image is built on Debian 13 (trixie) with GStreamer 1.26 and Mesa
   25, the versions development and the live gates use; Debian 12 left
@@ -26,8 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release pipeline: the image is built from the version's tag, scanned
   before it is pushed, and a fixable HIGH finding stops it too; secret
   scanning runs on every push, docs-only included.
+- The state directory is checked for writing before the Arlo login: an
+  unwritable volume used to fail only after a successful login, once per
+  restart.
+- Failed Arlo logins are paced across restarts (`login-backoff.json` in
+  the state directory): 1, 5, 15, then 60 minutes, at least 15 after an
+  HTTP 429. A restart loop got an address blocked by Arlo's Cloudflare
+  edge (error 1015).
 
 ### Added
+- Podman notes in the README, the Compose file and the Docker Hub
+  overview: rootless ownership with `podman unshare chown`, `:Z` on
+  SELinux hosts.
 - `scripts/measure.sh`: CPU, memory, threads and RTSP clients of the
   running daemon over time, per number of live cameras, for the
   multi-camera performance check.
@@ -399,6 +415,7 @@ First release: the daemon as validated on the owner's camera and box.
 - Documentation still described the retired SSE bus and a Chromium
   requirement; both are gone since the move to `arlo-rs` 0.2.0.
 
-[Unreleased]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/YpNo/arlo-camera-streamer-rs/releases/tag/v0.1.0

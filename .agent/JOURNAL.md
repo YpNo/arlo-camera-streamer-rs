@@ -487,3 +487,18 @@ Not done: M1 (relay hostname waiver) waits for the TLS live gate; the
           audited module.
 Policy:   an image fix now ships with a version bump (rebuilds use the
           tag's Dockerfile).
+
+## 2026-10-09 — Frigate box: rootless podman, a Cloudflare block; 0.2.0
+Seen:     First deployment on the owner's box (rootless podman 5.4.2, no
+          SELinux, three cameras). The state volume was not writable by
+          uid 10001; the daemon logged in, failed on the session cache and
+          thumbnails, and the restart policy repeated the login until
+          Arlo's Cloudflare edge answered 429 / error 1015.
+Changed:  The state directory is probed before the login; failed logins
+          are paced across restarts (login-backoff.json beside the session
+          cache: 1/5/15/60 min, >= 15 after a 429; DomainError::RateLimited
+          maps HTTP 429). Podman notes in README, compose header and the
+          Docker Hub overview. Version 0.2.0 (trixie image, sweep #2 fixes).
+Owner:    state as a host directory, `podman unshare chown -R 10001:10001`.
+          Compose key is `devices:` (the box's local file had `device:`)
+          and needs `group_add` with the host's render gid.

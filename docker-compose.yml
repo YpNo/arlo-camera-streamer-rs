@@ -15,6 +15,13 @@
 #        docker compose run --rm arlo-camera-streamer list-devices --config /etc/arlo-streamer/streamer.toml
 #
 # Then: docker compose up -d && docker compose logs -f
+#
+# Podman: `podman compose` reads this file too. Rootless podman maps the
+# container's uid 10001 to another host uid, so use a host directory for
+# the state (replace `arlo-state:` below with `./state:` and delete the
+# `volumes:` block at the end), owned inside podman's user namespace:
+#   mkdir -p state && podman unshare chown -R 10001:10001 state
+# On an SELinux host (Fedora, RHEL, Alma) add `,Z` to both bind mounts.
 # Stream URL: rtsp://<host>:8554/<stream_name>, or
 # rtsp://arlo-camera-streamer:8554/<stream_name> from a container on the
 # same Compose network (Frigate's go2rtc, for one).
@@ -23,10 +30,12 @@ services:
   arlo-camera-streamer:
     # Pin a release; `latest` follows the newest one. Same image on
     # docker.io/ypno/arlo-camera-streamer-rs. amd64 and arm64.
-    image: ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.1
+    image: ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.0
     container_name: arlo-camera-streamer
     # A non-zero exit means the daemon stopped on its own (the Arlo event bus
-    # ended, a camera task died) after releasing every live session.
+    # ended, a camera task died) after releasing every live session. A failed
+    # Arlo login is paced by the daemon itself (1, 5, 15, then 60 minutes,
+    # recorded in the state directory), so a restart loop cannot hammer Arlo.
     restart: on-failure
     # SIGTERM drains: every live session is released first, but the whole
     # drain can take longer than Docker's default 10 s before the kill.
@@ -42,8 +51,9 @@ services:
       - ./config:/etc/arlo-streamer:ro
       # Session cache and idle thumbnails (and HLS segments when
       # [output.hls] is set). A named volume is created owned by the image's
-      # uid 10001; a host directory instead needs
-      # `sudo chown -R 10001:10001 <dir>` once.
+      # uid 10001 with Docker; a host directory instead needs
+      # `sudo chown -R 10001:10001 <dir>` once (rootless podman: see the
+      # header). The daemon checks it can write here before logging in.
       - arlo-state:/var/lib/arlo-streamer
     ports:
       - "8554:8554"

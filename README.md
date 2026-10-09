@@ -141,11 +141,11 @@ repo root (Debian 13 with GStreamer 1.26, non-root, no setuid binaries,
 Trivy before it is tagged), to GitHub's registry and to Docker Hub:
 
 ```bash
-docker pull ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.1
+docker pull ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.0
 ```
 
 ```bash
-docker pull docker.io/ypno/arlo-camera-streamer-rs:v0.1.1
+docker pull docker.io/ypno/arlo-camera-streamer-rs:v0.2.0
 ```
 
 Tags: `v<version>` (pin this one), `latest` (the newest release), and
@@ -242,7 +242,7 @@ the OTP is typed on stdin:
 docker run --rm -it -e ARLO_PASSWORD -e ARLO_IMAP_PASSWORD \
   -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
   -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \
-  ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.1 list-devices --config /etc/arlo-streamer/streamer.toml
+  ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.0 list-devices --config /etc/arlo-streamer/streamer.toml
 ```
 
 It also warns about configured `arlo_device_id` values the account does
@@ -285,15 +285,16 @@ docker run -d \
   -e ARLO_PASSWORD \
   -e ARLO_IMAP_PASSWORD \
   -e STREAMER_ADMIN_TOKEN \
-  ghcr.io/ypno/arlo-camera-streamer-rs:v0.1.1
+  ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.0
 ```
 
 Two things the image cannot do for you:
 
 - **The state directory must be writable by uid 10001**, the user the
   image runs as. A host bind mount keeps the host's ownership, so run
-  `sudo chown -R 10001:10001 /var/lib/arlo-streamer` once (a named volume
-  needs nothing). Otherwise the boot fails on the session cache directory.
+  `sudo chown -R 10001:10001 /var/lib/arlo-streamer` once (a Docker named
+  volume needs nothing). The daemon checks this before it logs in to Arlo
+  and stops with the command to run if it cannot write there.
 - **`metrics_bind` and `admin_bind` default to `127.0.0.1`**, which inside
   the container is unreachable from the host even with `-p`. To scrape
   metrics or call `/admin/*` from the host, set them to `0.0.0.0:9090` and
@@ -335,6 +336,32 @@ docker compose run --rm arlo-camera-streamer list-devices --config /etc/arlo-str
 ```bash
 docker compose up -d
 ```
+
+### Podman
+
+`podman compose` and `podman run` take the same file and flags, with two
+differences:
+
+- **Rootless podman maps uid 10001 to another host uid**, so neither a
+  plain `chown 10001` nor a named volume gives the daemon its state
+  directory. Use a host directory owned inside podman's user namespace,
+  and mount it in place of the `arlo-state` volume (`./state:/var/lib/arlo-streamer`):
+
+  ```bash
+  mkdir -p state && podman unshare chown -R 10001:10001 state
+  ```
+
+  `podman unshare ls -ln state` shows the ownership the container sees.
+- **On an SELinux host** (Fedora, RHEL, Alma), add `,Z` to the bind
+  mounts (`./config:/etc/arlo-streamer:ro,Z`, `./state:/var/lib/arlo-streamer:Z`);
+  "Permission denied" with correct ownership is the sign.
+
+A boot that keeps failing does not keep logging in: each failed Arlo login
+is recorded in the state directory, and the next attempt waits 1, 5, 15,
+then 60 minutes (at least 15 after Arlo answers "too many requests"),
+however often the container restarts. The log says how long it waits.
+Arlo's Cloudflare edge blocks an address that logs in too often (HTTP 429,
+error 1015); the block lifts by itself after a while without attempts.
 
 ### Frigate integration
 
@@ -515,6 +542,9 @@ on `/metrics` the same for a dashboard.
 |---|---|---|
 | Boot stops at the session cache | `session_cache_path directory … cannot be created` | Directory not writable by the daemon user (uid 10001 in the image). |
 | A code is asked at every restart | the login runbook's symptom table | Session cache on a non-persistent path, or the Arlo password changed. |
+| Boot stops with `session_cache_path directory … is not writable` | that line | The state directory is not owned by uid 10001: `sudo chown -R 10001:10001 <dir>`, or `podman unshare chown -R 10001:10001 <dir>` with rootless podman ([Podman](#podman)). |
+| `429 Too Many Requests` / `rate_limited` (Cloudflare error 1015) at login | `Arlo login failed rate_limited=true next_login_in_secs=…` | Too many logins from your address, usually a crash loop before the session cache could be written. Stop the container, fix the first error, wait an hour, start once. The daemon waits by itself between failed logins. |
+| `an earlier Arlo login failed; waiting before the next one` | `wait_secs=…` | The pause after a failed login (`login-backoff.json` in the state directory). It ends on its own; delete that file to log in at once, if you are sure the cause is fixed. |
 | Boot stops on the encoder | `is not usable on this host` | An explicit `video_encoder` whose device or plugin is missing; use `auto` or install the plugin. |
 | VLC connects, idle frame shows, never goes live | `to=Activating` then `attach_live failed …` | Read the reason: `webrtcbin has no sink request pad` is the missing `gstreamer1.0-nice`; `camera busy` is the Arlo app viewing; `splice timeout` is no RTP from Arlo (firewall on UDP, try `ice_address_family = "ipv4"`). |
 | Live starts and drops after ~10 s | `live source stalled` | UDP to Arlo's TURN blocked after the handshake, or the camera's own network. |
