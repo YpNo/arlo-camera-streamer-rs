@@ -682,9 +682,11 @@ tagged `v<version>`, `latest` and `sha-<commit>` on
 `ghcr.io/ypno/arlo-camera-streamer-rs` and on
 `docker.io/ypno/arlo-camera-streamer-rs` (Docker Hub needs the repository
 variable `DOCKERHUB_USERNAME` and the secret `DOCKERHUB_TOKEN`; without
-them GHCR alone is published). A version whose image is missing a
-platform in any registry is rebuilt from its tag on the next push to
-`main`; a registry error fails the run instead of being read as "absent".
+them GHCR alone is published). The image build keeps its layers in the
+Actions cache per platform, so the dependency layer (only changed by
+`Cargo.lock`) is not recompiled at every release. A version whose image
+is missing a platform in any registry is rebuilt from its tag on the next
+push to `main`; a registry error fails the run instead of being read as "absent".
 A fix to the image itself (the `Dockerfile`) therefore ships with a new
 version. A push without a version bump publishes nothing, and no crate is
 ever published: the workspace is `publish = false`.

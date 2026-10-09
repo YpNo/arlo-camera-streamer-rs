@@ -31,6 +31,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Runners are pinned to ubuntu-24.04 (and ubuntu-24.04-arm): the jobs
+# install GStreamer and build dependencies by package name, and the
+# ubuntu-latest label moves to Ubuntu 26 from 2026-10-19. Move the pin
+# deliberately, in its own change, once the packages are checked there.
+
 permissions:
   contents: read
 
@@ -44,7 +49,7 @@ concurrency:
 jobs:
   format:
     name: Check Formatting
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     # Root of the build chain: the weekly schedule is for the audit only,
     # and every build job below `needs` this one.
@@ -60,7 +65,7 @@ jobs:
 
   clippy:
     name: Lint with Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs: [format]
     steps:
@@ -82,7 +87,7 @@ jobs:
 
   test:
     name: Run Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: [clippy] # same build, warmed by clippy's cache; a lint failure skips it
     steps:
@@ -113,7 +118,7 @@ jobs:
   # workflow (secret-scan.yml), which runs on docs-only pushes too.
   security:
     name: Security & License Audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -141,7 +146,7 @@ jobs:
 
   doc:
     name: Documentation Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs: [clippy]
     steps:
@@ -163,7 +168,7 @@ jobs:
 
   coverage:
     name: Code Coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: [test]
     # The costliest job (instrumented rebuild + the GStreamer integration
@@ -233,7 +238,7 @@ jobs:
 
   sonarqube:
     name: SonarQube
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [test]
     if: github.actor != 'renovate[bot]' # a bump carries no code to analyse
@@ -260,7 +265,7 @@ jobs:
   # per version, never for an unversioned push.
   release:
     name: Create GitHub Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     needs: [format, clippy, test, security, doc, coverage]
     if: >-
@@ -403,7 +408,7 @@ jobs:
   # `publish = false`.
   image:
     name: Container image (${{ matrix.platform }})
-    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 90
     needs: [release]
     if: needs.release.outputs.image_missing == 'true'
@@ -461,6 +466,12 @@ jobs:
           provenance: mode=max
           sbom: true
           outputs: type=oci,dest=/tmp/image.tar
+          # Every layer, the builder's included, goes to the Actions cache
+          # per platform: the dependency layer (crates, BoringSSL, the
+          # GStreamer bindings) only changes with Cargo.lock, so the next
+          # release compiles our crates only.
+          cache-from: type=gha,scope=image-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.platform }}
       # Report HIGH and CRITICAL; stop on any fixable one (.trivyignore
       # holds the reviewed exceptions, none so far).
       - name: Vulnerability report
@@ -505,6 +516,7 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=image-${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           # SLSA provenance and an SPDX SBOM are attached to every digest.
           provenance: mode=max
@@ -529,7 +541,7 @@ jobs:
 
   image-publish:
     name: Tag the image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs: [release, image]
     permissions:

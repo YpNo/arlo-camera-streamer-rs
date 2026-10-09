@@ -35,28 +35,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
+ENV CARGO_TERM_COLOR=never
 
-# 1) Copy the workspace manifests first to maximize layer cache hits on
-#    iterative source-only changes.
-COPY Cargo.toml Cargo.lock ./
+# 1) The dependencies, in a layer of their own: the manifests, the lockfile
+#    and the toolchain pin, with empty placeholder sources, built in release
+#    mode. That layer (crates downloaded, BoringSSL and GStreamer bindings
+#    compiled) only changes with Cargo.lock, so CI restores it from its
+#    layer cache and a release compiles our crates only. No cache mount
+#    here: a mount is not part of the layer, so a fresh CI runner would
+#    start from nothing. `--locked` blocks Cargo.lock churn during deploy.
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY crates/streamer-app/Cargo.toml         crates/streamer-app/Cargo.toml
 COPY crates/streamer-bin/Cargo.toml         crates/streamer-bin/Cargo.toml
 COPY crates/streamer-domain/Cargo.toml      crates/streamer-domain/Cargo.toml
 COPY crates/streamer-infra-arlo/Cargo.toml  crates/streamer-infra-arlo/Cargo.toml
 COPY crates/streamer-infra-media/Cargo.toml crates/streamer-infra-media/Cargo.toml
 COPY crates/streamer-infra-ops/Cargo.toml   crates/streamer-infra-ops/Cargo.toml
-COPY rust-toolchain.toml clippy.toml deny.toml rustfmt.toml ./
+RUN for crate in crates/*/; do mkdir -p "${crate}src" && touch "${crate}src/lib.rs"; done \
+ && echo 'fn main() {}' > crates/streamer-bin/src/main.rs \
+ && cargo build --release --locked --package arlo-camera-streamer \
+ && rm -rf crates/*/src
 
-# 2) Copy the actual source.
+# 2) Our sources. Their timestamps may predate the placeholder build above,
+#    and cargo decides what to rebuild by timestamp: touch them, or the
+#    placeholder binary would ship.
 COPY crates/ crates/
-
-# 3) Build the release binary.
-#    `--locked` blocks accidental Cargo.lock churn during deploy.
-ENV CARGO_TERM_COLOR=never
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo build --release --locked --package arlo-camera-streamer \
- && cp /build/target/release/arlo-camera-streamer /tmp/arlo-camera-streamer
+RUN find crates -name '*.rs' -exec touch {} + \
+ && cargo build --release --locked --package arlo-camera-streamer
 
 # ----------------------------------------------------------------------
 # Stage 2 — runtime
@@ -112,20 +117,20 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends \
 # The setuid/setgid bits go too (su, passwd, mount, …): the daemon needs
 # none of them, and each is a way back to root for a local exploit when
 # the container runs without `no-new-privileges`.
-RUN groupadd --system --gid 10001 streamer \
- && useradd  --system --uid 10001 --gid streamer --create-home --shell /usr/sbin/nologin streamer \
- && find / -xdev -perm /6000 -type f -exec chmod a-s {} +
-
-WORKDIR /app
-COPY --from=builder /tmp/arlo-camera-streamer /usr/local/bin/arlo-camera-streamer
-RUN chmod +x /usr/local/bin/arlo-camera-streamer
-
 # Default mount points (overridable at runtime):
 # - /etc/arlo-streamer/streamer.toml — config (read-only)
 # - /var/lib/arlo-streamer            — session cache + thumbnails
 # - /var/lib/arlo-streamer/hls         — HLS output (when [output.hls] is set)
-RUN mkdir -p /etc/arlo-streamer /var/lib/arlo-streamer/hls \
+RUN groupadd --system --gid 10001 streamer \
+ && useradd  --system --uid 10001 --gid streamer --create-home --shell /usr/sbin/nologin streamer \
+ && find / -xdev -perm /6000 -type f -exec chmod a-s {} + \
+ && mkdir -p /etc/arlo-streamer /var/lib/arlo-streamer/hls \
  && chown -R streamer:streamer /var/lib/arlo-streamer
+
+WORKDIR /app
+# Last, as it changes with every commit; the mode is set in the copy itself
+# (a `RUN chmod` after it stored the 27 MB binary a second time).
+COPY --from=builder --chmod=0755 /build/target/release/arlo-camera-streamer /usr/local/bin/arlo-camera-streamer
 
 # Numeric so the runtime can verify the image runs unprivileged without
 # resolving the name (Kubernetes `runAsNonRoot`, Docker Scout).
