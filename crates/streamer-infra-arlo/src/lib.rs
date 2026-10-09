@@ -31,7 +31,7 @@ pub mod stream_requester;
 pub mod thumbnails;
 pub mod user_view;
 
-/// The authenticated client [`boot`] returns, for the composition root.
+/// The authenticated client `boot()` returns, for the composition root.
 pub use arlo_rs::client::ArloClient;
 pub use boot::boot;
 pub use device_registry::DeviceRegistry;

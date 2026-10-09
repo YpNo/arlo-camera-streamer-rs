@@ -14,7 +14,7 @@
 //! All routes require a `Authorization: Bearer <token>` header that
 //! matches the token configured on [`AdminServer::new`]. A constant-
 //! time comparison guards against timing-leak side channels. The check
-//! is one layer over every route ([`require_bearer`]), so a route added
+//! is one layer over every route (`require_bearer`), so a route added
 //! later cannot forget it, and it runs before any extractor.
 //!
 //! Tokens shorter than [`MIN_ADMIN_TOKEN_BYTES`] are rejected at
@@ -152,7 +152,7 @@ impl AdminServer {
         })
     }
 
-    /// Build the axum router: every route behind [`require_bearer`].
+    /// Build the axum router: every route behind `require_bearer`.
     /// Exposed for tests.
     pub fn router(&self) -> Router {
         Router::new()
