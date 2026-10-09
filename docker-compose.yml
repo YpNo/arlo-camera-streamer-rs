@@ -19,7 +19,7 @@
 # Podman: `podman compose` reads this file too. Rootless podman maps the
 # container's uid 10001 to another host uid, so use a host directory for
 # the data folder, owned inside podman's user namespace:
-#   mkdir -p state && podman unshare chown -R 10001:10001 state
+#   mkdir -p data && podman unshare chown -R 10001:10001 data
 # On an SELinux host (Fedora, RHEL, Alma) add `,Z` to both bind mounts.
 # Stream URL: rtsp://<host>:8554/<stream_name>, or
 # rtsp://arlo-camera-streamer:8554/<stream_name> from a container on the
@@ -79,7 +79,7 @@ services:
     #         - driver: nvidia
     #           count: 1
     #           capabilities: [gpu, video]
-    device:
+    devices:
       - /dev/dri/renderD128:/dev/dri/renderD128
     group_add:
       - "992"
@@ -95,7 +95,4 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  data:
 

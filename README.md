@@ -322,10 +322,13 @@ subcommand against `metrics_bind`.
 ### Docker Compose
 
 [`docker-compose.yml`](./docker-compose.yml) runs the same image with the
-settings above built in: the 30 s stop grace period, `restart: on-failure`,
-a named state volume (no `chown` needed), a read-only root filesystem, no
-capabilities, rotated logs, and commented blocks for the hardware encoders
-and the ops ports. Its header lists the three files to prepare —
+settings above built in: the 30 s stop grace period, a restart policy,
+the state in `./data` beside the file (owned by uid 10001: `sudo chown -R
+10001:10001 data`, or `podman unshare chown -R 10001:10001 data`), a
+read-only root filesystem, no capabilities, rotated logs, a VA-API device
+with its render group (adjust the gid to `getent group render`, or remove
+both lines on a box without a GPU), and commented blocks for the other
+encoders and the ops ports. Its header lists the three files to prepare —
 `config/streamer.toml`, a `.env` with the secrets (gitignored), and the one
 interactive `list-devices` login:
 
