@@ -678,7 +678,7 @@ history.
 After every gate, a push to `main` whose `Cargo.toml` version has no
 release yet gets a GitHub release tagged `v<version>`, then the container
 image for that version, built from the tag's commit: per platform on
-native runners, into a local archive scanned with Trivy before any
+native runners, into a local OCI layout scanned with Trivy before any
 registry login (a fixable CRITICAL or HIGH finding stops the release;
 reviewed exceptions go in `.trivyignore`), then pushed by digest and
 tagged `v<version>`, `latest` and `sha-<commit>` on
