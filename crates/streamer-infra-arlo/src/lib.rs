@@ -25,15 +25,19 @@ pub mod error;
 pub mod event_mapper;
 pub mod events;
 pub mod ice;
+pub mod login_backoff;
 pub mod snapshot_cache;
 pub mod stream_requester;
 pub mod thumbnails;
 pub mod user_view;
 
+/// The authenticated client [`boot`] returns, for the composition root.
+pub use arlo_rs::client::ArloClient;
 pub use boot::boot;
 pub use device_registry::DeviceRegistry;
 pub use discovery::discover_devices;
 pub use events::ArloEventSourceAdapter;
+pub use login_backoff::LoginBackoff;
 pub use snapshot_cache::SnapshotUrlCache;
 pub use stream_requester::ArloWebrtcSignalerAdapter;
 pub use thumbnails::ArloThumbnailSourceAdapter;

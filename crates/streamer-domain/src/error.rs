@@ -41,6 +41,12 @@ pub enum DomainError {
     /// application waits for the view to end instead of backing off.
     #[error("camera busy: {0}")]
     CameraBusy(String),
+
+    /// The cloud refused the request for now (HTTP 429: Arlo or its
+    /// Cloudflare edge). Retrying soon makes it last longer; the boot
+    /// waits before the next login.
+    #[error("rate limited: {0}")]
+    RateLimited(String),
 }
 
 /// Longest adapter-sourced reason kept, in bytes. The text reaches the

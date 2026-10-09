@@ -39,7 +39,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -53,14 +53,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use secrecy::SecretString;
 use streamer_app::system::StreamerSystem;
 use streamer_domain::config::StreamerConfig;
+use streamer_domain::error::DomainError;
 use streamer_domain::event::ConnectionStatus;
 use streamer_domain::port::{
     AdminControl, ArloEventSource, ArloThumbnailSource, MetricsRecorder, UserViewSource,
     WebrtcSignaler,
 };
+use streamer_infra_arlo::login_backoff::delay_after;
 use streamer_infra_arlo::{
-    ArloEventSourceAdapter, ArloThumbnailSourceAdapter, ArloUserViewSourceAdapter,
-    ArloWebrtcSignalerAdapter, DeviceRegistry, SnapshotUrlCache, boot::boot,
+    ArloClient, ArloEventSourceAdapter, ArloThumbnailSourceAdapter, ArloUserViewSourceAdapter,
+    ArloWebrtcSignalerAdapter, DeviceRegistry, LoginBackoff, SnapshotUrlCache, boot::boot,
 };
 use streamer_infra_media::{GstMediaMultiplexer, GstPipelineRegistry, RtspServer};
 use streamer_infra_ops::admin_server::check_admin_token;
@@ -210,23 +212,13 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
         })
     };
 
-    // -- Arlo adapters --
-    let ArloAdapters {
-        event_source,
-        signaler,
-        thumbnails,
-        user_views,
-    } = arlo_adapters(&config).await?;
-
-    // -- Media adapter --
-    let rtsp_server =
-        RtspServer::start(&config.output.rtsp.bind).context("failed to start RTSP server")?;
-    // The encoder is probed on this host (ADR 0008): `auto` takes the first
-    // working backend, an explicit one must work or the boot fails here.
-    let video_encoder = streamer_infra_media::encoder::resolve(config.output.video_encoder)
-        .context("no usable H.264 encoder")?;
+    // -- State directory, before the Arlo login --
+    //
     // Idle thumbnails live beside the session cache (owner-only), never
-    // in the shared temp directory where another user could plant one.
+    // in the shared temp directory where another user could plant one. An
+    // unwritable state directory fails here, before any request reaches
+    // Arlo: failing after the login made a restart policy log in again and
+    // again until Cloudflare blocked the address.
     let thumbnail_dir = thumbnail_dir(&config);
     {
         // Filesystem work stays off the runtime's worker threads.
@@ -236,6 +228,26 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
             .context("thumbnail directory task")?
             .with_context(|| format!("thumbnail directory {}", thumbnail_dir.display()))?;
     }
+
+    // -- Arlo login, paced, then the adapters --
+    let Some(arlo_client) = login_paced(&config, &mut signals).await? else {
+        info!("stopped before the Arlo login");
+        return Ok(());
+    };
+    let ArloAdapters {
+        event_source,
+        signaler,
+        thumbnails,
+        user_views,
+    } = arlo_adapters(&config, arlo_client)?;
+
+    // -- Media adapter --
+    let rtsp_server =
+        RtspServer::start(&config.output.rtsp.bind).context("failed to start RTSP server")?;
+    // The encoder is probed on this host (ADR 0008): `auto` takes the first
+    // working backend, an explicit one must work or the boot fails here.
+    let video_encoder = streamer_infra_media::encoder::resolve(config.output.video_encoder)
+        .context("no usable H.264 encoder")?;
     let pipeline_registry = Arc::new(GstPipelineRegistry::new(
         rtsp_server.clone(),
         video_encoder,
@@ -463,10 +475,73 @@ struct ArloAdapters {
 }
 
 /// Boot the Arlo client and build the four adapters on it.
-async fn arlo_adapters(config: &StreamerConfig) -> Result<ArloAdapters> {
-    let arlo_client = boot(&config.arlo)
-        .await
-        .context("failed to boot arlo-rs client")?;
+/// Log in to Arlo, not sooner than the persisted back-off allows, and
+/// record the outcome (`streamer_infra_arlo::login_backoff`): a restart
+/// policy must not turn a failing boot into a login per restart. `None`
+/// when a stop signal arrives during the wait. Errors that never reached
+/// Arlo (configuration, the state directory) do not count.
+async fn login_paced(
+    config: &StreamerConfig,
+    signals: &mut ShutdownSignals,
+) -> Result<Option<Arc<ArloClient>>> {
+    let backoff = LoginBackoff::beside(&config.arlo.session_cache_path);
+    let wait = backoff.remaining(SystemTime::now()).await;
+    if !wait.is_zero() {
+        warn!(
+            wait_secs = wait.as_secs(),
+            "an earlier Arlo login failed; waiting before the next one (a restart does not shorten it)"
+        );
+        if !pause_unless_stopped(wait, signals).await {
+            return Ok(None);
+        }
+    }
+    let error = match boot(&config.arlo).await {
+        Ok(client) => {
+            backoff.clear().await;
+            return Ok(Some(client));
+        }
+        Err(e) => e,
+    };
+    if !matches!(error, DomainError::InvalidConfig(_)) {
+        let rate_limited = matches!(error, DomainError::RateLimited(_));
+        match backoff
+            .record_failure(SystemTime::now(), rate_limited)
+            .await
+        {
+            Ok(pause) => error!(
+                rate_limited,
+                next_login_in_secs = pause.as_secs(),
+                "Arlo login failed"
+            ),
+            Err(io) => {
+                // Nothing persisted: pause here, or the restart that
+                // follows logs in again at once.
+                let pause = delay_after(if rate_limited { 3 } else { 1 });
+                warn!(
+                    error = %io,
+                    pause_secs = pause.as_secs(),
+                    "login back-off not recorded; pausing before exiting"
+                );
+                pause_unless_stopped(pause, signals).await;
+            }
+        }
+    }
+    Err(anyhow::Error::new(error).context("failed to boot arlo-rs client"))
+}
+
+/// Sleep `pause`, or less when a stop signal arrives. Returns whether the
+/// whole pause elapsed.
+async fn pause_unless_stopped(pause: Duration, signals: &mut ShutdownSignals) -> bool {
+    tokio::select! {
+        () = tokio::time::sleep(pause) => true,
+        signal = signals.recv() => {
+            warn!(signal, "stop requested while waiting to log in");
+            false
+        }
+    }
+}
+
+fn arlo_adapters(config: &StreamerConfig, arlo_client: Arc<ArloClient>) -> Result<ArloAdapters> {
     // One shared HTTP client (https only, bounded in time and redirects)
     // so connection pooling kicks in across cameras when fetching
     // presigned thumbnail URLs.

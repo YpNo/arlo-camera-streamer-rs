@@ -130,7 +130,7 @@ async fn ensure_cache_dir(cache_path: &Path) -> Result<(), DomainError> {
     };
     if let Ok(meta) = tokio::fs::metadata(parent).await {
         if meta.is_dir() {
-            return Ok(());
+            return ensure_writable(parent).await;
         }
         return Err(DomainError::InvalidConfig(format!(
             "session_cache_path directory {} exists but is not a directory",
@@ -166,7 +166,41 @@ async fn ensure_cache_dir(cache_path: &Path) -> Result<(), DomainError> {
         })?;
     }
     info!(path = %parent.display(), "created session cache directory");
-    Ok(())
+    ensure_writable(parent).await
+}
+
+/// Prove the state directory takes a file before anything talks to Arlo.
+/// An unwritable volume used to surface only after a successful login
+/// (the session cache, then the thumbnails), and a restart policy turned
+/// that into one login per restart until Cloudflare blocked the address.
+///
+/// # Errors
+///
+/// [`DomainError::InvalidConfig`] naming the directory and how to fix
+/// its ownership.
+async fn ensure_writable(dir: &Path) -> Result<(), DomainError> {
+    use tokio::io::AsyncWriteExt;
+    // Container PIDs repeat: a probe left by a crash would block create_new.
+    let probe = dir.join(format!(".write-probe-{}", std::process::id()));
+    let _ = tokio::fs::remove_file(&probe).await;
+    let written = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .await?;
+        file.write_all(b"ok").await
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&probe).await;
+    written.map_err(|e| {
+        DomainError::InvalidConfig(format!(
+            "session_cache_path directory {} is not writable by this process: {e}. \
+             The image runs as uid 10001: `chown -R 10001:10001` the state directory \
+             (rootless podman: `podman unshare chown -R 10001:10001 <dir>`)",
+            dir.display()
+        ))
+    })
 }
 
 fn utf8_path(p: &Path) -> Result<String, DomainError> {
@@ -526,5 +560,32 @@ mod tests {
         ensure_cache_dir(Path::new("session.json"))
             .await
             .expect("no parent means nothing to create");
+    }
+
+    /// An unwritable state volume used to fail only after the login, so a
+    /// restart policy logged in again and again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_cache_dir_fails_on_a_directory_it_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_dir("read-only");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let err = ensure_cache_dir(&root.join("session.json"))
+            .await
+            .expect_err("an unwritable directory must fail before the login");
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(err.to_string().contains("not writable"), "{err}");
+        assert!(
+            err.to_string().contains("10001"),
+            "says how to fix it: {err}"
+        );
+        assert!(
+            std::fs::read_dir(&root).unwrap().next().is_none(),
+            "no probe file left behind"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }
