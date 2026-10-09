@@ -27,6 +27,7 @@
 //! | Module          | Pure | Notes                                              |
 //! |-----------------|:----:|----------------------------------------------------|
 //! | [`error`]       |  ✓   | [`MediaError`] + mapping to [`DomainError`].       |
+//! | [`elements`]    |      | The GStreamer elements checked at boot.            |
 //! | [`idle_source`] |  ✓   | JPEG-still vs synthetic selection.                 |
 //! | [`pipeline_desc`]|  ✓  | `gst-launch` description builders.                 |
 //! | [`splice`]      |  ✓   | Keyframe / IDR detection helpers.                  |
@@ -45,6 +46,7 @@
 #![forbid(unsafe_code)]
 
 pub mod codec_cache;
+pub mod elements;
 pub mod encoder;
 pub mod error;
 pub mod gst_pipeline;
