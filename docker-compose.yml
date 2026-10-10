@@ -62,10 +62,12 @@ services:
       # - "127.0.0.1:9090:9090"
       # - "127.0.0.1:9091:9091"
     # Hardware H.264 encoder for video_encoder = "auto". Uncomment what the
-    # box has; the boot log names the winner: `video encoder (auto) encoder=…`.
-    # The device must be usable by uid 10001, so add the group that owns it
-    # on the host, by number: `getent group render` (VA-API) or
-    # `getent group video` (Raspberry Pi).
+    # box has (or put it in a docker-compose.override.yml beside this file,
+    # gitignored); the boot log names the winner: `video encoder (auto)
+    # encoder=…`. The device must be usable by uid 10001, so add the group
+    # that owns it on the host, by number: `getent group render` (VA-API) or
+    # `getent group video` (Raspberry Pi). Rootless podman cannot map that
+    # group: put your user in it and use `- keep-groups` instead.
     # devices:
     #   - /dev/dri:/dev/dri            # Intel / AMD GPU (VA-API)
     #   - /dev/video11:/dev/video11    # Raspberry Pi 4 / Zero 2 / CM4
@@ -79,10 +81,6 @@ services:
     #         - driver: nvidia
     #           count: 1
     #           capabilities: [gpu, video]
-    devices:
-      - /dev/dri/renderD128:/dev/dri/renderD128
-    group_add:
-      - "992"
     read_only: true
     tmpfs:
       - /tmp

@@ -312,7 +312,9 @@ on a Raspberry Pi 4 / Zero 2 / CM4, `--gpus all` with the NVIDIA
 container toolkit for NVENC. uid 10001 must be allowed to open the
 device: add the group that owns it on the host by number,
 `--group-add "$(getent group render | cut -d: -f3)"` (`video` on a Pi);
-without it the encoder fails its dry run and `auto` falls back to x264. A Raspberry Pi 5 has no H.264 hardware
+without it the encoder fails its dry run and `auto` falls back to x264
+(the log warns when a render node is present and unused). Rootless podman
+needs `--group-add keep-groups` instead ([Podman](#podman)). A Raspberry Pi 5 has no H.264 hardware
 encoder; it runs x264 in software. The image sets
 `RUST_LOG=info,arlo_camera_streamer=info` on purpose, quieter than the
 binary's own default, because a container runs unattended for months; pass
@@ -325,10 +327,10 @@ subcommand against `metrics_bind`.
 settings above built in: the 30 s stop grace period, a restart policy,
 the state in `./data` beside the file (owned by uid 10001: `sudo chown -R
 10001:10001 data`, or `podman unshare chown -R 10001:10001 data`), a
-read-only root filesystem, no capabilities, rotated logs, a VA-API device
-with its render group (adjust the gid to `getent group render`, or remove
-both lines on a box without a GPU), and commented blocks for the other
-encoders and the ops ports. Its header lists the three files to prepare —
+read-only root filesystem, no capabilities, rotated logs, and commented
+blocks for the GPU encoders and the ops ports. Machine-specific settings
+such as the GPU device belong in a `docker-compose.override.yml` beside
+it (gitignored), which `docker compose` and `podman compose` merge in. Its header lists the three files to prepare —
 `config/streamer.toml`, a `.env` with the secrets (gitignored), and the one
 interactive `list-devices` login:
 
@@ -358,6 +360,24 @@ differences:
 - **On an SELinux host** (Fedora, RHEL, Alma), add `,Z` to the bind
   mounts (`./config:/etc/arlo-streamer:ro,Z`, `./state:/var/lib/arlo-streamer:Z`);
   "Permission denied" with correct ownership is the sign.
+- **A GPU device needs `keep-groups`, not the render gid.** Rootless
+  podman cannot map the host's render group into the container: the
+  device shows as owned by `65534` there and `--group-add <gid>` grants
+  nothing. Put your own user in the render group (`sudo usermod -aG
+  render "$USER"`, then log in again) and pass `--group-add keep-groups`,
+  which keeps your groups for the container (crun only). In a
+  `docker-compose.override.yml`:
+
+  ```yaml
+  services:
+    arlo-camera-streamer:
+      devices:
+        - /dev/dri/renderD128:/dev/dri/renderD128
+      group_add:
+        - keep-groups
+  ```
+
+  Docker rejects `keep-groups`; there, add the render group's number.
 
 A boot that keeps failing does not keep logging in: each failed Arlo login
 is recorded in the state directory, and the next attempt waits 1, 5, 15,
@@ -549,6 +569,7 @@ on `/metrics` the same for a dashboard.
 | `429 Too Many Requests` / `rate_limited` (Cloudflare error 1015) at login | `Arlo login failed rate_limited=true next_login_in_secs=…` | Too many logins from your address, usually a crash loop before the session cache could be written. Stop the container, fix the first error, wait an hour, start once. The daemon waits by itself between failed logins. |
 | `an earlier Arlo login failed; waiting before the next one` | `wait_secs=…` | The pause after a failed login (`login-backoff.json` in the state directory). It ends on its own; delete that file to log in at once, if you are sure the cause is fixed. |
 | Boot stops on the encoder | `is not usable on this host` | An explicit `video_encoder` whose device or plugin is missing; use `auto` or install the plugin. |
+| x264 although the box has a GPU | `a GPU render node is present but no hardware H.264 encoder works` (its `skipped` field gives each reason) | `plugin registered no …`: the device is not passed through or not readable by uid 10001 (the render group; `keep-groups` with rootless [Podman](#podman)), or the driver has no H.264 encoder. `missing GStreamer element(s)`: the plugin is not installed. |
 | VLC connects, idle frame shows, never goes live | `to=Activating` then `attach_live failed …` | Read the reason: `webrtcbin has no sink request pad` is the missing `gstreamer1.0-nice`; `camera busy` is the Arlo app viewing; `splice timeout` is no RTP from Arlo (firewall on UDP, try `ice_address_family = "ipv4"`). |
 | Live starts and drops after ~10 s | `live source stalled` | UDP to Arlo's TURN blocked after the handshake, or the camera's own network. |
 | Motion in front of the camera, nothing in the log | `camera trigger pulse` at `streamer_infra_arlo::events=debug`; `event for unconfigured camera` at `streamer_app::router=trace` | Motion detection or the armed mode is off in the Arlo app, or the camera's `arlo_device_id` is not in `[[cameras]]`. |
@@ -603,14 +624,24 @@ takes the first encoder that works, in this order:
 | Backend | Hardware | Element | Needs |
 |---|---|---|---|
 | `nvenc` | NVIDIA | `nvh264enc` | NVIDIA driver, container toolkit (`--gpus all`) |
-| `va` | Intel / AMD | `vah264enc` | `/dev/dri`, VA drivers (in the image) |
+| `va` | Intel / AMD | `vah264enc`, or Intel's low-power `vah264lpenc` | `/dev/dri`, VA drivers (in the image) |
 | `vaapi` | Intel / AMD, older stacks | `vaapih264enc` | same as `va` |
 | `v4l2` | Raspberry Pi 4 / Zero 2 / CM4 | `v4l2h264enc` | `/dev/video11` |
 | `x264` | any CPU | `x264enc` | nothing; ~0.6 core per camera |
 
 A probe is a short dry run, so a plugin whose device is missing (VA
 without a render node) is skipped rather than chosen. The log says which
-one won: `video encoder (auto) encoder=va`. Name a backend explicitly to
+one won: `video encoder (auto) encoder=va element=vah264lpenc rate-control=cqp`.
+
+On Intel from Skylake (6th generation) on, Debian's free driver offers
+only the fixed-function low-power encoder, `vah264lpenc`, which `va`
+falls back to. It keeps the bitrate at 2 Mbit/s only when the GPU's HuC
+firmware is loaded; without it (the default before 12th-generation
+chips) it encodes at constant quality (QP 26), and the bitrate follows
+the scene, which the log says once at boot. On 6th- to 11th-generation
+chips the `i915.enable_guc=2` kernel parameter loads HuC; once the driver
+offers bitrate control, the daemon picks that mode by itself (not yet
+tried on a real box). Name a backend explicitly to
 pin it; then the boot fails if it does not work on that host. The
 Raspberry Pi 5 has no H.264 hardware encoder and runs x264 (one or two
 cameras at 720p15 are fine). A Google Coral accelerates Frigate's

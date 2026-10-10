@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `va` falls back to Intel's low-power encoder (`vah264lpenc`), the only
+  H.264 encoder Debian's free driver offers from Skylake on: with bitrate
+  control when the GPU's HuC firmware is loaded, at constant quality
+  (QP 26) otherwise. Before, such a box always encoded on the CPU.
+
+### Changed
+- The boot log names the encoder element and its rate control
+  (`element=vah264lpenc rate-control=cqp`), and warns when a GPU render
+  node is present but `auto` falls back to x264, with each reason.
+- A hardware plugin that is installed but registered no encoder is
+  reported as a device or driver problem, not as a missing element.
+- The encoder probe runs off the async runtime's worker threads.
+- The Compose file no longer enables a VA-API device with a fixed group
+  id: machine-specific settings go in a gitignored
+  `docker-compose.override.yml`. The README explains `keep-groups` for a
+  GPU under rootless podman.
+
 ## [0.2.1] - 2026-10-09
 
 The first published 0.2 image: 0.2.0 was tagged but its image never
