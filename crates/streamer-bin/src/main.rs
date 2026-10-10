@@ -177,6 +177,18 @@ async fn run_daemon(config: StreamerConfig) -> Result<()> {
 }
 
 async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()> {
+    // -- GStreamer, before the Arlo login --
+    //
+    // A missing plugin otherwise shows only as a media torn down at each
+    // client connection, and a boot failure after the login costs one
+    // login per restart.
+    streamer_infra_media::elements::check(config.output.hls.is_some())
+        .context("GStreamer plugins")?;
+    // The encoder is probed on this host (ADR 0008): `auto` takes the first
+    // working backend, an explicit one must work or the boot fails here.
+    let video_encoder = streamer_infra_media::encoder::resolve(config.output.video_encoder)
+        .context("no usable H.264 encoder")?;
+
     // -- Observability handles --
     let cameras_count = u32::try_from(config.cameras.len()).unwrap_or(u32::MAX);
     let metrics = Arc::new(
@@ -244,10 +256,6 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
     // -- Media adapter --
     let rtsp_server =
         RtspServer::start(&config.output.rtsp.bind).context("failed to start RTSP server")?;
-    // The encoder is probed on this host (ADR 0008): `auto` takes the first
-    // working backend, an explicit one must work or the boot fails here.
-    let video_encoder = streamer_infra_media::encoder::resolve(config.output.video_encoder)
-        .context("no usable H.264 encoder")?;
     let pipeline_registry = Arc::new(GstPipelineRegistry::new(
         rtsp_server.clone(),
         video_encoder,

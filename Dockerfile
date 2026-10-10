@@ -80,7 +80,9 @@ LABEL org.opencontainers.image.source="https://github.com/YpNo/arlo-camera-strea
 
 # Runtime libraries: GStreamer base + plugins required by the idle and
 # live pipelines (videotestsrc, jpegdec, x264enc, h264parse, h265parse,
-# rtspserver), the WebRTC transport (`gstreamer1.0-nice` = libnice ICE,
+# rtspserver), `gstreamer1.0-x` for the pango plugin (the idle caption's
+# `textoverlay`: not in plugins-base on Debian; the daemon refuses to
+# start without it), the WebRTC transport (`gstreamer1.0-nice` = libnice ICE,
 # required by webrtcbin for live streaming). arlo-rs no longer needs a
 # browser: its default transport is a Chrome-impersonating HTTP client
 # (verified live 2026-09-25). Bring `tini` as PID 1 so signals propagate
@@ -96,6 +98,7 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends \
         ca-certificates \
         tini \
         gstreamer1.0-plugins-base \
+        gstreamer1.0-x \
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-plugins-ugly \
