@@ -191,7 +191,7 @@ async fn run_daemon(config: StreamerConfig) -> Result<()> {
         "configuration loaded"
     );
     if let Err(e) = run(config, signals).await {
-        error!(error = %e, "fatal error");
+        log_fatal(&e);
         return Err(e);
     }
     Ok(())
@@ -675,6 +675,12 @@ fn init_tracing(format: LogFormat) -> Result<()> {
     Ok(())
 }
 
+/// Log the error that ends the daemon with its whole cause chain: the
+/// outer context alone (`GStreamer plugins`) said what failed, not why.
+fn log_fatal(e: &anyhow::Error) {
+    error!(error = %format_args!("{e:#}"), "fatal error");
+}
+
 /// The log subscriber for `format`, writing through `writer`; `ansi`
 /// colours the text format.
 fn subscriber<W>(
@@ -750,6 +756,27 @@ mod tests {
         });
         let bytes = out.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn the_fatal_error_line_carries_the_whole_cause_chain() {
+        let capture = Capture::default();
+        let out = capture.0.clone();
+        let sub = subscriber(LogFormat::Json, EnvFilter::new("info"), false, move || {
+            capture.clone()
+        });
+        let e = anyhow::anyhow!("missing GStreamer element(s): textoverlay")
+            .context("GStreamer plugins");
+
+        tracing::subscriber::with_default(sub, || log_fatal(&e));
+
+        let line: serde_json::Value =
+            serde_json::from_slice(&out.lock().unwrap()).expect("one JSON line");
+        assert_eq!(line["level"], "ERROR");
+        assert_eq!(
+            line["error"],
+            "GStreamer plugins: missing GStreamer element(s): textoverlay"
+        );
     }
 
     #[test]

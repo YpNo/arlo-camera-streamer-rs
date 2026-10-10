@@ -41,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   camera still runs one pipeline whichever server a client uses.
 
 ### Changed
+- The `fatal error` log line carries the whole cause chain
+  (`GStreamer plugins: missing GStreamer element(s): textoverlay`), not
+  only the outer context.
 - Text log lines carry colour escape codes only on a terminal; container
   logs and files showed them as `\x1b[2m…`.
 - The boot log names the encoder element and its rate control
