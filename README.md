@@ -59,6 +59,7 @@ Read [`crates/streamer-domain/src/port.rs`](./crates/streamer-domain/src/port.rs
 to see the contracts. The ADRs document the load-bearing decisions:
 
 - [ADR index](./docs/adr/README.md) and the [validation record](./docs/VALIDATION.md) of what has run against a real camera.
+- [Arlo protocol notes](./docs/arlo-protocol-notes.md): what was learned about Arlo's undocumented cloud (login, event bus, WebRTC, the app's watch-along stream).
 - [ADR 0001 — Factory-restart splice](./docs/adr/0001-factory-restart-splice.md): *superseded by 0003*.
 - [ADR 0002 — RTSP-only output for v1](./docs/adr/0002-rtsp-only-output-v1.md): *superseded by 0006 for HLS*; DASH stays out.
 - [ADR 0003 — Seamless input-selector splice](./docs/adr/0003-seamless-input-selector-splice.md): one persistent pipeline per camera, idle and live swapped at a frame boundary, clients never disconnect.

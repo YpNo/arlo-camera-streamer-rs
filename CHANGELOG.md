@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it.
 
 ### Added
+- `docs/arlo-protocol-notes.md`: what this project learned about Arlo's
+  undocumented cloud, in one place (login, devices, the MQTT bus, the
+  WebRTC leg, the app's watch-along stream, snapshots).
 - With no `[[cameras]]` block, the daemon serves every camera on the
   account, each named as `list-devices` suggests (unique, `-2` on a
   collision), and logs them; the configured-cameras gauge follows.
