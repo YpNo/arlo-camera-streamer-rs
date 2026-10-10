@@ -64,6 +64,7 @@ use streamer_infra_arlo::{
     ArloClient, ArloEventSourceAdapter, ArloThumbnailSourceAdapter, ArloUserViewSourceAdapter,
     ArloWebrtcSignalerAdapter, DeviceRegistry, LoginBackoff, SnapshotUrlCache, boot::boot,
 };
+use streamer_infra_media::encoder::EncoderBackend;
 use streamer_infra_media::{GstMediaMultiplexer, GstPipelineRegistry, RtspServer};
 use streamer_infra_ops::admin_server::check_admin_token;
 use streamer_infra_ops::{AdminServer, Metrics, OpsServer, Readiness};
@@ -176,18 +177,25 @@ async fn run_daemon(config: StreamerConfig) -> Result<()> {
     Ok(())
 }
 
-async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()> {
-    // -- GStreamer, before the Arlo login --
-    //
-    // A missing plugin otherwise shows only as a media torn down at each
-    // client connection, and a boot failure after the login costs one
-    // login per restart.
+/// The GStreamer side of the boot, before the Arlo login: every element
+/// the pipelines use, then the H.264 encoder probed on this host (ADR
+/// 0008: `auto` takes the first working backend, an explicit one must work
+/// or the boot fails). A missing plugin otherwise shows only as a media
+/// torn down at each client connection, and a boot failure after the
+/// login costs one login per restart.
+async fn prepare_gstreamer(config: &StreamerConfig) -> Result<EncoderBackend> {
     streamer_infra_media::elements::check(config.output.hls.is_some())
         .context("GStreamer plugins")?;
-    // The encoder is probed on this host (ADR 0008): `auto` takes the first
-    // working backend, an explicit one must work or the boot fails here.
-    let video_encoder = streamer_infra_media::encoder::resolve(config.output.video_encoder)
-        .context("no usable H.264 encoder")?;
+    // The dry runs block: off the runtime's worker threads.
+    let configured = config.output.video_encoder;
+    tokio::task::spawn_blocking(move || streamer_infra_media::encoder::resolve(configured))
+        .await
+        .context("encoder probe task")?
+        .context("no usable H.264 encoder")
+}
+
+async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()> {
+    let video_encoder = prepare_gstreamer(&config).await?;
 
     // -- Observability handles --
     let cameras_count = u32::try_from(config.cameras.len()).unwrap_or(u32::MAX);

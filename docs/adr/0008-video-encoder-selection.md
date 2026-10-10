@@ -83,3 +83,18 @@ NVENC). The Raspberry Pi 5 ends up on x264 by design.
 - **Intel QSV (`qsvh264enc`) beside VA.** Not added: one Intel path
   (`va`, with `vaapi` for older stacks) is enough, and QSV needs the
   oneVPL runtime in the image.
+
+## Update — 2026-10-10: Intel low-power encoding
+
+The first deployment on an Intel HD Graphics 530 (Skylake, Debian 13,
+free `intel-media-va-driver`) showed that the `va` plugin registers no
+`vah264enc` and no `vapostproc` there, only `vah264lpenc` (the
+fixed-function encoder), and offers it at constant quality only: rate
+control needs the GPU's HuC firmware, which the kernel loads by default
+only from 12th-generation chips on. `va` therefore tries three variants:
+`vah264enc` (CBR), `vah264lpenc` with CBR, `vah264lpenc` with constant
+quality (QP 26). The low-power ones take NV12 from `videoconvert` rather
+than `vapostproc`. A driver without CBR rejects the property value, so
+the existing dry run decides between them. Constant quality leaves the
+bitrate unbounded; on a LAN feeding an NVR that is accepted over a CPU
+encoder, and the log says so at boot.
