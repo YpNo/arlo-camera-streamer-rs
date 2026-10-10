@@ -235,6 +235,12 @@ impl Metrics {
         }
     }
 
+    /// Set the configured-cameras gauge, when the list is known only after
+    /// the login (an empty `[[cameras]]` filled from the account).
+    pub fn set_cameras_configured(&self, cameras: u32) {
+        self.cameras_configured.set(i64::from(cameras));
+    }
+
     /// Update the Arlo-bus connectivity gauge.
     pub fn set_arlo_connected(&self, connected: bool) {
         self.arlo_connected.set(i64::from(connected));
@@ -411,6 +417,18 @@ mod tests {
             m.render()
                 .unwrap()
                 .contains("streamer_cameras_configured 0")
+        );
+    }
+
+    /// An empty `[[cameras]]` is filled after the login.
+    #[test]
+    fn cameras_configured_can_be_set_once_known() {
+        let m = Metrics::new(0, "0.1.0").unwrap();
+        m.set_cameras_configured(3);
+        assert!(
+            m.render()
+                .unwrap()
+                .contains("streamer_cameras_configured 3")
         );
     }
 

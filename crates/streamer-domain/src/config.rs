@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::camera::{CameraId, StreamName};
+use crate::camera::{CameraId, DiscoveredDevice, StreamName};
 use crate::error::DomainError;
 use crate::stream::{Codec, IceAddressFamily};
 
@@ -385,6 +385,26 @@ pub struct CameraConfig {
 }
 
 impl CameraConfig {
+    /// One entry per discovered device, as `[[cameras]]` would list them:
+    /// a stream name from the device's name (unique among them), default
+    /// cooldown, the output's encoder and bitrate. What an empty
+    /// `[[cameras]]` serves.
+    #[must_use]
+    pub fn for_devices(devices: &[DiscoveredDevice]) -> Vec<Self> {
+        let mut taken = std::collections::HashSet::new();
+        devices
+            .iter()
+            .map(|device| Self {
+                arlo_device_id: device.id.clone(),
+                stream_name: StreamName::suggest_unique(&device.name, &device.id, &mut taken),
+                codec_hint: None,
+                cooldown: CooldownConfig::default(),
+                video_encoder: None,
+                bitrate_kbps: None,
+            })
+            .collect()
+    }
+
     /// The encoder this camera uses: its own, else the output's.
     #[must_use]
     pub fn video_encoder_or(&self, output: &OutputConfig) -> VideoEncoder {
@@ -1046,6 +1066,39 @@ mod tests {
             hls(u32::MAX, 6).effective_segment_secs(),
             MAX_HLS_SEGMENT_SECS
         );
+    }
+
+    /// What an empty `[[cameras]]` serves: every device, unique names,
+    /// defaults everywhere else, and a config that validates.
+    #[test]
+    fn cameras_for_devices_name_each_device_uniquely_with_defaults() {
+        let device = |id: &str, name: &str| DiscoveredDevice {
+            id: CameraId::new(id),
+            name: name.to_string(),
+            kind: "camera".to_string(),
+            model: None,
+        };
+        let devices = [
+            device("CAM1", "Living Room"),
+            device("CAM2", "Living room"),
+            device("DB1", "🔔"),
+        ];
+
+        let cameras = CameraConfig::for_devices(&devices);
+
+        let names: Vec<&str> = cameras.iter().map(|c| c.stream_name.as_str()).collect();
+        assert_eq!(names, ["living-room", "living-room-2", "camera-db1"]);
+        assert_eq!(cameras[2].arlo_device_id.as_str(), "DB1");
+        assert!(
+            cameras
+                .iter()
+                .all(|c| c.video_encoder.is_none() && c.bitrate_kbps.is_none())
+        );
+
+        let raw = include_str!("../../../config/streamer.example.toml");
+        let mut cfg: StreamerConfig = toml::from_str(raw).expect("parses");
+        cfg.cameras = cameras;
+        cfg.validate().expect("an auto-filled config validates");
     }
 
     #[test]

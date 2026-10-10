@@ -123,6 +123,8 @@ bind = "0.0.0.0:8554"
 # `arlo_device_id` is the opaque id from the Arlo cloud. To list them,
 # with a ready-to-paste block per camera:
 #   arlo-camera-streamer list-devices --config <this file>
+# With no [[cameras]] block at all, the daemon serves every camera on the
+# account, each named after the device (the names list-devices suggests).
 # ---------------------------------------------------------------------------
 
 [[cameras]]

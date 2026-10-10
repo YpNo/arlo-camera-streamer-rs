@@ -189,7 +189,7 @@ budget and probe 0 to 86400 s).
 | `output.hls.segment_secs`           | u32            | `2` (floor 1)        | Target segment length; segments cut at keyframes (every 2 s). |
 | `output.hls.playlist_length`        | u32            | `10` (floor 3)       | Segments in the playlist; two more are kept on disk.      |
 | `output.dash`                       | —              | removed in 0.3.0     | A config that still has the table is refused at boot; delete it (ADR 0006). |
-| `[[cameras]]`                       | array          | `[]`                 | One block per camera — see example.                      |
+| `[[cameras]]`                       | array          | `[]`                 | One block per camera — see example. With none, every camera on the account is served, named as `list-devices` suggests (the log lists them). |
 | `cameras[].video_encoder` / `cameras[].bitrate_kbps` | as `output.*` | (the output's) | One camera's own encoder or bitrate. Each setting in use is probed once at boot; the log names each camera that differs (`camera encoding`). |
 | `cameras.codec_hint`                | `h264`/`h265`  | (auto)               | Skip first-stream codec detection.                       |
 | `cameras.cooldown.debounce_secs`    | u64            | `60`                 | Hold-live debounce after last motion.                    |
@@ -249,7 +249,11 @@ docker run --rm -it -e ARLO_PASSWORD -e ARLO_IMAP_PASSWORD \
 ```
 
 It also warns about configured `arlo_device_id` values the account does
-not have, which is how typos show up. Logs go to stderr, the report to
+not have, which is how typos show up. To try the daemon before choosing,
+leave `[[cameras]]` out altogether: it then serves every camera on the
+account under those suggested names, and logs each one (`camera from the
+account`). Listing the cameras is still the way to leave some out, or
+give one its own settings. Logs go to stderr, the report to
 stdout. The factor choice, the log lines that prove the pairing and what
 to do when a restart asks for a code again are in the login runbook,
 [`.agents/skills/arlo-mfa-login/SKILL.md`](./.agents/skills/arlo-mfa-login/SKILL.md).

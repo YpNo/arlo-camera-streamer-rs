@@ -337,6 +337,7 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
         info!("stopped before the Arlo login");
         return Ok(());
     };
+    let config = with_account_cameras(config, &arlo_client, &metrics).await?;
     let ArloAdapters {
         event_source,
         signaler,
@@ -638,6 +639,42 @@ async fn pause_unless_stopped(pause: Duration, signals: &mut ShutdownSignals) ->
             false
         }
     }
+}
+
+/// An empty `[[cameras]]` serves every camera on the account, named
+/// after the device (as `list-devices` would suggest). A config that
+/// lists cameras is returned as is.
+async fn with_account_cameras(
+    mut config: StreamerConfig,
+    client: &ArloClient,
+    metrics: &Metrics,
+) -> Result<StreamerConfig> {
+    if !config.cameras.is_empty() {
+        return Ok(config);
+    }
+    let devices = streamer_infra_arlo::discover_devices(client)
+        .await
+        .context("listing the account's cameras for an empty [[cameras]]")?;
+    anyhow::ensure!(
+        !devices.is_empty(),
+        "no [[cameras]] configured and the Arlo account has no camera"
+    );
+    config.cameras = streamer_domain::config::CameraConfig::for_devices(&devices);
+    warn!(
+        cameras = config.cameras.len(),
+        "no [[cameras]] configured: serving every camera on the account; \
+         list the ones to serve to choose (list-devices prints them)"
+    );
+    for camera in &config.cameras {
+        info!(
+            camera = %camera.arlo_device_id,
+            stream_name = %camera.stream_name,
+            "camera from the account"
+        );
+        metrics.prewarm_camera(&camera.arlo_device_id);
+    }
+    metrics.set_cameras_configured(u32::try_from(config.cameras.len()).unwrap_or(u32::MAX));
+    Ok(config)
 }
 
 fn arlo_adapters(config: &StreamerConfig, arlo_client: Arc<ArloClient>) -> Result<ArloAdapters> {

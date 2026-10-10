@@ -4,6 +4,7 @@
 //! `CameraId` are both strings under the hood) and centralize input
 //! validation at the trust boundary, per project security guidelines.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -142,6 +143,27 @@ impl StreamName {
     }
 }
 
+impl StreamName {
+    /// [`Self::suggest`], made unique against `taken` (`-2`, `-3`, … on a
+    /// collision) and added to it.
+    #[must_use]
+    pub fn suggest_unique(
+        display_name: &str,
+        device_id: &CameraId,
+        taken: &mut HashSet<String>,
+    ) -> Self {
+        let base = Self::suggest(display_name, device_id).0;
+        let mut candidate = base.clone();
+        let mut n = 2;
+        while taken.contains(&candidate) {
+            candidate = format!("{base}-{n}");
+            n += 1;
+        }
+        taken.insert(candidate.clone());
+        Self(candidate)
+    }
+}
+
 /// Characters of the device id kept by [`StreamName::suggest`]'s fallback.
 const SUGGESTED_ID_TAIL: usize = 5;
 
@@ -197,6 +219,21 @@ impl From<StreamName> for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suggest_unique_numbers_collisions_and_records_each_name() {
+        let mut taken = HashSet::from(["front-door".to_string()]);
+        let id = CameraId::new("ABC12345");
+
+        let first = StreamName::suggest_unique("Front Door", &id, &mut taken);
+        let second = StreamName::suggest_unique("front door!", &id, &mut taken);
+        let other = StreamName::suggest_unique("Yard", &id, &mut taken);
+
+        assert_eq!(first.as_str(), "front-door-2");
+        assert_eq!(second.as_str(), "front-door-3");
+        assert_eq!(other.as_str(), "yard");
+        assert!(taken.contains("front-door-3") && taken.contains("yard"));
+    }
     use rstest::rstest;
 
     #[rstest]

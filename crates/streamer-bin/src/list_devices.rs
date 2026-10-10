@@ -108,7 +108,7 @@ fn render_snippet(devices: &[DiscoveredDevice], configured: &[CameraConfig]) -> 
         .collect();
     let mut out = "\nAdd the ones you want to expose to your configuration:\n".to_string();
     for d in missing {
-        let name = unique_stream_name(d, &mut taken);
+        let name = StreamName::suggest_unique(&d.name, &d.id, &mut taken);
         let _ = write!(
             out,
             "\n# {} ({})\n[[cameras]]\narlo_device_id = \"{}\"\nstream_name    = \"{name}\"   # rtsp://<host>:8554/{name}\n",
@@ -116,22 +116,6 @@ fn render_snippet(devices: &[DiscoveredDevice], configured: &[CameraConfig]) -> 
         );
     }
     out
-}
-
-/// A suggested stream name not already used by the configuration or by
-/// an earlier suggestion (`-2`, `-3`, … on collision).
-fn unique_stream_name(device: &DiscoveredDevice, taken: &mut HashSet<String>) -> String {
-    let base = StreamName::suggest(&device.name, &device.id)
-        .as_str()
-        .to_string();
-    let mut candidate = base.clone();
-    let mut n = 2;
-    while taken.contains(&candidate) {
-        candidate = format!("{base}-{n}");
-        n += 1;
-    }
-    taken.insert(candidate.clone());
-    candidate
 }
 
 #[cfg(test)]

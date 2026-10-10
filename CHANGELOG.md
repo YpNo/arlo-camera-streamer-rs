@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it.
 
 ### Added
+- With no `[[cameras]]` block, the daemon serves every camera on the
+  account, each named as `list-devices` suggests (unique, `-2` on a
+  collision), and logs them; the configured-cameras gauge follows.
 - `output.bitrate_kbps` (default 2048, as before) and, per camera,
   `video_encoder` and `bitrate_kbps` overriding the output's. Each encoder
   setting in use is probed once at boot; the log names each camera that
