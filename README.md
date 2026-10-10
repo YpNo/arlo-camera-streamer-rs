@@ -184,10 +184,10 @@ budget and probe 0 to 86400 s).
 | `output.rtsp.bind`                  | `host:port`    | `0.0.0.0:8554`       | Embedded RTSP server.                                    |
 | `output.metrics_bind`               | `host:port`    | `127.0.0.1:9090`     | Prometheus + healthchecks.                               |
 | `output.admin_bind`                 | `host:port`    | `127.0.0.1:9091`     | `/admin/*` write API.                                    |
-| `output.hls.dir`                    | path           | (off)                | Enables HLS: `<dir>/<stream_name>/index.m3u8` + segments (ADR 0006). Serve it with any web server. Keeps each camera's encoder running. |
+| `output.hls.dir`                    | path           | (off)                | Enables HLS: `<dir>/<stream_name>/index.m3u8` + segments (ADR 0006). Serve it with any web server, or the Compose `hls` profile ([Serving HLS](#serving-hls)). Keeps each camera's encoder running. |
 | `output.hls.segment_secs`           | u32            | `2` (floor 1)        | Target segment length; segments cut at keyframes (every 2 s). |
 | `output.hls.playlist_length`        | u32            | `10` (floor 3)       | Segments in the playlist; two more are kept on disk.      |
-| `output.dash`                       | table          | (ignored)            | Parsed for compatibility, not supported: see ADR 0006.    |
+| `output.dash`                       | —              | removed in 0.3.0     | A config that still has the table is refused at boot; delete it (ADR 0006). |
 | `[[cameras]]`                       | array          | `[]`                 | One block per camera — see example.                      |
 | `cameras.codec_hint`                | `h264`/`h265`  | (auto)               | Skip first-stream codec detection.                       |
 | `cameras.cooldown.debounce_secs`    | u64            | `60`                 | Hold-live debounce after last motion.                    |
@@ -363,6 +363,24 @@ then 60 minutes (at least 15 after Arlo answers "too many requests"),
 however often the container restarts. The log says how long it waits.
 Arlo's Cloudflare edge blocks an address that logs in too often (HTTP 429,
 error 1015); the block lifts by itself after a while without attempts.
+
+### Serving HLS
+
+With `[output.hls] dir = "/var/lib/arlo-streamer/hls"`, the daemon writes
+`<stream_name>/index.m3u8` and its segments into `./data/hls` on the host.
+The Compose file has an opt-in web server for them (nginx, unprivileged,
+read-only, no capabilities, running as the daemon's uid so it can read its
+files):
+
+```bash
+docker compose --profile hls up -d
+```
+
+Playlists are then at `http://<host>:8080/hls/<stream_name>/index.m3u8`,
+for VLC, Home Assistant's camera card or a page with hls.js. It serves
+playlists (never cached) and segments only, with CORS open to any origin;
+everything else is a 404 ([`deploy/nginx-hls.conf`](./deploy/nginx-hls.conf)).
+Like the RTSP port, it is meant for a trusted LAN.
 
 ### Frigate integration
 

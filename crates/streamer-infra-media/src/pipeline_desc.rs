@@ -31,7 +31,7 @@ use std::path::Path;
 
 use crate::live_rtp_sink::AacRtpFormat;
 use streamer_domain::camera::StreamName;
-use streamer_domain::config::{DashOutput, HlsOutput, OutputConfig};
+use streamer_domain::config::{HlsOutput, OutputConfig};
 
 use crate::encoder::EncoderBackend;
 
@@ -130,14 +130,12 @@ pub(crate) fn default_aac_format() -> AacRtpFormat {
 /// the same root `dir` without colliding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputBranches {
-    /// Output stream name (used as RTSP path component and HLS/DASH subdir).
+    /// Output stream name (used as RTSP path component and HLS subdir).
     pub stream_name: StreamName,
     /// `/<stream_name>` — RTSP mount path under the embedded server.
     pub rtsp_mount_path: String,
     /// HLS branch config, present when `[output.hls]` is set.
     pub hls: Option<HlsBranchConfig>,
-    /// DASH branch config, present when `[output.dash]` is set.
-    pub dash: Option<DashBranchConfig>,
 }
 
 /// Resolved HLS sink parameters.
@@ -171,15 +169,6 @@ pub const HLS_SEGMENT_PREFIX: &str = "segment-";
 /// See [`HLS_SEGMENT_PREFIX`].
 pub const HLS_SEGMENT_SUFFIX: &str = ".ts";
 
-/// Resolved DASH sink parameters.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DashBranchConfig {
-    /// Path to `manifest.mpd`.
-    pub manifest_location: String,
-    /// Target segment duration in seconds.
-    pub target_duration: u32,
-}
-
 /// Build the RTSP mount path for a stream.
 #[must_use]
 pub fn rtsp_mount_path(name: &StreamName) -> String {
@@ -193,7 +182,6 @@ pub fn build_output_branches(name: &StreamName, output: &OutputConfig) -> Output
         stream_name: name.clone(),
         rtsp_mount_path: rtsp_mount_path(name),
         hls: output.hls.as_ref().map(|h| build_hls_branch(name, h)),
-        dash: output.dash.as_ref().map(|d| build_dash_branch(name, d)),
     }
 }
 
@@ -238,14 +226,6 @@ pub fn hls_segmenter_launch(url: &str, hls: &HlsBranchConfig) -> String {
         length = hls.playlist_length,
         max = hls.max_files,
     )
-}
-
-fn build_dash_branch(name: &StreamName, dash: &DashOutput) -> DashBranchConfig {
-    let dir = format_dir(&dash.dir, name);
-    DashBranchConfig {
-        manifest_location: format!("{dir}/manifest.mpd"),
-        target_duration: dash.segment_secs,
-    }
 }
 
 fn format_dir(root: &Path, name: &StreamName) -> String {
@@ -412,13 +392,13 @@ fn escape_gst_text(s: &str) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use streamer_domain::config::{DashOutput, HlsOutput, OutputConfig, RtspOutput, VideoEncoder};
+    use streamer_domain::config::{HlsOutput, OutputConfig, RtspOutput, VideoEncoder};
 
     fn name() -> StreamName {
         StreamName::parse("front_door").unwrap()
     }
 
-    fn output(hls: bool, dash: bool) -> OutputConfig {
+    fn output(hls: bool) -> OutputConfig {
         OutputConfig {
             rtsp: RtspOutput {
                 bind: "0.0.0.0:8554".to_string(),
@@ -428,10 +408,7 @@ mod tests {
                 segment_secs: 4,
                 playlist_length: 6,
             }),
-            dash: dash.then_some(DashOutput {
-                dir: PathBuf::from("/var/dash"),
-                segment_secs: 2,
-            }),
+            dash: None,
             video_encoder: VideoEncoder::X264,
             metrics_bind: "127.0.0.1:9090".to_string(),
             admin_bind: "127.0.0.1:9091".to_string(),
@@ -445,15 +422,14 @@ mod tests {
 
     #[test]
     fn build_output_branches_with_no_optional_sinks() {
-        let b = build_output_branches(&name(), &output(false, false));
+        let b = build_output_branches(&name(), &output(false));
         assert_eq!(b.rtsp_mount_path, "/front_door");
         assert!(b.hls.is_none());
-        assert!(b.dash.is_none());
     }
 
     #[test]
     fn build_output_branches_with_hls_uses_per_stream_dir() {
-        let b = build_output_branches(&name(), &output(true, false));
+        let b = build_output_branches(&name(), &output(true));
         let hls = b.hls.expect("hls present");
         assert_eq!(hls.dir, "/var/hls/front_door");
         assert_eq!(hls.playlist_location, "/var/hls/front_door/index.m3u8");
@@ -482,7 +458,7 @@ mod tests {
 
     #[test]
     fn build_output_branches_with_hls_raises_values_below_the_floor() {
-        let mut out = output(true, false);
+        let mut out = output(true);
         if let Some(h) = out.hls.as_mut() {
             h.segment_secs = 0;
             h.playlist_length = 1;
@@ -495,7 +471,7 @@ mod tests {
 
     #[test]
     fn hls_segmenter_launch_repackages_the_rtsp_mount_without_reencoding() {
-        let hls = build_output_branches(&name(), &output(true, false))
+        let hls = build_output_branches(&name(), &output(true))
             .hls
             .expect("hls present");
         let desc = hls_segmenter_launch("rtsp://127.0.0.1:8554/front_door", &hls);
@@ -516,14 +492,6 @@ mod tests {
                 "the segmenter must not transcode ({codec}): {desc}"
             );
         }
-    }
-
-    #[test]
-    fn build_output_branches_with_dash_uses_per_stream_dir() {
-        let b = build_output_branches(&name(), &output(false, true));
-        let dash = b.dash.expect("dash present");
-        assert_eq!(dash.manifest_location, "/var/dash/front_door/manifest.mpd");
-        assert_eq!(dash.target_duration, 2);
     }
 
     #[test]

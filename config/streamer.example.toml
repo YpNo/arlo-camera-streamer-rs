@@ -110,8 +110,8 @@ bind = "0.0.0.0:8554"
 # segment_secs    = 2      # floor 1; segments cut at keyframes (every 2 s)
 # playlist_length = 10     # floor 3; two more segments are kept on disk
 #
-# [output.dash] is parsed but not supported (see ADR 0006); the daemon
-# warns and ignores it.
+# There is no [output.dash]: it was removed in 0.3.0 (ADR 0006), and a
+# config that still has it is refused at boot. HLS serves browsers.
 
 # ---------------------------------------------------------------------------
 # Cameras — one [[cameras]] block per Arlo device you want to expose.

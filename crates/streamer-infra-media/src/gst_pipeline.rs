@@ -369,14 +369,6 @@ impl GstPipelineRegistry {
             (Some(hls), Some(url)) => Some(HlsSegmenter::start(camera.clone(), url, hls)?),
             _ => None,
         };
-        if outputs.dash.is_some() {
-            warn!(
-                camera = %camera,
-                "DASH output is not supported and is ignored: without gst-plugins-rs, \
-                 GStreamer's dashsink writes only MPEG-TS fragments that browser players \
-                 reject, and never deletes them (ADR 0006); use [output.hls]"
-            );
-        }
         mount.disarm();
         Ok(hls)
     }

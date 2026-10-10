@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- `[output.dash]`, parsed and ignored since 0.1 (GStreamer cannot write
+  DASH that browsers play without gst-plugins-rs, ADR 0006). A config that
+  still has the table is refused at boot with a message saying to delete
+  it.
+
 ### Added
+- An opt-in web server for the HLS output in the Compose file:
+  `docker compose --profile hls up -d` serves
+  `http://<host>:8080/hls/<stream_name>/index.m3u8` (unprivileged nginx,
+  read-only, playlists and segments only, CORS open).
 - `va` falls back to Intel's low-power encoder (`vah264lpenc`), the only
   H.264 encoder Debian's free driver offers from Skylake on: with bitrate
   control when the GPU's HuC firmware is loaded, at constant quality

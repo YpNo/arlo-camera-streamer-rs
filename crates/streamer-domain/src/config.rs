@@ -235,9 +235,10 @@ pub struct OutputConfig {
     /// HLS sink — optional secondary output.
     #[serde(default)]
     pub hls: Option<HlsOutput>,
-    /// MPEG-DASH sink — optional secondary output.
-    #[serde(default)]
-    pub dash: Option<DashOutput>,
+    /// The removed `[output.dash]` table, read only so that
+    /// [`StreamerConfig::validate`] can say what to do about it.
+    #[serde(default, skip_serializing)]
+    pub dash: Option<serde::de::IgnoredAny>,
     /// H.264 encoder for the live/idle pipeline (software or GPU).
     #[serde(default)]
     pub video_encoder: VideoEncoder,
@@ -323,17 +324,6 @@ impl HlsOutput {
         }
         Ok(())
     }
-}
-
-/// DASH sink configuration. Files are written to `dir/<stream_name>/…`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DashOutput {
-    /// Filesystem directory for DASH segments and manifests.
-    pub dir: PathBuf,
-    /// Target segment duration in seconds.
-    #[serde(default = "default_segment_secs")]
-    pub segment_secs: u32,
 }
 
 fn default_app_version() -> String {
@@ -481,6 +471,14 @@ impl StreamerConfig {
         }
         if let Some(hls) = &self.output.hls {
             hls.validate()?;
+        }
+        if self.output.dash.is_some() {
+            return Err(DomainError::InvalidConfig(
+                "[output.dash] was removed in 0.3.0: GStreamer cannot write DASH that \
+                 browsers play without gst-plugins-rs (ADR 0006). Delete the table; \
+                 [output.hls] serves browsers and Home Assistant"
+                    .to_string(),
+            ));
         }
         for (name, bind) in [
             ("output.rtsp.bind", &self.output.rtsp.bind),
@@ -994,6 +992,24 @@ mod tests {
         assert_eq!(
             hls(u32::MAX, 6).effective_segment_secs(),
             MAX_HLS_SEGMENT_SECS
+        );
+    }
+
+    /// 0.3.0 removed DASH: a config that still has the table is told what
+    /// to do, instead of serde's bare "unknown field".
+    #[test]
+    fn a_config_with_the_removed_dash_table_is_refused_with_the_way_out() {
+        let raw = include_str!("../../../config/streamer.example.toml").to_string()
+            + "\n[output.dash]\ndir = \"/var/dash\"\nsegment_secs = 2\n";
+        let cfg: StreamerConfig = toml::from_str(&raw).expect("still parses");
+
+        let err = cfg.validate().unwrap_err().to_string();
+
+        assert!(err.contains("[output.dash] was removed"), "{err}");
+        assert!(err.contains("Delete the table"), "{err}");
+        assert!(
+            !toml::to_string(&cfg).expect("serializes").contains("dash"),
+            "never written back"
         );
     }
 

@@ -114,3 +114,13 @@ alone, so a camera keeps one pipeline and one splice. Both pools remove a
 session 30 s after its client's last keep-alive: before, nothing removed
 expired sessions, and every client that vanished without a TEARDOWN held
 one for good.
+
+## Update — 2026-10-10: DASH removed
+
+`[output.dash]` had been parsed and ignored since this decision, with a
+warning. It is removed: a config that still has the table is refused at
+boot with a message saying to delete it, rather than accepted and
+ignored. Re-adding DASH stays tied to the re-evaluation triggers above
+(gst-plugins-rs muxers packaged, or built into the image). HLS gained an
+opt-in web server in the Compose file (`--profile hls`, nginx serving
+playlists and segments only).
