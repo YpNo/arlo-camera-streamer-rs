@@ -810,7 +810,7 @@ CI does.
 
 GitHub Actions workflows live in [`.github/workflows/`](./.github/workflows/).
 The `ci.yml` pipeline is staged: format → clippy → tests (with the GStreamer
-integration tests) → coverage gate (86 %; raised deliberately, never above
+integration tests) → coverage gate (88 %; raised deliberately, never above
 what is held) and SonarCloud, with the rustdoc check beside the tests and
 cargo-deny (a checksum-pinned binary) in parallel. A failed stage skips
 the costlier ones, docs-only changes do not run it, the weekly schedule

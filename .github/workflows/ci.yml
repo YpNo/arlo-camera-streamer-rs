@@ -208,29 +208,27 @@ jobs:
         # Exclusions (files, not packages: `--exclude <pkg>` only stops a
         # package's tests from running while its lines still count, which
         # is how the first run reported the media crate at 0 %):
-        # - `crates/streamer-bin/*` — composition root, only glue
+        # - `crates/streamer-bin/src/main.rs` — composition root, only glue
+        #   (the binary's other modules count, with their tests).
         # - The GStreamer-bound media files count: `tests/live_session.rs`
-        #   drives them through real WebRTC calls (STREAMER_REQUIRE_GST_IT
-        #   makes a missing plugin fail instead of silently skipping).
-        # - I/O-heavy infra-arlo files — `boot.rs` async auth, `events.rs`
-        #   live MQTT bus, `stream_requester.rs` and `thumbnails.rs` real
-        #   network calls. Their pure logic (`event_mapper.rs`, `error.rs`,
-        #   the `build_arlo_rs_config` and `utf8_path` helpers) IS unit-tested
-        #   inline; the wrappers belong to integration tests against a real
-        #   Arlo account.
-        # Threshold: 86 — measured 88.25 % on 2026-09-28 with the media files
-        # counted. Raise deliberately; never set above what is held.
+        #   and `tests/rtsp_sessions.rs` drive them through real pipelines
+        #   (STREAMER_REQUIRE_GST_IT makes a missing plugin fail instead of
+        #   silently skipping).
+        # - `streamer-infra-arlo/src/boot.rs` — the live login; its helpers
+        #   are unit-tested inline.
+        # - `streamer-infra-arlo/src/arlo_api.rs` — the calls through to the
+        #   live arlo-rs client. The adapters around them are tested against
+        #   the fake in the same file.
+        # Threshold: 88 — measured 90.24 % on 2026-10-10 with these
+        # exclusions. Raise deliberately; never set above what is held.
         env:
           STREAMER_REQUIRE_GST_IT: "1"
         run: |
           cargo tarpaulin --workspace --all-features --timeout 180 --out xml \
-            --exclude arlo-camera-streamer \
-            --exclude-files 'crates/streamer-bin/*' \
+            --exclude-files 'crates/streamer-bin/src/main.rs' \
             --exclude-files 'crates/streamer-infra-arlo/src/boot.rs' \
-            --exclude-files 'crates/streamer-infra-arlo/src/events.rs' \
-            --exclude-files 'crates/streamer-infra-arlo/src/stream_requester.rs' \
-            --exclude-files 'crates/streamer-infra-arlo/src/thumbnails.rs' \
-            --fail-under 86
+            --exclude-files 'crates/streamer-infra-arlo/src/arlo_api.rs' \
+            --fail-under 88
       - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           fail_ci_if_error: false

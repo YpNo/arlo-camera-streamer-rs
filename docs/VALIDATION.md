@@ -28,7 +28,7 @@ this file records whether reality agreed. Update it after every live gate
 
 | Item | Notes |
 |---|---|
-| Coverage gate | 86 % (measured 88.25 % on 2026-09-28, GStreamer files counted since the integration tests). Still excluded: `streamer-bin` and the infra-arlo network wrappers (`boot`, `events`, `stream_requester`, `thumbnails`). |
+| Coverage gate | 88 % (measured 90.24 % on 2026-10-10, GStreamer files counted since the integration tests). Still excluded: `streamer-bin/src/main.rs`, the live login (`boot.rs`) and the calls into the live arlo-rs client (`arlo_api.rs`); the adapters around them are tested against its fake. |
 | Release 0.1.0 | Prepared 2026-10-03: changelog cut, lockfile refreshed (166 crates), licence metadata aligned to the MIT file, SECURITY.md rewritten for this project, image publishing added to `ci.yml` (GHCR, per-version, Trivy-gated, arm64 opt-in via `IMAGE_PLATFORMS`). The tag and the image appear on the merge to `main`. |
 | Encoder selection | ADR 0008 (2026-10-03): `encoder::resolve` with a dry run per backend; integration-tested on the dev box (VA elements present, no render node → x264). Hardware backends `va`, `v4l2`, `nvenc` written from element docs, not yet run on hardware; `vaapi` ran before 2026-09-28. |
 | MFA login skill | `.agents/skills/arlo-mfa-login`, validated 2026-10-03 on a fresh cache path (IMAP factor, 13 s, file 0600; Arlo answers 9261 "Invalid factor data" to the trusted-browser probe of a new device id). |
