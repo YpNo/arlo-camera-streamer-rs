@@ -69,6 +69,7 @@ to see the contracts. The ADRs document the load-bearing decisions:
 - [ADR 0007 — Relay the user's app view](./docs/adr/0007-relay-the-users-app-view.md): a live view started in the Arlo app is relayed, picture and sound, from the RTSPS stream Arlo hands the app identity; no cooldown, no budget charge; the relay lets go of the stream every `user_view_probe_secs` so the camera can report whether the app still views.
 - [ADR 0008 — Choosing the H.264 encoder per host](./docs/adr/0008-video-encoder-selection.md): `video_encoder = "auto"` dry-runs NVIDIA, Intel/AMD, V4L2 and x264 at boot and keeps the first that works.
 - [ADR 0009 — Camera state over MQTT for Home Assistant](./docs/adr/0009-mqtt-home-assistant.md): publish-only, discovery, no new dependency (a small client on the codec already in the tree).
+- [ADR 0010 — The idle picture drawn once a second](./docs/adr/0010-idle-picture-drawn-once-a-second.md): `imagefreeze` repeats it to 15 fps; a third of a core less per connected camera.
 
 ## Prerequisites
 
@@ -629,11 +630,9 @@ cameras streaming to Frigate.
 
 On that box, the GPU encoder costs about 9% of a core per connected
 camera. On the idle picture x264 costs little more (about 8% in a bench
-of the same chain): the idle frame is nearly static. The idle picture
-itself — the thumbnail blended into every frame at 15 fps — costs about
-0.4 core per connected camera whatever the encoder. The GPU's saving
-grows with motion: live video is where x264 works hardest. See
-[Performance](#performance).
+of the same chain): the idle frame is nearly static, and since 0.3.0 it
+is drawn only once a second. The GPU's saving grows with motion: live
+video is where x264 works hardest. See [Performance](#performance).
 
 ### GPU troubleshooting
 
@@ -833,11 +832,14 @@ decode (~0.25 core). CPU therefore scales with the number of
 **connected** cameras, not with how many are live. On a 4-core box that
 is a ceiling of roughly **6 idle / 4–5 concurrently live** cameras.
 
-A bench of the idle chain on the same chip (2026-10-10, one camera)
-shows where the idle cost goes: drawing the idle picture (the thumbnail
-blended into every frame, plus the caption) is about 0.4 core; x264 adds
-only about 0.08 on that nearly static picture. A GPU encoder therefore
-helps most on live video; see [GPU encoding](#gpu-encoding).
+A bench of the idle chain on the same chip (one camera) showed where the
+idle cost went up to 0.2: drawing the idle picture (the thumbnail blended
+into every frame, plus the caption) was about 0.4 core, x264 about 0.08
+on that nearly static picture. Since 0.3.0 the picture is drawn once a
+second and repeated ([ADR 0010](./docs/adr/0010-idle-picture-drawn-once-a-second.md)):
+the idle branch costs about 3 % of a core, 14 % with x264. The figures
+in the table above predate that change and will be measured again. A GPU
+encoder now takes most of what is left; see [GPU encoding](#gpu-encoding).
 
 > The `gupnp … 1900: Address already in use` warnings at live start are
 > harmless — libnice's UPnP probe colliding with local bridge

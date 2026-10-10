@@ -16,6 +16,7 @@ real camera is recorded in [`../VALIDATION.md`](../VALIDATION.md).
 | [0007](./0007-relay-the-users-app-view.md) | Relay the user's live view from the Arlo app, picture and sound | accepted | 2026-10-01 |
 | [0008](./0008-video-encoder-selection.md) | Choosing the H.264 encoder per host (`auto`) | accepted | 2026-10-03 |
 | [0009](./0009-mqtt-home-assistant.md) | Camera state over MQTT for Home Assistant | accepted | 2026-10-10 |
+| [0010](./0010-idle-picture-drawn-once-a-second.md) | The idle picture is drawn once a second, not every frame | accepted | 2026-10-11 |
 
 ## Writing one
 

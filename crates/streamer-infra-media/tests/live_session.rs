@@ -344,6 +344,59 @@ async fn rtsp_server_stopped_right_after_start_drops_promptly() {
     }
 }
 
+/// ADR 0010: the idle picture is drawn once a second and repeated, yet a
+/// new snapshot shows, a second one replaces it, and a media rebuilt for
+/// a new client starts on the latest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_snapshot_replaces_the_idle_picture_and_survives_a_rebuilt_media() {
+    let _serial = SERIAL.lock().await;
+    if !gstreamer_ready() {
+        return;
+    }
+    let stack = Stack::new(WebrtcConfig::default());
+    stack.media.register(&stack.camera).await.expect("register");
+    let probe = RtspProbe::connect(&stack.url());
+    assert!(
+        eventually(PICTURE_TIMEOUT, || shows_idle(&probe)).await,
+        "client never showed the idle screen"
+    );
+    let near = |probe: &RtspProbe, low: u64, high: u64| (low..=high).contains(&probe.mean_luma());
+
+    stack
+        .media
+        .refresh_thumbnail(&stack.camera, solid_jpeg(0xff80_8080))
+        .await
+        .expect("grey snapshot");
+    assert!(
+        eventually(PICTURE_TIMEOUT, || near(&probe, 105, 150)).await,
+        "the grey snapshot never showed: {}",
+        probe.mean_luma()
+    );
+    stack
+        .media
+        .refresh_thumbnail(&stack.camera, solid_jpeg(0xffd0_d0d0))
+        .await
+        .expect("light snapshot");
+    assert!(
+        eventually(PICTURE_TIMEOUT, || near(&probe, 170, 215)).await,
+        "the second snapshot did not replace the first: {}",
+        probe.mean_luma()
+    );
+    assert!(
+        !probe.interrupted(),
+        "a snapshot change interrupted the client"
+    );
+
+    drop(probe);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let again = RtspProbe::connect(&stack.url());
+    assert!(
+        eventually(PICTURE_TIMEOUT, || near(&again, 170, 215)).await,
+        "a rebuilt media lost the snapshot: {}",
+        again.mean_luma()
+    );
+}
+
 /// gdk-pixbuf decodes at the declared size: a 2.6 KB file declaring
 /// 12000×12000 took about 1 GB. The refresh refuses it before any decode,
 /// and the client keeps its picture.
@@ -430,11 +483,21 @@ async fn second_client_over_udp_joins_a_playing_media() {
 /// stream; `num_buffers` bounds the finite variant.
 /// A real 64×48 JPEG, encoded by GStreamer.
 fn small_jpeg() -> bytes::Bytes {
+    encoded_jpeg("videotestsrc num-buffers=1")
+}
+
+/// A 64×48 JPEG of one colour (`0xAARRGGBB`).
+fn solid_jpeg(argb: u32) -> bytes::Bytes {
+    encoded_jpeg(&format!(
+        "videotestsrc pattern=solid-color foreground-color={argb} num-buffers=1"
+    ))
+}
+
+fn encoded_jpeg(source: &str) -> bytes::Bytes {
     use gstreamer::prelude::*;
-    let pipeline = gstreamer::parse::launch(
-        "videotestsrc num-buffers=1 ! video/x-raw,width=64,height=48 ! jpegenc \
-         ! appsink name=out sync=false",
-    )
+    let pipeline = gstreamer::parse::launch(&format!(
+        "{source} ! video/x-raw,width=64,height=48 ! jpegenc ! appsink name=out sync=false"
+    ))
     .expect("jpeg pipeline")
     .downcast::<gstreamer::Bin>()
     .expect("bin");

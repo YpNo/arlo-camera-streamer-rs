@@ -235,8 +235,7 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         }
         let outputs = build_output_branches(&stream_name, &self.output);
         let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        // Initial idle source: synthetic until first thumbnail arrives.
-        let idle = select_idle_source(None, &stream_name, &timestamp);
+        let idle = select_idle_source(&stream_name, &timestamp);
         match self.registry.register(camera, idle, outputs).await {
             Ok(()) => {
                 info!("camera registered with idle pipeline");

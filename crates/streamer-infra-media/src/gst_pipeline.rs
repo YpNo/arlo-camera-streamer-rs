@@ -55,11 +55,13 @@
 //! [`refresh_thumbnail`](PipelineRegistry::refresh_thumbnail) persists the JPEG to a stable per-camera
 //! file and points the synthetic idle branch's `gdkpixbufoverlay`
 //! (`idle_overlay`) at it, so the STANDBY screen shows the camera's
-//! last snapshot instead of a black frame. The overlay is an inline
-//! filter: before the first snapshot it's a transparent pass-through,
-//! so idle preroll is unchanged. A rebuilt media re-applies the file at
-//! `media-configure`. The cached bytes are also kept in per-camera
-//! state for a future `/admin/thumbnail/<cam>` endpoint.
+//! last snapshot, with the caption drawn over it, instead of a black
+//! frame. The overlay is an inline filter: before the first snapshot
+//! it's a transparent pass-through, so idle preroll is unchanged. The
+//! branch draws once a second and `imagefreeze` repeats each drawing
+//! (ADR 0010), so a change shows within one. A rebuilt media re-applies
+//! the file at `media-configure`. The bytes are kept in per-camera state
+//! for `GET /admin/cameras/{id}/thumbnail.jpg`.
 //!
 //! Exercised by `tests/live_session.rs`: a real RTSP client watches
 //! the idle → live → idle splice and a client joining mid-session.
@@ -254,16 +256,11 @@ impl GstPipelineRegistry {
     }
 
     fn refresh_overlay_timestamp(idle: &IdleKind) -> IdleKind {
-        match idle {
-            IdleKind::Synthetic { stream_name, .. } => {
-                let ts = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-                IdleKind::Synthetic {
-                    stream_name: stream_name.clone(),
-                    overlay: standby_caption(stream_name, &ts),
-                }
-            }
-            // JPEG-still keeps its bytes; overlay is N/A.
-            IdleKind::JpegStill { .. } => idle.clone(),
+        let IdleKind::Synthetic { stream_name, .. } = idle;
+        let ts = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        IdleKind::Synthetic {
+            stream_name: stream_name.clone(),
+            overlay: standby_caption(stream_name, &ts),
         }
     }
 
@@ -1088,6 +1085,117 @@ fn apply_aac_caps(appsrc: &gst_app::AppSrc, format: &AacRtpFormat) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A solid-colour 64×48 JPEG, encoded by GStreamer.
+    fn solid_jpeg(argb: u32) -> Vec<u8> {
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc pattern=solid-color foreground-color={argb} num-buffers=1 \
+             ! video/x-raw,width=64,height=48 ! jpegenc ! appsink name=out sync=false"
+        ))
+        .unwrap()
+        .downcast::<gst::Bin>()
+        .unwrap();
+        let sink = pipeline
+            .by_name("out")
+            .unwrap()
+            .downcast::<gstreamer_app::AppSink>()
+            .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let sample = sink
+            .try_pull_sample(gst::ClockTime::from_seconds(5))
+            .unwrap();
+        pipeline.set_state(gst::State::Null).unwrap();
+        let map = sample.buffer().unwrap().map_readable().unwrap();
+        map.as_slice().to_vec()
+    }
+
+    /// ADR 0010 and the overlay order: the idle chain drawn once a second
+    /// still leaves at the unified 15 fps, shows the snapshot, and draws
+    /// the caption over it (the snapshot used to cover the caption).
+    #[test]
+    fn the_idle_picture_shows_the_snapshot_and_the_caption_over_it_at_15_fps() {
+        if gst::init().is_err()
+            || ["imagefreeze", "gdkpixbufoverlay", "textoverlay", "jpegenc"]
+                .iter()
+                .any(|e| gst::ElementFactory::find(e).is_none())
+        {
+            assert!(
+                std::env::var("STREAMER_REQUIRE_GST_IT").as_deref() != Ok("1"),
+                "GStreamer elements missing"
+            );
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("idle-picture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let grey = dir.join("grey.jpg");
+        std::fs::write(&grey, solid_jpeg(0xff80_8080)).unwrap();
+        let idle = IdleKind::Synthetic {
+            stream_name: streamer_domain::camera::StreamName::parse("front_door").unwrap(),
+            overlay: "STANDBY · front_door · 2026-10-11T10:00:00".into(),
+        };
+        let launch = format!(
+            "{} ! appsink name=out sync=false",
+            crate::pipeline_desc::idle_raw_chain(&idle)
+        );
+        let pipeline = gst::parse::launch(&launch)
+            .unwrap()
+            .downcast::<gst::Bin>()
+            .unwrap();
+        apply_thumbnail_overlay(&pipeline.by_name(IDLE_OVERLAY_NAME).unwrap(), &grey);
+        let sink = pipeline
+            .by_name("out")
+            .unwrap()
+            .downcast::<gstreamer_app::AppSink>()
+            .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        let (width, height) = (SYNTHETIC_WIDTH as usize, SYNTHETIC_HEIGHT as usize);
+        let mut shown = None;
+        for _ in 0..60 {
+            let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_seconds(2)) else {
+                break;
+            };
+            let caps = sample.caps().unwrap().structure(0).unwrap().to_owned();
+            let map = sample.buffer().unwrap().map_readable().unwrap();
+            // I420: the luma plane first, 1280 bytes a row.
+            let luma = &map.as_slice()[..width * height];
+            let top_mean = luma[..width * 100]
+                .iter()
+                .map(|&y| u64::from(y))
+                .sum::<u64>()
+                / (width as u64 * 100);
+            if top_mean > 90 {
+                // The caption's band: `textoverlay` scales its font with the
+                // frame, so it spans about rows 570..680 at 720.
+                let band_max = (height - 200..height)
+                    .flat_map(|row| {
+                        luma[row * width + width / 2 - 200..row * width + width / 2 + 200].iter()
+                    })
+                    .copied()
+                    .max()
+                    .unwrap_or(0);
+                shown = Some((caps, top_mean, band_max));
+                break;
+            }
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let (caps, top_mean, band_max) = shown.expect("the snapshot never showed");
+        assert_eq!(
+            caps.get::<gst::Fraction>("framerate").unwrap(),
+            gst::Fraction::new(15, 1),
+            "the unified rate leaves the idle branch"
+        );
+        assert!(
+            (100..=150).contains(&top_mean),
+            "a mid-grey snapshot: {top_mean}"
+        );
+        assert!(
+            band_max > 200,
+            "white caption text over the snapshot: {band_max}"
+        );
+    }
 
     /// Records the mounts removed through it. The real server needs a
     /// `GLib` main loop, which unit tests must not share across threads.

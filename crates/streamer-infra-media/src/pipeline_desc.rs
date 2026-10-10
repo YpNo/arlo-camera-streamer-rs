@@ -288,36 +288,29 @@ pub fn combined_launch_string(idle: &IdleKind, encoding: VideoEncoding) -> Strin
 
 /// Idle producer normalized to the **unified raw caps** (Phase 7).
 /// The selector forwards raw frames to the single downstream encoder.
-fn idle_raw_chain(idle: &IdleKind) -> String {
-    match idle {
-        IdleKind::JpegStill { .. } => format!(
-            "appsrc name=idle_jpeg_src is-live=true format=time \
-             caps=image/jpeg,framerate={IDLE_FPS}/1 \
-             ! jpegdec ! videoconvert ! videoscale ! videorate \
-             ! video/x-raw,format=I420,\
+///
+/// The picture is drawn [`IDLE_FPS`] times a second and `imagefreeze`
+/// repeats each drawing up to the unified rate (ADR 0010): drawing the
+/// full-frame snapshot 15 times a second cost a third of a core per
+/// connected camera, for a picture that changes a few times an hour.
+/// `allow-replace` takes each new drawing, so a new snapshot or caption
+/// shows within one. The snapshot (`gdkpixbufoverlay`, scaled to fill)
+/// goes under the caption: the other way round it covered it.
+pub(crate) fn idle_raw_chain(idle: &IdleKind) -> String {
+    let IdleKind::Synthetic { overlay, .. } = idle;
+    let escaped = escape_gst_text(overlay);
+    format!(
+        "videotestsrc pattern=black is-live=true \
+         ! video/x-raw,\
+width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={IDLE_FPS}/1 \
+         ! gdkpixbufoverlay name={IDLE_OVERLAY_NAME} \
+         ! textoverlay name={IDLE_CAPTION_NAME} text=\"{escaped}\" valignment=bottom \
+                      halignment=center font-desc=\"Sans 24\" \
+         ! videoconvert \
+         ! imagefreeze is-live=true allow-replace=true \
+         ! video/x-raw,format=I420,\
 width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1"
-        ),
-        IdleKind::Synthetic { overlay, .. } => {
-            let escaped = escape_gst_text(overlay);
-            // Pin the full unified caps at the end of the chain so
-            // both branches present identical caps to the selector.
-            // The intermediate width/height/framerate filter forces
-            // videotestsrc to that resolution and rate; the trailing
-            // filter adds `format=I420` once videoconvert has done
-            // the format swap.
-            format!(
-                "videotestsrc pattern=black is-live=true \
-                 ! video/x-raw,\
-width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1 \
-                 ! textoverlay name={IDLE_CAPTION_NAME} text=\"{escaped}\" valignment=bottom \
-                              halignment=center font-desc=\"Sans 24\" \
-                 ! gdkpixbufoverlay name={IDLE_OVERLAY_NAME} \
-                 ! videoconvert \
-                 ! video/x-raw,format=I420,\
-width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1"
-            )
-        }
-    }
+    )
 }
 
 /// Live RTP → decode → normalize-to-unified-caps. Output raw I420
@@ -586,20 +579,44 @@ mod tests {
     #[test]
     fn synthetic_idle_carries_thumbnail_overlay() {
         // Phase 5: the synthetic idle branch has an inline
-        // gdkpixbufoverlay (named for runtime capture) sized to the
-        // full frame, sitting after the STANDBY textoverlay.
+        // gdkpixbufoverlay (named for runtime capture), scaled to the full
+        // frame at runtime (gst_pipeline::apply_thumbnail_overlay).
         let s = combined_launch_string(&synth_idle(), enc(EncoderBackend::X264));
         assert!(s.contains(&format!("gdkpixbufoverlay name={IDLE_OVERLAY_NAME}")));
-        // Sizing is applied at runtime (see gst_pipeline::apply_thumbnail_overlay)
-        // because gdkpixbufoverlay ignores construction-time overlay-width/height
-        // when a `location` is loaded later.
-        // Overlay must sit after the text overlay and before the final
-        // I420 convert so STANDBY text shows until a snapshot loads.
-        let text = s.find("textoverlay").expect("textoverlay present");
+        // The full-frame snapshot goes under the caption: drawn after it,
+        // it covered the STANDBY / LIVE IN ARLO APP text.
         let pix = s
             .find("gdkpixbufoverlay")
             .expect("gdkpixbufoverlay present");
-        assert!(text < pix, "textoverlay should precede gdkpixbufoverlay");
+        let text = s.find("textoverlay").expect("textoverlay present");
+        assert!(pix < text, "the caption must be drawn over the snapshot");
+    }
+
+    /// ADR 0010: the idle picture is drawn once a second and repeated up
+    /// to the unified rate, so the selector still sees 15 fps on both
+    /// sides.
+    #[test]
+    fn the_idle_picture_is_drawn_at_the_idle_rate_and_frozen_to_the_unified_one() {
+        let s = combined_launch_string(&synth_idle(), enc(EncoderBackend::X264));
+        let drawn =
+            format!("width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={IDLE_FPS}/1");
+        let draw = s.find(&drawn).expect("the drawing rate");
+        let freeze = s
+            .find("imagefreeze is-live=true allow-replace=true")
+            .expect("imagefreeze");
+        let caption = s.find("textoverlay").expect("caption");
+        let unified = format!(
+            "format=I420,width={SYNTHETIC_WIDTH},height={SYNTHETIC_HEIGHT},framerate={UNIFIED_FPS}/1"
+        );
+        let selector = s.find("sel.sink_0").expect("idle pad");
+        let idle_caps = s[..selector]
+            .rfind(&unified)
+            .expect("unified caps on the idle side");
+        assert!(
+            draw < caption && caption < freeze && freeze < idle_caps,
+            "{s}"
+        );
+        assert_eq!(IDLE_FPS, 1);
     }
 
     #[test]
@@ -654,21 +671,6 @@ mod tests {
         let s = combined_launch_string(&synth_idle(), enc(EncoderBackend::X264));
         assert!(s.contains("payload=103"));
         assert!(s.contains("encoding-name=H264"));
-    }
-
-    #[test]
-    fn combined_launch_string_jpeg_idle_variant_builds() {
-        let s = combined_launch_string(
-            &IdleKind::JpegStill {
-                jpeg: bytes::Bytes::from_static(&[0]),
-            },
-            enc(EncoderBackend::X264),
-        );
-        assert!(s.contains("appsrc name=idle_jpeg_src"));
-        assert!(s.contains("jpegdec"));
-        assert!(s.contains("sel.sink_0"));
-        assert!(s.contains("appsrc name=live_rtp_src"));
-        assert!(s.contains("sel.sink_1"));
     }
 
     #[test]

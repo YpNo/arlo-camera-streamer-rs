@@ -47,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (QP 26) otherwise. Before, such a box always encoded on the CPU.
 
 ### Fixed
+- The idle picture's caption (STANDBY, LIVE IN ARLO APP) was hidden under
+  the snapshot, which is scaled to the whole frame and was drawn after
+  it: it is drawn over the snapshot now.
 - The watch-along relay waives the TLS hostname check only for an IP
   host, as Arlo's URLs use; a DNS host must match its certificate. The
   certificate's SHA-256 is logged when the waiver applies, and the
@@ -62,6 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   camera still runs one pipeline whichever server a client uses.
 
 ### Changed
+- The idle picture is drawn once a second and repeated up to 15 fps
+  (`imagefreeze`, ADR 0010) instead of being drawn 15 times a second:
+  its branch costs about 3 % of a core instead of 37–56 % per connected
+  camera on the reference box (14 % instead of 45 % with x264). A new
+  caption shows within a second. The unused JPEG-still idle kind is gone.
 - The `fatal error` log line carries the whole cause chain
   (`GStreamer plugins: missing GStreamer element(s): textoverlay`), not
   only the outer context.

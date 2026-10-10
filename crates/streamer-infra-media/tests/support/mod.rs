@@ -33,6 +33,8 @@ const ELEMENTS: &[&str] = &[
     "input-selector",
     "textoverlay",
     "gdkpixbufoverlay",
+    "imagefreeze",
+    "jpegenc",
     "rtspsrc",
     "valve",
 ];
