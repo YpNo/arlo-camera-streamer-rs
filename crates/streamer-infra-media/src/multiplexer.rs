@@ -84,6 +84,9 @@ pub trait PipelineRegistry: Send + Sync {
     /// Replace the idle still frame for the camera (best-effort).
     async fn refresh_thumbnail(&self, camera: &CameraId, jpeg: Bytes) -> Result<(), MediaError>;
 
+    /// The idle frame's thumbnail, as last refreshed.
+    async fn current_thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, MediaError>;
+
     /// Replace the caption of the camera's idle frame, now and for any
     /// media built later.
     async fn set_idle_caption(&self, camera: &CameraId, caption: String) -> Result<(), MediaError>;
@@ -329,6 +332,19 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
             .map_err(Into::into)
     }
 
+    async fn current_thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, DomainError> {
+        self.stream_name(camera)?;
+        // Configured but not built yet: nothing shown, and a read never
+        // builds a pipeline.
+        if !self.registered.read().await.contains(camera) {
+            return Ok(None);
+        }
+        self.registry
+            .current_thumbnail(camera)
+            .await
+            .map_err(Into::into)
+    }
+
     #[instrument(skip(self), fields(camera = %camera))]
     async fn set_user_view_notice(
         &self,
@@ -434,6 +450,15 @@ mod tests {
         ) -> Result<(), MediaError> {
             self.thumbs.lock().unwrap().push((camera.clone(), jpeg));
             Ok(())
+        }
+
+        async fn current_thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, MediaError> {
+            let thumbs = self.thumbs.lock().unwrap();
+            Ok(thumbs
+                .iter()
+                .rev()
+                .find(|(c, _)| c == camera)
+                .map(|(_, jpeg)| jpeg.clone()))
         }
 
         async fn set_idle_caption(
@@ -634,6 +659,31 @@ mod tests {
             "{:?}",
             captions[1]
         );
+    }
+
+    #[tokio::test]
+    async fn current_thumbnail_reads_the_registry_without_building_a_pipeline() {
+        let reg = Arc::new(FakeRegistry::default());
+        let m = mux(reg.clone());
+        let jpeg = Bytes::from_static(b"\xff\xd8a");
+
+        assert_eq!(m.current_thumbnail(&cam("CAM_A")).await.unwrap(), None);
+        assert!(
+            reg.registered.lock().unwrap().is_empty(),
+            "a read never registers"
+        );
+        m.register(&cam("CAM_A")).await.unwrap();
+        m.refresh_thumbnail(&cam("CAM_A"), jpeg.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            m.current_thumbnail(&cam("CAM_A")).await.unwrap(),
+            Some(jpeg)
+        );
+        assert!(matches!(
+            m.current_thumbnail(&cam("GHOST")).await,
+            Err(DomainError::UnknownCamera(_))
+        ));
     }
 
     #[tokio::test]

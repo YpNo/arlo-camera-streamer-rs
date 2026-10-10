@@ -360,6 +360,21 @@ async fn thumbnail_declaring_a_huge_frame_is_refused_without_disturbing_the_clie
         eventually(PICTURE_TIMEOUT, || shows_idle(&probe)).await,
         "client never showed the idle screen"
     );
+    assert_eq!(
+        stack.media.current_thumbnail(&stack.camera).await.unwrap(),
+        None
+    );
+    let shown = small_jpeg();
+    stack
+        .media
+        .refresh_thumbnail(&stack.camera, shown.clone())
+        .await
+        .expect("a valid thumbnail");
+    assert_eq!(
+        stack.media.current_thumbnail(&stack.camera).await.unwrap(),
+        Some(shown.clone()),
+        "the admin endpoint serves what the idle frame shows"
+    );
 
     let mut crafted = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08];
     crafted.extend(12000_u16.to_be_bytes());
@@ -372,6 +387,11 @@ async fn thumbnail_declaring_a_huge_frame_is_refused_without_disturbing_the_clie
         .expect_err("a huge declared frame must be refused");
 
     assert!(err.to_string().contains("12000x12000"), "{err}");
+    assert_eq!(
+        stack.media.current_thumbnail(&stack.camera).await.unwrap(),
+        Some(shown),
+        "a refused thumbnail replaces nothing"
+    );
     let frames = probe.frames();
     assert!(
         eventually(PICTURE_TIMEOUT, || probe.frames() > frames + 2).await,
@@ -408,6 +428,34 @@ async fn second_client_over_udp_joins_a_playing_media() {
 
 /// A live white H.264 source, standing in for the app's watch-along
 /// stream; `num_buffers` bounds the finite variant.
+/// A real 64×48 JPEG, encoded by GStreamer.
+fn small_jpeg() -> bytes::Bytes {
+    use gstreamer::prelude::*;
+    let pipeline = gstreamer::parse::launch(
+        "videotestsrc num-buffers=1 ! video/x-raw,width=64,height=48 ! jpegenc \
+         ! appsink name=out sync=false",
+    )
+    .expect("jpeg pipeline")
+    .downcast::<gstreamer::Bin>()
+    .expect("bin");
+    let sink = pipeline
+        .by_name("out")
+        .expect("appsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink type");
+    pipeline.set_state(gstreamer::State::Playing).expect("play");
+    let sample = sink
+        .try_pull_sample(gstreamer::ClockTime::from_seconds(5))
+        .expect("a frame");
+    pipeline.set_state(gstreamer::State::Null).expect("stop");
+    let buffer = sample
+        .buffer()
+        .expect("buffer")
+        .map_readable()
+        .expect("map");
+    bytes::Bytes::copy_from_slice(buffer.as_slice())
+}
+
 fn white_source(num_buffers: Option<u32>) -> String {
     let bound = num_buffers.map_or(String::new(), |n| format!(" num-buffers={n}"));
     format!(

@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it.
 
 ### Added
+- `GET /admin/cameras/{id}/thumbnail.jpg`: the JPEG the camera's idle
+  frame shows, behind the admin bearer token; `404` before Arlo provided
+  one. It reads the daemon's copy and reaches neither Arlo nor the camera.
 - An opt-in web server for the HLS output in the Compose file:
   `docker compose --profile hls up -d` serves
   `http://<host>:8080/hls/<stream_name>/index.m3u8` (unprivileged nginx,

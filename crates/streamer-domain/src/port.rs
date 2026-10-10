@@ -227,6 +227,16 @@ pub trait MediaMultiplexer: Send + Sync {
     /// be decoded or pushed to the idle source.
     async fn refresh_thumbnail(&self, camera: &CameraId, jpeg: Bytes) -> Result<(), DomainError>;
 
+    /// The JPEG the camera's idle frame shows, as last refreshed; `None`
+    /// before the first one (or before the camera is registered). Reads
+    /// what the adapter holds: no cloud request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::UnknownCamera`] for a camera that is not
+    /// configured.
+    async fn current_thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, DomainError>;
+
     /// Show (`true`) or clear (`false`) the notice that the user is
     /// watching the camera in the Arlo app, on the idle frame: that view
     /// cannot be relayed (ADR 0005), so viewers are told where the live
@@ -323,6 +333,15 @@ pub trait AdminControl: Send + Sync {
     /// configured, or [`AdminError::Unavailable`] on a control-plane
     /// transport failure.
     async fn force_idle(&self, camera: &CameraId) -> Result<(), AdminError>;
+
+    /// The JPEG the camera's idle frame shows; `None` before Arlo provided
+    /// one. Read-only: no request reaches Arlo or the camera.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::UnknownCamera`] when `camera` is not
+    /// configured.
+    async fn thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, AdminError>;
 
     /// Manually wake the camera (synthetic motion event), respecting
     /// the daily budget. Useful for healthcheck dashboards.

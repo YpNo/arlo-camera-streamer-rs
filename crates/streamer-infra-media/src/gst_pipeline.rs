@@ -159,7 +159,8 @@ struct CameraEntry {
     mount_path: String,
     idle: IdleKind,
     /// Last known thumbnail JPEG. Applied to the idle overlay in
-    /// `refresh_thumbnail` and retained for a future ops endpoint.
+    /// `refresh_thumbnail`; `GET /admin/cameras/{id}/thumbnail.jpg`
+    /// serves it.
     last_thumbnail: Option<Bytes>,
     /// Set when gst-rtsp-server constructs a media for this factory.
     /// Read by `attach_live_sink` to find the appsrc + selector pads.
@@ -570,6 +571,14 @@ impl PipelineRegistry for GstPipelineRegistry {
             .map_err(|e| MediaError::Pipeline(format!("thumbnail load task failed: {e}")))?;
         debug!(path = %path.display(), "thumbnail applied to idle overlay");
         Ok(())
+    }
+
+    async fn current_thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, MediaError> {
+        let guard = self.state.read().await;
+        let entry = guard
+            .get(camera)
+            .ok_or_else(|| MediaError::UnknownCamera(camera.to_string()))?;
+        Ok(entry.last_thumbnail.clone())
     }
 
     async fn set_idle_caption(&self, camera: &CameraId, caption: String) -> Result<(), MediaError> {

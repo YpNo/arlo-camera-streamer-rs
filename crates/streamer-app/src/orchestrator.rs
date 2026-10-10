@@ -1616,6 +1616,12 @@ mod tests {
             self.events.lock().await.push(MediaCall::RefreshThumbnail);
             Ok(())
         }
+        async fn current_thumbnail(
+            &self,
+            _camera: &CameraId,
+        ) -> Result<Option<Bytes>, DomainError> {
+            Ok(None)
+        }
         async fn set_user_view_notice(
             &self,
             _camera: &CameraId,

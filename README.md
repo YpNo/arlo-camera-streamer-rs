@@ -414,12 +414,15 @@ Stream URL pattern: `rtsp://<host>:<rtsp.bind>/<cameras.stream_name>`.
 | `GET /readyz`  (port 9090)            | None     | Ready iff started **and** Arlo bus connected. |
 | `GET /admin/state` (port 9091)        | Bearer   | System snapshot (JSON); per-camera state as the camera task last published it, so a camera mid-negotiation still answers (`activating`). |
 | `GET /admin/cameras/{id}` (port 9091) | Bearer   | Per-camera snapshot.                   |
+| `GET /admin/cameras/{id}/thumbnail.jpg` (port 9091) | Bearer | The JPEG the camera's idle frame shows (`no-store`); `404` before Arlo provided one. Read from the daemon's copy: reaches neither Arlo nor the camera. |
 | `POST /admin/cameras/{id}/wake` (port 9091) | Bearer | Inject a synthetic motion event; `429` within 30 s of the previous session's end (or failed attempt). Each activation also costs 15 s of the daily budget, and needs 30 s of it left. |
 | `POST /admin/cameras/{id}/idle` (port 9091) | Bearer | Force the camera back to `Idle`. |
 
 ```bash
 curl -H "Authorization: Bearer $STREAMER_ADMIN_TOKEN" \
      http://localhost:9091/admin/state | jq
+curl -H "Authorization: Bearer $STREAMER_ADMIN_TOKEN" -o front_door.jpg \
+     http://localhost:9091/admin/cameras/<arlo_device_id>/thumbnail.jpg
 ```
 
 ### Selected metrics

@@ -174,7 +174,8 @@ impl StreamerSystem {
         )));
 
         let arlo_connected = Arc::new(AtomicBool::new(false));
-        let admin = AdminControlActor::new(admin_routes, version, arlo_connected.clone());
+        let admin =
+            AdminControlActor::new(admin_routes, version, arlo_connected.clone(), media.clone());
 
         info!(cameras = config.cameras.len(), "streamer system spawned");
         Ok(Self {
@@ -468,6 +469,13 @@ mod tests {
             _jpeg: Bytes,
         ) -> Result<(), DomainError> {
             Ok(())
+        }
+
+        async fn current_thumbnail(
+            &self,
+            _camera: &CameraId,
+        ) -> Result<Option<Bytes>, DomainError> {
+            Ok(None)
         }
     }
 
