@@ -98,7 +98,11 @@ impl Stack {
         streamer_infra_media::prepare_thumbnail_dir(&thumbnails).expect("thumbnail dir");
         let registry = Arc::new(GstPipelineRegistry::new(
             server.clone(),
-            streamer_infra_media::encoder::EncoderBackend::X264,
+            streamer_infra_media::encoder::EncoderPlan::uniform(
+                streamer_infra_media::encoder::VideoEncoding::at_default_bitrate(
+                    streamer_infra_media::encoder::EncoderBackend::X264,
+                ),
+            ),
             thumbnails.clone(),
         ));
         let camera = CameraId::new(CAMERA);
@@ -107,6 +111,8 @@ impl Stack {
             stream_name: StreamName::parse(STREAM).expect("stream name"),
             codec_hint: None,
             cooldown: CooldownConfig::default(),
+            video_encoder: None,
+            bitrate_kbps: None,
         }];
         let output = OutputConfig {
             rtsp: RtspOutput {
@@ -115,6 +121,7 @@ impl Stack {
             hls,
             dash: None,
             video_encoder: VideoEncoder::X264,
+            bitrate_kbps: streamer_domain::config::DEFAULT_VIDEO_BITRATE_KBPS,
             metrics_bind: "127.0.0.1:0".to_string(),
             admin_bind: "127.0.0.1:0".to_string(),
         };

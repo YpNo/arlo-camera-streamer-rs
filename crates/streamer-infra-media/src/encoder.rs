@@ -22,6 +22,7 @@
 //! low power with bitrate control, then low power at constant quality. A
 //! driver without CBR rejects that property value, so the dry run decides.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::time::Duration;
@@ -30,10 +31,11 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use tracing::{debug, info, warn};
 
-use streamer_domain::config::VideoEncoder;
+use streamer_domain::camera::CameraId;
+use streamer_domain::config::{DEFAULT_VIDEO_BITRATE_KBPS, VideoEncoder};
 
 use crate::error::MediaError;
-use crate::pipeline_desc::{UNIFIED_ENCODER_NAME, UNIFIED_GOP, VIDEO_BITRATE_KBPS};
+use crate::pipeline_desc::{UNIFIED_ENCODER_NAME, UNIFIED_GOP};
 
 /// How long a backend's dry run may take to reach end-of-stream.
 const DRY_RUN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -50,8 +52,8 @@ pub const LOW_POWER_QP: u32 = 26;
 /// Rate control of the `va` plugin's low-power encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateControl {
-    /// Constant bitrate at the unified video bitrate (`VIDEO_BITRATE_KBPS`).
-    /// On Intel the driver offers it only with the GPU's `HuC` firmware loaded.
+    /// Constant bitrate at the camera's bitrate. On Intel the driver
+    /// offers it only with the GPU's `HuC` firmware loaded.
     Cbr,
     /// Constant quality at [`LOW_POWER_QP`]; what a driver without `HuC`
     /// offers (Debian's free Intel driver on Skylake, for one).
@@ -66,9 +68,9 @@ impl RateControl {
         }
     }
 
-    fn properties(self) -> String {
+    fn properties(self, kbps: u32) -> String {
         match self {
-            Self::Cbr => format!("{} bitrate={VIDEO_BITRATE_KBPS}", self.label()),
+            Self::Cbr => format!("{} bitrate={kbps}", self.label()),
             Self::Cqp => format!("{} qpi={LOW_POWER_QP} qpp={LOW_POWER_QP}", self.label()),
         }
     }
@@ -178,10 +180,9 @@ impl EncoderBackend {
     /// `byte-stream,alignment=au` caps, so the downstream
     /// `h264parse ! rtph264pay` is identical.
     #[must_use]
-    pub fn segment(self) -> String {
+    pub fn segment(self, kbps: u32) -> String {
         let name = UNIFIED_ENCODER_NAME;
         let gop = UNIFIED_GOP;
-        let kbps = VIDEO_BITRATE_KBPS;
         let caps = "video/x-h264,stream-format=byte-stream,alignment=au";
         match self {
             Self::X264 => format!(
@@ -201,7 +202,7 @@ impl EncoderBackend {
                 "videoconvert ! video/x-raw,format=NV12 \
                  ! vah264lpenc name={name} {rate} key-int-max={gop} b-frames=0 \
                  ! {caps}",
-                rate = rate.properties()
+                rate = rate.properties(kbps)
             ),
             Self::Vaapi => format!(
                 "vaapipostproc \
@@ -223,6 +224,64 @@ impl EncoderBackend {
                  ! {caps}"
             ),
         }
+    }
+}
+
+/// A resolved encoder and the bitrate it encodes at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoEncoding {
+    /// The encoder.
+    pub backend: EncoderBackend,
+    /// Its bitrate in kbit/s; a constant-quality backend ignores it.
+    pub bitrate_kbps: u32,
+}
+
+impl VideoEncoding {
+    /// `backend` at the default bitrate.
+    #[must_use]
+    pub const fn at_default_bitrate(backend: EncoderBackend) -> Self {
+        Self {
+            backend,
+            bitrate_kbps: DEFAULT_VIDEO_BITRATE_KBPS,
+        }
+    }
+
+    /// The encoder segment of the unified launch string.
+    #[must_use]
+    pub fn segment(self) -> String {
+        self.backend.segment(self.bitrate_kbps)
+    }
+}
+
+/// How every camera encodes: one default, and the cameras configured
+/// otherwise.
+#[derive(Debug, Clone)]
+pub struct EncoderPlan {
+    default: VideoEncoding,
+    cameras: HashMap<CameraId, VideoEncoding>,
+}
+
+impl EncoderPlan {
+    /// Every camera encodes as `default`.
+    #[must_use]
+    pub fn uniform(default: VideoEncoding) -> Self {
+        Self {
+            default,
+            cameras: HashMap::new(),
+        }
+    }
+
+    /// `camera` encodes as `encoding` instead.
+    #[must_use]
+    pub fn with_camera(mut self, camera: CameraId, encoding: VideoEncoding) -> Self {
+        self.cameras.insert(camera, encoding);
+        self
+    }
+
+    /// How `camera` encodes.
+    #[must_use]
+    pub fn for_camera(&self, camera: &CameraId) -> VideoEncoding {
+        self.cameras.get(camera).copied().unwrap_or(self.default)
     }
 }
 
@@ -337,7 +396,7 @@ fn dry_run(backend: EncoderBackend) -> Result<(), String> {
         "videotestsrc num-buffers={DRY_RUN_FRAMES} \
          ! video/x-raw,format=I420,width=320,height=240,framerate=15/1 \
          ! videoconvert ! {} ! fakesink sync=false",
-        backend.segment()
+        backend.segment(DEFAULT_VIDEO_BITRATE_KBPS)
     );
     let pipeline = gst::parse::launch(&launch).map_err(|e| format!("launch: {e}"))?;
     let bus = pipeline
@@ -427,12 +486,12 @@ mod tests {
 
     #[test]
     fn low_power_segments_set_their_rate_control_and_no_b_frames() {
-        let cbr = EncoderBackend::VaLowPower(RateControl::Cbr).segment();
+        let cbr = EncoderBackend::VaLowPower(RateControl::Cbr).segment(2048);
         assert!(
             cbr.contains("vah264lpenc name=video_enc rate-control=cbr bitrate=2048 "),
             "{cbr}"
         );
-        let cqp = EncoderBackend::VaLowPower(RateControl::Cqp).segment();
+        let cqp = EncoderBackend::VaLowPower(RateControl::Cqp).segment(2048);
         assert!(cqp.contains("rate-control=cqp qpi=26 qpp=26 "), "{cqp}");
         for segment in [cbr, cqp] {
             assert!(
@@ -442,6 +501,45 @@ mod tests {
             assert!(segment.contains(" b-frames=0 "), "{segment}");
             assert!(!segment.contains("vapostproc"), "{segment}");
         }
+    }
+
+    /// The configured bitrate reaches every backend that has one.
+    #[test]
+    fn every_bitrate_backend_encodes_at_the_bitrate_given() {
+        for (backend, expected) in [
+            (EncoderBackend::X264, "bitrate=1500 "),
+            (EncoderBackend::Va, "bitrate=1500 "),
+            (
+                EncoderBackend::VaLowPower(RateControl::Cbr),
+                "bitrate=1500 ",
+            ),
+            (EncoderBackend::Vaapi, "bitrate=1500 "),
+            (EncoderBackend::Nvenc, "bitrate=1500 "),
+            (EncoderBackend::V4l2, "video_bitrate=1500000,"),
+        ] {
+            let segment = backend.segment(1500);
+            assert!(segment.contains(expected), "{backend:?}: {segment}");
+        }
+        let cqp = EncoderBackend::VaLowPower(RateControl::Cqp).segment(1500);
+        assert!(
+            !cqp.contains("bitrate="),
+            "constant quality has none: {cqp}"
+        );
+    }
+
+    #[test]
+    fn the_plan_gives_each_camera_its_override_or_the_default() {
+        let default = VideoEncoding::at_default_bitrate(EncoderBackend::X264);
+        let door = VideoEncoding {
+            backend: EncoderBackend::VaLowPower(RateControl::Cqp),
+            bitrate_kbps: 1000,
+        };
+        let plan = EncoderPlan::uniform(default).with_camera(CameraId::new("DOOR"), door);
+
+        assert_eq!(plan.for_camera(&CameraId::new("DOOR")), door);
+        assert_eq!(plan.for_camera(&CameraId::new("YARD")), default);
+        assert_eq!(default.bitrate_kbps, DEFAULT_VIDEO_BITRATE_KBPS);
+        assert_eq!(door.segment(), door.backend.segment(1000));
     }
 
     #[test]
@@ -487,7 +585,7 @@ mod tests {
     #[test]
     fn every_segment_names_the_encoder_and_ends_in_the_shared_caps() {
         for backend in EncoderBackend::AUTO_ORDER {
-            let segment = backend.segment();
+            let segment = backend.segment(2048);
             assert!(
                 segment.contains(&format!("name={UNIFIED_ENCODER_NAME}")),
                 "{backend}: {segment}"
@@ -501,10 +599,10 @@ mod tests {
         }
         assert!(
             EncoderBackend::V4l2
-                .segment()
+                .segment(2048)
                 .contains("video_bitrate=2048000")
         );
-        assert!(EncoderBackend::Nvenc.segment().contains("gop-size="));
+        assert!(EncoderBackend::Nvenc.segment(2048).contains("gop-size="));
     }
 
     #[test]

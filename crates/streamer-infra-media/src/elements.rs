@@ -174,8 +174,8 @@ mod tests {
             },
         ];
         for idle in &idles {
-            let Some(factories) = factories_of(&combined_launch_string(idle, EncoderBackend::X264))
-            else {
+            let encoding = crate::encoder::VideoEncoding::at_default_bitrate(EncoderBackend::X264);
+            let Some(factories) = factories_of(&combined_launch_string(idle, encoding)) else {
                 return;
             };
             assert_listed(&factories, ALWAYS);

@@ -85,7 +85,7 @@ use tracing::{debug, info, instrument, warn};
 use streamer_domain::camera::CameraId;
 use streamer_domain::thumbnail::check_thumbnail;
 
-use crate::encoder::EncoderBackend;
+use crate::encoder::EncoderPlan;
 use crate::error::MediaError;
 use crate::hls::{HlsSegmenter, prepare_dir};
 use crate::idle_source::{IdleKind, SYNTHETIC_HEIGHT, SYNTHETIC_WIDTH, standby_caption};
@@ -200,9 +200,10 @@ fn lock<T>(m: &StdMutex<T>) -> MutexGuard<'_, T> {
 /// GStreamer-backed [`PipelineRegistry`].
 pub struct GstPipelineRegistry {
     server: Arc<RtspServer>,
-    /// H.264 encoder backend resolved at boot ([`crate::encoder::resolve`]),
-    /// baked into every camera's persistent launch string.
-    video_encoder: EncoderBackend,
+    /// Each camera's encoder and bitrate, resolved at boot
+    /// ([`crate::encoder::resolve`]), baked into its persistent launch
+    /// string.
+    encoders: EncoderPlan,
     /// Directory holding the per-camera snapshot JPEGs the idle overlay
     /// loads; prepared by [`prepare_thumbnail_dir`] before this exists.
     thumbnail_dir: PathBuf,
@@ -210,18 +211,14 @@ pub struct GstPipelineRegistry {
 }
 
 impl GstPipelineRegistry {
-    /// Construct from a started RTSP server, the resolved video encoder
-    /// backend and the directory for the idle thumbnails (see
+    /// Construct from a started RTSP server, every camera's resolved
+    /// encoding and the directory for the idle thumbnails (see
     /// [`prepare_thumbnail_dir`]).
     #[must_use]
-    pub fn new(
-        server: Arc<RtspServer>,
-        video_encoder: EncoderBackend,
-        thumbnail_dir: PathBuf,
-    ) -> Self {
+    pub fn new(server: Arc<RtspServer>, encoders: EncoderPlan, thumbnail_dir: PathBuf) -> Self {
         Self {
             server,
-            video_encoder,
+            encoders,
             thumbnail_dir,
             state: RwLock::new(HashMap::new()),
         }
@@ -387,7 +384,7 @@ impl PipelineRegistry for GstPipelineRegistry {
         // Refresh the standby clock so the very first frame after
         // register reflects the current time.
         let idle = Self::refresh_overlay_timestamp(&idle);
-        let launch = combined_launch_string(&idle, self.video_encoder);
+        let launch = combined_launch_string(&idle, self.encoders.for_camera(camera));
         debug!(camera = %camera, launch_string = %launch, "combined launch string");
 
         let wiring: WiringSlot = Arc::new(StdMutex::new(None));

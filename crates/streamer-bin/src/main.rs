@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use secrecy::SecretString;
 use streamer_app::system::StreamerSystem;
-use streamer_domain::config::StreamerConfig;
+use streamer_domain::config::{StreamerConfig, VideoEncoder};
 use streamer_domain::error::DomainError;
 use streamer_domain::event::ConnectionStatus;
 use streamer_domain::port::{
@@ -64,7 +64,7 @@ use streamer_infra_arlo::{
     ArloClient, ArloEventSourceAdapter, ArloThumbnailSourceAdapter, ArloUserViewSourceAdapter,
     ArloWebrtcSignalerAdapter, DeviceRegistry, LoginBackoff, SnapshotUrlCache, boot::boot,
 };
-use streamer_infra_media::encoder::EncoderBackend;
+use streamer_infra_media::encoder::{EncoderBackend, EncoderPlan, VideoEncoding};
 use streamer_infra_media::{GstMediaMultiplexer, GstPipelineRegistry, RtspServer};
 use streamer_infra_ops::admin_server::check_admin_token;
 use streamer_infra_ops::{AdminServer, Metrics, OpsServer, Readiness};
@@ -198,24 +198,87 @@ async fn run_daemon(config: StreamerConfig) -> Result<()> {
 }
 
 /// The GStreamer side of the boot, before the Arlo login: every element
-/// the pipelines use, then the H.264 encoder probed on this host (ADR
-/// 0008: `auto` takes the first working backend, an explicit one must work
-/// or the boot fails). A missing plugin otherwise shows only as a media
-/// torn down at each client connection, and a boot failure after the
-/// login costs one login per restart.
-async fn prepare_gstreamer(config: &StreamerConfig) -> Result<EncoderBackend> {
+/// the pipelines use, then each encoder setting the config uses probed
+/// on this host (ADR 0008: `auto` takes the first working backend, an
+/// explicit one must work or the boot fails). A missing plugin otherwise
+/// shows only as a media torn down at each client connection, and a boot
+/// failure after the login costs one login per restart.
+async fn prepare_gstreamer(config: &StreamerConfig) -> Result<EncoderPlan> {
     streamer_infra_media::elements::check(config.output.hls.is_some())
         .context("GStreamer plugins")?;
+    let output = config.output.video_encoder;
+    let others = camera_encoder_settings(config);
     // The dry runs block: off the runtime's worker threads.
-    let configured = config.output.video_encoder;
-    tokio::task::spawn_blocking(move || streamer_infra_media::encoder::resolve(configured))
-        .await
-        .context("encoder probe task")?
-        .context("no usable H.264 encoder")
+    let (output_backend, others) = tokio::task::spawn_blocking(move || {
+        let output_backend = streamer_infra_media::encoder::resolve(output)?;
+        let others = others
+            .into_iter()
+            .map(|setting| {
+                streamer_infra_media::encoder::resolve(setting).map(|backend| (setting, backend))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, streamer_infra_media::MediaError>((output_backend, others))
+    })
+    .await
+    .context("encoder probe task")?
+    .context("no usable H.264 encoder")?;
+    Ok(encoder_plan(config, output_backend, &others))
+}
+
+/// The cameras' own encoder settings that differ from the output's, each
+/// once: three cameras on `va` cost one probe.
+fn camera_encoder_settings(config: &StreamerConfig) -> Vec<VideoEncoder> {
+    let mut settings = Vec::new();
+    for setting in config.cameras.iter().filter_map(|c| c.video_encoder) {
+        if setting != config.output.video_encoder && !settings.contains(&setting) {
+            settings.push(setting);
+        }
+    }
+    settings
+}
+
+/// Every camera's encoder and bitrate: the output's, or the camera's own
+/// setting resolved in `others`. Only the cameras that differ are logged
+/// and listed.
+fn encoder_plan(
+    config: &StreamerConfig,
+    output: EncoderBackend,
+    others: &[(VideoEncoder, EncoderBackend)],
+) -> EncoderPlan {
+    let backend_for = |setting: VideoEncoder| {
+        others
+            .iter()
+            .find(|(resolved, _)| *resolved == setting)
+            .map_or(output, |(_, backend)| *backend)
+    };
+    let default = VideoEncoding {
+        backend: output,
+        bitrate_kbps: config.output.bitrate_kbps,
+    };
+    config
+        .cameras
+        .iter()
+        .fold(EncoderPlan::uniform(default), |plan, camera| {
+            let encoding = VideoEncoding {
+                backend: backend_for(camera.video_encoder_or(&config.output)),
+                bitrate_kbps: camera.bitrate_kbps_or(&config.output),
+            };
+            if encoding == default {
+                return plan;
+            }
+            info!(
+                camera = %camera.arlo_device_id,
+                encoder = encoding.backend.label(),
+                element = %encoding.backend.describe(),
+                bitrate_kbps = encoding.bitrate_kbps,
+                "camera encoding"
+            );
+            plan.with_camera(camera.arlo_device_id.clone(), encoding)
+        })
 }
 
 async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()> {
-    let video_encoder = prepare_gstreamer(&config).await?;
+    let encoders = prepare_gstreamer(&config).await?;
 
     // -- Observability handles --
     let cameras_count = u32::try_from(config.cameras.len()).unwrap_or(u32::MAX);
@@ -286,7 +349,7 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
         RtspServer::start(&config.output.rtsp.bind).context("failed to start RTSP server")?;
     let pipeline_registry = Arc::new(GstPipelineRegistry::new(
         rtsp_server.clone(),
-        video_encoder,
+        encoders,
         thumbnail_dir,
     ));
     let relay_tls =
@@ -756,6 +819,72 @@ mod tests {
         });
         let bytes = out.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
+    }
+
+    fn example_config() -> StreamerConfig {
+        toml::from_str(include_str!("../../../config/streamer.example.toml")).expect("parses")
+    }
+
+    fn camera(
+        id: &str,
+        setting: Option<VideoEncoder>,
+        kbps: Option<u32>,
+    ) -> streamer_domain::config::CameraConfig {
+        streamer_domain::config::CameraConfig {
+            arlo_device_id: streamer_domain::camera::CameraId::new(id),
+            stream_name: streamer_domain::camera::StreamName::parse(id.to_lowercase())
+                .expect("stream name"),
+            codec_hint: None,
+            cooldown: streamer_domain::config::CooldownConfig::default(),
+            video_encoder: setting,
+            bitrate_kbps: kbps,
+        }
+    }
+
+    /// Three cameras on `va` cost one probe; the output's own setting none.
+    #[test]
+    fn each_camera_encoder_setting_is_probed_once() {
+        let mut config = example_config();
+        config.output.video_encoder = VideoEncoder::Auto;
+        config.cameras = vec![
+            camera("A", Some(VideoEncoder::Va), None),
+            camera("B", Some(VideoEncoder::Va), None),
+            camera("C", Some(VideoEncoder::Auto), None),
+            camera("D", Some(VideoEncoder::X264), None),
+            camera("E", None, None),
+        ];
+        assert_eq!(
+            camera_encoder_settings(&config),
+            vec![VideoEncoder::Va, VideoEncoder::X264]
+        );
+    }
+
+    #[test]
+    fn the_plan_applies_each_cameras_own_encoder_and_bitrate() {
+        use streamer_infra_media::encoder::RateControl;
+        let mut config = example_config();
+        config.output.video_encoder = VideoEncoder::Auto;
+        config.output.bitrate_kbps = 3000;
+        config.cameras = vec![
+            camera("PLAIN", None, None),
+            camera("SLOW", None, Some(1000)),
+            camera("GPU", Some(VideoEncoder::Va), None),
+        ];
+        let low_power = EncoderBackend::VaLowPower(RateControl::Cqp);
+
+        let plan = encoder_plan(
+            &config,
+            EncoderBackend::X264,
+            &[(VideoEncoder::Va, low_power)],
+        );
+
+        let of = |id: &str| plan.for_camera(&streamer_domain::camera::CameraId::new(id));
+        assert_eq!(of("PLAIN").backend, EncoderBackend::X264);
+        assert_eq!(of("PLAIN").bitrate_kbps, 3000);
+        assert_eq!(of("SLOW").backend, EncoderBackend::X264);
+        assert_eq!(of("SLOW").bitrate_kbps, 1000);
+        assert_eq!(of("GPU").backend, low_power);
+        assert_eq!(of("GPU").bitrate_kbps, 3000);
     }
 
     #[test]

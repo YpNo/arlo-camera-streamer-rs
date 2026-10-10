@@ -490,6 +490,7 @@ mod tests {
             hls: None,
             dash: None,
             video_encoder: VideoEncoder::X264,
+            bitrate_kbps: streamer_domain::config::DEFAULT_VIDEO_BITRATE_KBPS,
             metrics_bind: "127.0.0.1:9090".to_string(),
             admin_bind: "127.0.0.1:9091".to_string(),
         }
@@ -502,12 +503,16 @@ mod tests {
                 stream_name: name("front_door"),
                 codec_hint: Some(Codec::H265),
                 cooldown: CooldownConfig::default(),
+                video_encoder: None,
+                bitrate_kbps: None,
             },
             CameraConfig {
                 arlo_device_id: cam("CAM_B"),
                 stream_name: name("back_yard"),
                 codec_hint: None,
                 cooldown: CooldownConfig::default(),
+                video_encoder: None,
+                bitrate_kbps: None,
             },
         ]
     }

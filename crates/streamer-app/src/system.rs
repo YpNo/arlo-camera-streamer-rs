@@ -502,6 +502,7 @@ mod tests {
                 hls: None,
                 dash: None,
                 video_encoder: streamer_domain::config::VideoEncoder::X264,
+                bitrate_kbps: streamer_domain::config::DEFAULT_VIDEO_BITRATE_KBPS,
                 metrics_bind: "127.0.0.1:9090".to_string(),
                 admin_bind: "127.0.0.1:9091".to_string(),
             },
@@ -511,6 +512,8 @@ mod tests {
                 stream_name: StreamName::parse("cam").unwrap(),
                 codec_hint: None,
                 cooldown: CooldownConfig::default(),
+                video_encoder: None,
+                bitrate_kbps: None,
             }],
         }
     }

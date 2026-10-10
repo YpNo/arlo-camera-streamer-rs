@@ -242,6 +242,11 @@ pub struct OutputConfig {
     /// H.264 encoder for the live/idle pipeline (software or GPU).
     #[serde(default)]
     pub video_encoder: VideoEncoder,
+    /// Bitrate of the output stream, in kbit/s ([`DEFAULT_VIDEO_BITRATE_KBPS`]).
+    /// A constant-quality encoder (Intel low power without `HuC`) has no
+    /// bitrate to set and ignores it.
+    #[serde(default = "default_video_bitrate_kbps")]
+    pub bitrate_kbps: u32,
     /// Bind address for the Prometheus `/metrics` endpoint.
     #[serde(default = "default_metrics_bind")]
     pub metrics_bind: String,
@@ -273,6 +278,14 @@ pub struct HlsOutput {
     #[serde(default = "default_playlist_length")]
     pub playlist_length: u32,
 }
+
+/// Bitrate of the output stream when nothing else is set, in kbit/s.
+pub const DEFAULT_VIDEO_BITRATE_KBPS: u32 = 2048;
+/// Lowest bitrate accepted: below it 720p H.264 is a smear.
+pub const MIN_VIDEO_BITRATE_KBPS: u32 = 256;
+/// Highest bitrate accepted: above it a typo (an extra zero) floods the
+/// LAN and the NVR's disk.
+pub const MAX_VIDEO_BITRATE_KBPS: u32 = 20_000;
 
 /// Shortest HLS segment accepted; `0` would disable splitting.
 pub const MIN_HLS_SEGMENT_SECS: u32 = 1;
@@ -332,6 +345,9 @@ fn default_app_version() -> String {
 fn default_rtsp_bind() -> String {
     "0.0.0.0:8554".to_string()
 }
+const fn default_video_bitrate_kbps() -> u32 {
+    DEFAULT_VIDEO_BITRATE_KBPS
+}
 fn default_metrics_bind() -> String {
     "127.0.0.1:9090".to_string()
 }
@@ -360,6 +376,26 @@ pub struct CameraConfig {
     /// Cooldown / battery-protection knobs.
     #[serde(default)]
     pub cooldown: CooldownConfig,
+    /// This camera's H.264 encoder, in place of `output.video_encoder`.
+    #[serde(default)]
+    pub video_encoder: Option<VideoEncoder>,
+    /// This camera's bitrate in kbit/s, in place of `output.bitrate_kbps`.
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
+}
+
+impl CameraConfig {
+    /// The encoder this camera uses: its own, else the output's.
+    #[must_use]
+    pub fn video_encoder_or(&self, output: &OutputConfig) -> VideoEncoder {
+        self.video_encoder.unwrap_or(output.video_encoder)
+    }
+
+    /// The bitrate this camera uses: its own, else the output's.
+    #[must_use]
+    pub fn bitrate_kbps_or(&self, output: &OutputConfig) -> u32 {
+        self.bitrate_kbps.unwrap_or(output.bitrate_kbps)
+    }
 }
 
 /// Cooldown and battery-protection knobs per camera.
@@ -468,7 +504,14 @@ impl StreamerConfig {
                 )));
             }
             camera.cooldown.validate(&camera.arlo_device_id)?;
+            if let Some(kbps) = camera.bitrate_kbps {
+                validate_bitrate(
+                    &format!("cameras.{}.bitrate_kbps", camera.arlo_device_id),
+                    kbps,
+                )?;
+            }
         }
+        validate_bitrate("output.bitrate_kbps", self.output.bitrate_kbps)?;
         if let Some(hls) = &self.output.hls {
             hls.validate()?;
         }
@@ -493,6 +536,16 @@ impl StreamerConfig {
         }
         Ok(())
     }
+}
+
+/// A bitrate inside [`MIN_VIDEO_BITRATE_KBPS`]..=[`MAX_VIDEO_BITRATE_KBPS`].
+fn validate_bitrate(name: &str, kbps: u32) -> Result<(), DomainError> {
+    if (MIN_VIDEO_BITRATE_KBPS..=MAX_VIDEO_BITRATE_KBPS).contains(&kbps) {
+        return Ok(());
+    }
+    Err(DomainError::InvalidConfig(format!(
+        "{name} = {kbps} is outside {MIN_VIDEO_BITRATE_KBPS}..={MAX_VIDEO_BITRATE_KBPS} kbit/s"
+    )))
 }
 
 const fn default_debounce() -> u64 {
@@ -993,6 +1046,59 @@ mod tests {
             hls(u32::MAX, 6).effective_segment_secs(),
             MAX_HLS_SEGMENT_SECS
         );
+    }
+
+    #[test]
+    fn a_cameras_own_encoder_and_bitrate_override_the_outputs() {
+        let raw = include_str!("../../../config/streamer.example.toml").to_string();
+        let mut cfg: StreamerConfig = toml::from_str(&raw).expect("parses");
+        assert_eq!(cfg.output.bitrate_kbps, DEFAULT_VIDEO_BITRATE_KBPS);
+        let camera = cfg.cameras[0].clone();
+        assert_eq!(
+            camera.video_encoder_or(&cfg.output),
+            cfg.output.video_encoder
+        );
+        assert_eq!(
+            camera.bitrate_kbps_or(&cfg.output),
+            DEFAULT_VIDEO_BITRATE_KBPS
+        );
+
+        let own: CameraConfig = toml::from_str(
+            "arlo_device_id = \"CAM2\"\nstream_name = \"yard\"\n\
+             video_encoder = \"va\"\nbitrate_kbps = 1000\n",
+        )
+        .expect("parses");
+        assert_eq!(own.video_encoder_or(&cfg.output), VideoEncoder::Va);
+        assert_eq!(own.bitrate_kbps_or(&cfg.output), 1000);
+        cfg.cameras.push(own);
+        cfg.validate().expect("in range");
+    }
+
+    #[test]
+    fn a_bitrate_outside_the_range_is_refused_with_its_name() {
+        let raw = include_str!("../../../config/streamer.example.toml");
+        let cfg: StreamerConfig = toml::from_str(raw).expect("parses");
+        for kbps in [MIN_VIDEO_BITRATE_KBPS - 1, MAX_VIDEO_BITRATE_KBPS + 1] {
+            let mut bad = cfg.clone();
+            bad.output.bitrate_kbps = kbps;
+            let err = bad.validate().unwrap_err().to_string();
+            assert!(err.contains("output.bitrate_kbps"), "{err}");
+
+            let mut bad = cfg.clone();
+            bad.cameras[0].bitrate_kbps = Some(kbps);
+            let err = bad.validate().unwrap_err().to_string();
+            assert!(err.contains(".bitrate_kbps"), "{err}");
+            assert!(
+                err.contains(bad.cameras[0].arlo_device_id.as_str()),
+                "{err}"
+            );
+        }
+        for kbps in [MIN_VIDEO_BITRATE_KBPS, MAX_VIDEO_BITRATE_KBPS] {
+            let mut ok = cfg.clone();
+            ok.output.bitrate_kbps = kbps;
+            ok.cameras[0].bitrate_kbps = Some(kbps);
+            ok.validate().expect("bounds are inclusive");
+        }
     }
 
     /// 0.3.0 removed DASH: a config that still has the table is told what

@@ -1719,6 +1719,8 @@ mod tests {
                 budget_reset: "00:00".to_string(),
                 user_view_probe_secs: probe,
             },
+            video_encoder: None,
+            bitrate_kbps: None,
         }
     }
 

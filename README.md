@@ -181,6 +181,7 @@ budget and probe 0 to 86400 s).
 | `webrtc.ice_address_family`         | `dual`/`ipv4`  | `dual`               | ICE candidate gathering; `ipv4` when IPv6 to Arlo is broken. |
 | `webrtc.live_stall_timeout_secs`    | u64            | `10` (floor 4)       | Seconds without inbound video before the live source is declared lost and the output returns to idle (ADR 0004). |
 | `output.video_encoder`              | `auto`/`x264`/`va`/`vaapi`/`v4l2`/`nvenc` | `auto` | `auto` probes the host at boot (NVIDIA, Intel/AMD, V4L2, then x264); an explicit name fails the boot when it does not work (see [GPU encoding](#gpu-encoding)). |
+| `output.bitrate_kbps`               | u32 (256..=20000) | `2048`           | Bitrate of each camera's stream; a constant-quality encoder (Intel low power without HuC) ignores it. |
 | `output.rtsp.bind`                  | `host:port`    | `0.0.0.0:8554`       | Embedded RTSP server.                                    |
 | `output.metrics_bind`               | `host:port`    | `127.0.0.1:9090`     | Prometheus + healthchecks.                               |
 | `output.admin_bind`                 | `host:port`    | `127.0.0.1:9091`     | `/admin/*` write API.                                    |
@@ -189,6 +190,7 @@ budget and probe 0 to 86400 s).
 | `output.hls.playlist_length`        | u32            | `10` (floor 3)       | Segments in the playlist; two more are kept on disk.      |
 | `output.dash`                       | —              | removed in 0.3.0     | A config that still has the table is refused at boot; delete it (ADR 0006). |
 | `[[cameras]]`                       | array          | `[]`                 | One block per camera — see example.                      |
+| `cameras[].video_encoder` / `cameras[].bitrate_kbps` | as `output.*` | (the output's) | One camera's own encoder or bitrate. Each setting in use is probed once at boot; the log names each camera that differs (`camera encoding`). |
 | `cameras.codec_hint`                | `h264`/`h265`  | (auto)               | Skip first-stream codec detection.                       |
 | `cameras.cooldown.debounce_secs`    | u64            | `60`                 | Hold-live debounce after last motion.                    |
 | `cameras.cooldown.max_continuous_live` | u64         | `300`                | Hard cap on continuous live (battery protection); also caps a relayed app view when probing is off. |
@@ -463,7 +465,9 @@ Coral accelerates Frigate's detection, not this daemon's encoding.
 Each probe is a short dry run, so a plugin whose device is missing or
 unreadable is skipped rather than chosen. Naming a backend pins it: the
 boot then fails when it does not work (`va` accepts its three variants,
-below). Details: [ADR 0008](./docs/adr/0008-video-encoder-selection.md).
+below). A camera can name its own in its `[[cameras]]` block
+(`video_encoder`, `bitrate_kbps`), for instance x264 for the one camera
+whose picture the GPU encoder handles poorly. Details: [ADR 0008](./docs/adr/0008-video-encoder-selection.md).
 
 ### Giving the container the GPU
 

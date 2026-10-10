@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it.
 
 ### Added
+- `output.bitrate_kbps` (default 2048, as before) and, per camera,
+  `video_encoder` and `bitrate_kbps` overriding the output's. Each encoder
+  setting in use is probed once at boot; the log names each camera that
+  differs.
 - `--log-format json` (or `STREAMER_LOG_FORMAT=json`): one JSON object per
   log line, the event's fields at the top level and the enclosing spans
   (the camera among them) in `spans`, for log pipelines.

@@ -90,7 +90,12 @@ live_stall_timeout_secs = 10
 #             Zero 2, CM4; needs `/dev/video11`.
 #   "nvenc" — NVIDIA GPU (`nvh264enc`); needs the NVIDIA container toolkit.
 # An explicit name fails the boot when that encoder does not work here.
+# A camera can name its own (see [[cameras]]).
 video_encoder = "auto"
+# Bitrate of each camera's stream in kbit/s, 256..=20000 (default 2048).
+# An Intel low-power encoder without HuC firmware encodes at constant
+# quality and ignores it (README, "GPU encoding").
+# bitrate_kbps = 2048
 # Prometheus /metrics endpoint (per-camera state, transitions, live seconds).
 metrics_bind = "127.0.0.1:9090"
 # Operational /admin HTTP endpoint (force-wake, force-idle, state snapshot).
@@ -125,6 +130,9 @@ arlo_device_id = "REPLACE_WITH_DEVICE_ID"
 # URL path of the RTSP output: rtsp://<host>:8554/front_door
 stream_name    = "front_door"
 # codec_hint   = "h264"   # or "h265"; learned automatically on first stream
+# This camera's own encoder and bitrate, in place of [output]'s:
+# video_encoder = "x264"
+# bitrate_kbps  = 1024
 
 # Checked at boot: debounce_secs and max_continuous_live 1..=86400, the
 # other two 0..=86400 (0 = disabled). A session is cut the moment the daily

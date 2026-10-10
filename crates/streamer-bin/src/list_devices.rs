@@ -155,6 +155,8 @@ mod tests {
             stream_name: StreamName::parse(stream).expect("valid"),
             codec_hint: None,
             cooldown: CooldownConfig::default(),
+            video_encoder: None,
+            bitrate_kbps: None,
         }
     }
 
