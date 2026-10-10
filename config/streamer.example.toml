@@ -119,6 +119,20 @@ bind = "0.0.0.0:8554"
 # config that still has it is refused at boot. HLS serves browsers.
 
 # ---------------------------------------------------------------------------
+# Home Assistant over MQTT (optional; ADR 0009). Publishes each camera's
+# state and Home Assistant discovery documents; nothing on the broker can
+# act on a camera.
+# ---------------------------------------------------------------------------
+# [mqtt]
+# url              = "mqtts://broker.lan:8883"    # or mqtt://host (1883); no user:pass@
+# username         = "arlo"
+# password_env     = "STREAMER_MQTT_PASSWORD"     # env var holding the password
+# ca_file          = "/etc/arlo-streamer/ca.pem"  # private CA; system roots otherwise
+# base_topic       = "arlo-camera-streamer"
+# discovery_prefix = "homeassistant"              # "" = no discovery
+# thumbnails       = false                        # publish the idle JPEG (any broker client can read it)
+
+# ---------------------------------------------------------------------------
 # Cameras — one [[cameras]] block per Arlo device you want to expose.
 # `arlo_device_id` is the opaque id from the Arlo cloud. To list them,
 # with a ready-to-paste block per camera:

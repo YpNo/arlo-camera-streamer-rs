@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it.
 
 ### Added
+- `[mqtt]`: each camera's state published to an MQTT broker with Home
+  Assistant discovery (ADR 0009): state, live, app view and live time
+  per camera, the Arlo connection, and the idle picture when
+  `thumbnails = true`. Publish only: nothing on the broker can act on a
+  camera. TLS with the system roots or a `ca_file`; a broker that is down
+  is retried with a growing pause and never stops the daemon; a camera
+  removed from the configuration is removed from Home Assistant.
 - `docs/arlo-protocol-notes.md`: what this project learned about Arlo's
   undocumented cloud, in one place (login, devices, the MQTT bus, the
   WebRTC leg, the app's watch-along stream, snapshots).

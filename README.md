@@ -68,6 +68,7 @@ to see the contracts. The ADRs document the load-bearing decisions:
 - [ADR 0006 — HLS output](./docs/adr/0006-hls-output-via-loopback-segmenter.md): HLS is written by a loopback RTSP client of each camera, no re-encode.
 - [ADR 0007 — Relay the user's app view](./docs/adr/0007-relay-the-users-app-view.md): a live view started in the Arlo app is relayed, picture and sound, from the RTSPS stream Arlo hands the app identity; no cooldown, no budget charge; the relay lets go of the stream every `user_view_probe_secs` so the camera can report whether the app still views.
 - [ADR 0008 — Choosing the H.264 encoder per host](./docs/adr/0008-video-encoder-selection.md): `video_encoder = "auto"` dry-runs NVIDIA, Intel/AMD, V4L2 and x264 at boot and keeps the first that works.
+- [ADR 0009 — Camera state over MQTT for Home Assistant](./docs/adr/0009-mqtt-home-assistant.md): publish-only, discovery, no new dependency (a small client on the codec already in the tree).
 
 ## Prerequisites
 
@@ -207,6 +208,7 @@ budget and probe 0 to 86400 s).
 | `ARLO_IMAP_PASSWORD` (or whatever you put in `arlo.mfa.password_env`) | IMAP password, when `arlo.mfa.kind = "email"` uses a mailbox. |
 | `STREAMER_ADMIN_TOKEN` | **Required** by `run`. Bearer token for `/admin/*`, at least 16 bytes (`openssl rand -hex 32`). |
 | `RUST_LOG` | Optional. Log filter, default `info,arlo_camera_streamer=debug`; see [Logging and debugging](#logging-and-debugging). |
+| `STREAMER_MQTT_PASSWORD` (or whatever you put in `mqtt.password_env`) | The MQTT broker's password, with `[mqtt]` and a `username`. |
 | `STREAMER_LOG_FORMAT` | Optional. `text` (default) or `json`, one object per line for a log pipeline; same as `--log-format`. See [Logging and debugging](#logging-and-debugging). |
 | `GST_DEBUG` | Optional. GStreamer's own debug output, off by default; see [GStreamer debugging](#gstreamer-debugging). |
 
@@ -389,6 +391,40 @@ for VLC, Home Assistant's camera card or a page with hls.js. It serves
 playlists (never cached) and segments only, with CORS open to any origin;
 everything else is a 404 ([`deploy/nginx-hls.conf`](./deploy/nginx-hls.conf)).
 Like the RTSP port, it is meant for a trusted LAN.
+
+### Home Assistant (MQTT)
+
+With an `[mqtt]` table (see the example config), the daemon publishes
+each camera's state to an MQTT broker and announces it to Home
+Assistant through MQTT discovery: each camera appears as a device with
+its **State** (`idle`, `activating`, `live`, `battery-protect`,
+`failed`), **Live** and **Viewed in the Arlo app** flags and **Live time
+today**, plus a bridge device with the **Arlo connection**; no YAML.
+With `thumbnails = true`, its idle picture appears as a camera entity.
+
+```toml
+[mqtt]
+url          = "mqtts://broker.lan:8883"
+username     = "arlo"
+password_env = "STREAMER_MQTT_PASSWORD"
+```
+
+- **Publish only.** The daemon subscribes to nothing: no message on the
+  broker can wake or stop a camera. Waking stays on the admin API.
+- **Topics**, keyed by the Arlo device id: `<base>/status` (`online`, and
+  `offline` as the last will), `<base>/bridge`, `<base>/<device_id>/state`
+  (one JSON document), `<base>/<device_id>/thumbnail`; all retained.
+- **State** is read every second and published when it changes; after
+  every (re)connection everything is published again. A broker that is
+  down is retried after 1, 2, 4 … 60 s and never stops the daemon.
+- **A camera removed** from the configuration is removed from Home
+  Assistant on the next connection (the ids published are recorded in
+  the state directory, `mqtt-published.json`).
+- **TLS** with `mqtts://`, verified against the system roots or
+  `ca_file`. A password over plain `mqtt://` to another host is allowed
+  (many LAN brokers have no TLS) with a warning at boot.
+- **Two daemons on one broker** need different `base_topic`s (the client
+  id derives from it).
 
 ### Frigate integration
 
@@ -886,6 +922,10 @@ Releasing is therefore: bump `version` in `Cargo.toml`, move the
 ## Security
 
 - Secrets are read from env vars at boot (`fail fast` on missing).
+- The MQTT adapter publishes only: nothing on the broker can act on a
+  camera. Its idle pictures (`thumbnails = true`, off by default) leave
+  the admin token's protection: any client of the broker can read them,
+  in clear over `mqtt://`.
 - The `/admin/*` surface refuses to start without a non-empty
   `STREAMER_ADMIN_TOKEN`. Rotate it by rotating the env var and
   restarting. Rejected requests are logged with their route, never the

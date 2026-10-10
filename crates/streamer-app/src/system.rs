@@ -515,6 +515,7 @@ mod tests {
                 video_encoder: None,
                 bitrate_kbps: None,
             }],
+            mqtt: None,
         }
     }
 

@@ -25,10 +25,149 @@ pub struct StreamerConfig {
     /// TOML means `WebrtcConfig::default()` — dual-stack ICE.
     #[serde(default)]
     pub webrtc: WebrtcConfig,
-    /// Cameras to expose. Empty list is a configuration error caught
-    /// at boot in `streamer-bin`.
+    /// Cameras to expose. An empty list serves every camera on the
+    /// account (filled after the login, in `streamer-bin`).
     #[serde(default)]
     pub cameras: Vec<CameraConfig>,
+    /// Camera state published to an MQTT broker for Home Assistant
+    /// (ADR 0009); off when absent.
+    #[serde(default)]
+    pub mqtt: Option<MqttConfig>,
+}
+
+/// The MQTT adapter's settings (ADR 0009).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MqttConfig {
+    /// `mqtt://host[:port]` (1883) or `mqtts://host[:port]` (8883); no
+    /// credentials, path or query.
+    pub url: String,
+    /// Login name, when the broker wants one.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Name of the env var holding the password (never the password).
+    #[serde(default)]
+    pub password_env: Option<String>,
+    /// PEM file of the CA that signed the broker's certificate, for a
+    /// private CA; the system roots otherwise.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// Prefix of every topic the daemon publishes.
+    #[serde(default = "default_mqtt_base_topic")]
+    pub base_topic: String,
+    /// Home Assistant's discovery prefix; empty turns discovery off.
+    #[serde(default = "default_mqtt_discovery_prefix")]
+    pub discovery_prefix: String,
+    /// Publish each camera's idle JPEG (readable by every client of the
+    /// broker): off by default.
+    #[serde(default)]
+    pub thumbnails: bool,
+}
+
+/// Where the broker is, from [`MqttConfig::url`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MqttEndpoint {
+    /// `mqtts://`: TLS to the broker.
+    pub tls: bool,
+    /// Host name or IP literal (no brackets).
+    pub host: String,
+    /// TCP port.
+    pub port: u16,
+}
+
+/// Default MQTT port, plain and over TLS.
+const MQTT_PORT: u16 = 1883;
+const MQTTS_PORT: u16 = 8883;
+
+impl MqttConfig {
+    /// The broker's address.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::InvalidConfig`] for another scheme, a missing host,
+    /// a bad port, or credentials, a path or a query in the URL.
+    pub fn endpoint(&self) -> Result<MqttEndpoint, DomainError> {
+        let bad = |why: &str| DomainError::InvalidConfig(format!("mqtt.url: {why}"));
+        let (tls, rest) = if let Some(rest) = self.url.strip_prefix("mqtts://") {
+            (true, rest)
+        } else if let Some(rest) = self.url.strip_prefix("mqtt://") {
+            (false, rest)
+        } else {
+            return Err(bad("must start with mqtt:// or mqtts://"));
+        };
+        let authority = rest.strip_suffix('/').unwrap_or(rest);
+        if authority.contains('@') {
+            return Err(bad("no user:password@ (use username and password_env)"));
+        }
+        if authority.contains(['/', '?', '#']) {
+            return Err(bad("no path or query"));
+        }
+        let (host, port) = split_host_port(authority).ok_or_else(|| bad("bad host or port"))?;
+        if host.is_empty() {
+            return Err(bad("missing host"));
+        }
+        Ok(MqttEndpoint {
+            tls,
+            host: host.to_string(),
+            port: port.unwrap_or(if tls { MQTTS_PORT } else { MQTT_PORT }),
+        })
+    }
+
+    fn validate(&self) -> Result<(), DomainError> {
+        self.endpoint()?;
+        if self.password_env.is_some() && self.username.is_none() {
+            return Err(DomainError::InvalidConfig(
+                "mqtt.password_env needs mqtt.username (MQTT sends no password alone)".to_string(),
+            ));
+        }
+        validate_topic_prefix("mqtt.base_topic", &self.base_topic, false)?;
+        validate_topic_prefix("mqtt.discovery_prefix", &self.discovery_prefix, true)
+    }
+}
+
+/// `host[:port]`, `[v6]` or `[v6]:port`; `None` when the port is not a
+/// number or the brackets do not close.
+fn split_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        return match after {
+            "" => Some((host, None)),
+            port => Some((host, Some(port.strip_prefix(':')?.parse().ok()?))),
+        };
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => Some((host, Some(port.parse().ok()?))),
+        None => Some((authority, None)),
+    }
+}
+
+/// Topic levels of `[A-Za-z0-9_-]`, `/`-separated, none empty: never a
+/// wildcard (`+`, `#`) or a `$` system topic. Empty only if `may_be_empty`.
+fn validate_topic_prefix(name: &str, value: &str, may_be_empty: bool) -> Result<(), DomainError> {
+    if value.is_empty() && may_be_empty {
+        return Ok(());
+    }
+    let ok = !value.is_empty()
+        && value.split('/').all(|level| {
+            !level.is_empty()
+                && level
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(DomainError::InvalidConfig(format!(
+            "{name} = '{value}': topic levels of letters, digits, '-' and '_', separated by '/'"
+        )))
+    }
+}
+
+fn default_mqtt_base_topic() -> String {
+    "arlo-camera-streamer".to_string()
+}
+fn default_mqtt_discovery_prefix() -> String {
+    "homeassistant".to_string()
 }
 
 /// Default for [`WebrtcConfig::live_stall_timeout_secs`]: about three
@@ -532,6 +671,9 @@ impl StreamerConfig {
             }
         }
         validate_bitrate("output.bitrate_kbps", self.output.bitrate_kbps)?;
+        if let Some(mqtt) = &self.mqtt {
+            mqtt.validate()?;
+        }
         if let Some(hls) = &self.output.hls {
             hls.validate()?;
         }
@@ -1152,6 +1294,89 @@ mod tests {
             ok.cameras[0].bitrate_kbps = Some(kbps);
             ok.validate().expect("bounds are inclusive");
         }
+    }
+
+    fn mqtt(url: &str) -> MqttConfig {
+        toml::from_str(&format!("url = \"{url}\"")).expect("parses")
+    }
+
+    #[test]
+    fn mqtt_endpoint_reads_scheme_host_and_port_with_defaults() {
+        let cases = [
+            ("mqtt://broker.lan", false, "broker.lan", 1883),
+            ("mqtts://broker.lan", true, "broker.lan", 8883),
+            ("mqtt://10.0.0.5:1884/", false, "10.0.0.5", 1884),
+            ("mqtts://[fd00::5]:9000", true, "fd00::5", 9000),
+            ("mqtt://[::1]", false, "::1", 1883),
+        ];
+        for (url, tls, host, port) in cases {
+            let endpoint = mqtt(url).endpoint().unwrap();
+            assert_eq!(
+                (endpoint.tls, endpoint.host.as_str(), endpoint.port),
+                (tls, host, port),
+                "{url}"
+            );
+        }
+    }
+
+    /// Credentials belong in `username` / `password_env`, never in the URL.
+    #[test]
+    fn mqtt_endpoint_refuses_other_schemes_credentials_paths_and_bad_ports() {
+        for url in [
+            "http://broker",
+            "tcp://broker:1883",
+            "mqtt://user:secret@broker",
+            "mqtt://broker/topic",
+            "mqtt://broker?x=1",
+            "mqtt://broker:notaport",
+            "mqtt://broker:70000",
+            "mqtt://",
+            "mqtt://[fd00::5",
+        ] {
+            let err = mqtt(url).endpoint().unwrap_err().to_string();
+            assert!(err.contains("mqtt.url"), "{url}: {err}");
+            assert!(!err.contains("secret"), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn mqtt_defaults_and_topic_rules() {
+        let config = mqtt("mqtt://broker");
+        assert_eq!(config.base_topic, "arlo-camera-streamer");
+        assert_eq!(config.discovery_prefix, "homeassistant");
+        assert!(!config.thumbnails, "thumbnails are opt-in");
+        config.validate().expect("defaults validate");
+
+        let off = MqttConfig {
+            discovery_prefix: String::new(),
+            ..config.clone()
+        };
+        off.validate().expect("an empty prefix turns discovery off");
+        for (field, bad) in [
+            ("base", "a/#"),
+            ("base", "a/+/b"),
+            ("base", "/a"),
+            ("base", ""),
+            ("disc", "ha/"),
+        ] {
+            let candidate = if field == "base" {
+                MqttConfig {
+                    base_topic: bad.to_string(),
+                    ..config.clone()
+                }
+            } else {
+                MqttConfig {
+                    discovery_prefix: bad.to_string(),
+                    ..config.clone()
+                }
+            };
+            assert!(candidate.validate().is_err(), "{field} = {bad:?}");
+        }
+        let password_alone = MqttConfig {
+            password_env: Some("PW".to_string()),
+            ..config
+        };
+        assert!(password_alone.validate().is_err());
     }
 
     /// 0.3.0 removed DASH: a config that still has the table is told what

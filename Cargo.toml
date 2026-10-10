@@ -48,6 +48,8 @@ tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util   = "0.7"
 tokio-rustls = "0.26"
+# MQTT 3.1.1 packet codec (ADR 0009); already in the tree through arlo-rs.
+mqttbytes    = "0.6"
 # Watch-along TLS (ADR 0007): system roots for chain verification, SHA-256 for the certificate pin.
 rustls-native-certs = "0.8"
 ring = "0.17"

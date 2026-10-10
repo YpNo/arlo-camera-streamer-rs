@@ -23,7 +23,7 @@ pub const MAX_CAMERA_ID_LEN: usize = 64;
 /// and in HTTP paths, so everything that crosses a trust boundary (the
 /// configuration, the admin API, the event bus) goes through
 /// [`CameraId::parse`], which allows `[A-Za-z0-9_-]{1,64}` only.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct CameraId(String);
 

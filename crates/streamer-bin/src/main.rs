@@ -67,6 +67,7 @@ use streamer_infra_arlo::{
 use streamer_infra_media::encoder::{EncoderBackend, EncoderPlan, VideoEncoding};
 use streamer_infra_media::{GstMediaMultiplexer, GstPipelineRegistry, RtspServer};
 use streamer_infra_ops::admin_server::check_admin_token;
+use streamer_infra_ops::mqtt::MqttSetup;
 use streamer_infra_ops::{AdminServer, Metrics, OpsServer, Readiness};
 
 use crate::signals::ShutdownSignals;
@@ -277,8 +278,48 @@ fn encoder_plan(
         })
 }
 
+/// The MQTT adapter's setup when `[mqtt]` is configured, checked before
+/// the Arlo login: the URL, the password's env var, the CA file and the
+/// TLS setup.
+async fn prepare_mqtt(config: &StreamerConfig) -> Result<Option<MqttSetup>> {
+    let Some(mqtt) = &config.mqtt else {
+        return Ok(None);
+    };
+    let password = match &mqtt.password_env {
+        // VarError::NotUnicode prints the value: not passed on.
+        Some(name) => Some(SecretString::from(std::env::var(name).map_err(|_| {
+            anyhow::anyhow!("env var {name} (mqtt.password_env) is not set or not UTF-8")
+        })?)),
+        None => None,
+    };
+    let ca_pem = match &mqtt.ca_file {
+        Some(path) => Some(
+            tokio::fs::read(path)
+                .await
+                .with_context(|| format!("mqtt.ca_file {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let state_dir = config
+        .arlo
+        .session_cache_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let setup = MqttSetup::new(
+        mqtt,
+        password,
+        ca_pem.as_deref(),
+        state_dir,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .context("MQTT")?;
+    info!(url = %mqtt.url, base_topic = %mqtt.base_topic, "MQTT state publishing on");
+    Ok(Some(setup))
+}
+
 async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()> {
     let encoders = prepare_gstreamer(&config).await?;
+    let mqtt = prepare_mqtt(&config).await?;
 
     // -- Observability handles --
     let cameras_count = u32::try_from(config.cameras.len()).unwrap_or(u32::MAX);
@@ -383,6 +424,9 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
     let shutdown = system.cancellation_token();
     let arlo_connected_flag = system.arlo_connected_flag();
     let admin_actor: Arc<dyn AdminControl> = Arc::new(system.admin_control());
+    // Its own stop, given after the cameras are released.
+    let mqtt_stop = CancellationToken::new();
+    let mqtt_task = mqtt.map(|setup| setup.spawn(admin_actor.clone(), mqtt_stop.clone()));
 
     // -- Background watchers --
     let conn_task = spawn_connection_watcher(
@@ -439,6 +483,13 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
     // even during the drain, makes the exit non-zero.
     let panics = system.panic_counter();
     drain_stage("streamer-system", system.shutdown()).await;
+    drain_stage("mqtt", async {
+        mqtt_stop.cancel();
+        if let Some(task) = mqtt_task {
+            let _ = task.await;
+        }
+    })
+    .await;
     drain_stage("connection-watcher", async {
         let _ = conn_task.await;
     })
