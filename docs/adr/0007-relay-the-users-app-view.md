@@ -145,3 +145,15 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
 - **Transcoding the AAC to Opus inside the relay** to reuse the Opus
   input: a decode and an encode per relay for nothing; a third mixer
   input decodes once.
+
+## Update — 2026-10-11: the waiver narrowed
+
+The hostname check was waived on any name mismatch, whatever the host.
+It is now waived only when the host is an IP address, as in every
+watch-along URL seen so far; a DNS host must match the certificate. On
+2026-10-10 the relay's certificate chained to a public root (the waiver
+logged). What stays open: on an IP host any certificate from a public
+CA passes, whoever it names. Binding the relay to Arlo's identity (an
+expected Arlo name, or a default SPKI pin) needs the certificate's
+names, which the relay now logs at `debug` (the DER, public data) with
+its SHA-256 at `info`; the next live run records them.

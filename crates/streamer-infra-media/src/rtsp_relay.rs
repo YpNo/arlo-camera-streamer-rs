@@ -1146,11 +1146,19 @@ impl ServerCertVerifier for WatchAlongVerifier {
             now,
         ) {
             Ok(verified) => Ok(verified),
+            // A certificate cannot name the raw IP Arlo's URL gives: only
+            // then is the name check waived. A DNS host must match.
             Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::NotValidForName
                 | rustls::CertificateError::NotValidForNameContext { .. },
-            )) => {
-                debug!("watch-along certificate chain trusted; hostname check waived (raw IP)");
+            )) if matches!(server_name, ServerName::IpAddress(_)) => {
+                info!(
+                    sha256 = %fingerprint_hex(presented),
+                    "watch-along certificate chain trusted; hostname check waived (raw IP)"
+                );
+                // Public data, for binding the relay to Arlo's names later
+                // (`xxd -r -p | openssl x509 -inform der -noout -text`).
+                debug!(der_hex = %hex_string(end_entity.as_ref()), "watch-along certificate");
                 Ok(ServerCertVerified::assertion())
             }
             Err(e) => {
@@ -1197,11 +1205,18 @@ fn cert_sha256(cert: &CertificateDer<'_>) -> [u8; 32] {
 }
 
 fn fingerprint_hex(bytes: [u8; 32]) -> String {
+    hex_string(&bytes)
+}
+
+/// Every byte as two lowercase hex digits, unseparated.
+fn hex_string(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
-    bytes.iter().fold(String::with_capacity(64), |mut out, b| {
-        let _ = write!(out, "{b:02x}");
-        out
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
 }
 
 /// 64 hex digits (colons tolerated) → 32 bytes.
@@ -2119,6 +2134,33 @@ mod tests {
         let ca = test_ca();
         let v = verifier_trusting(ca.der(), None);
         assert!(verify(&v, &leaf_of(&ca, false)).is_ok());
+    }
+
+    /// Second security sweep M1: the waiver covered DNS hosts too, so any
+    /// publicly trusted certificate passed for any name.
+    #[test]
+    fn verifier_checks_the_name_of_a_dns_host() {
+        let ca = test_ca();
+        let v = verifier_trusting(ca.der(), None);
+        let leaf = leaf_of(&ca, false);
+        let at = |name: &str| {
+            let host = ServerName::try_from(name.to_string()).unwrap();
+            v.verify_server_cert(&leaf, &[], &host, &[], UnixTime::now())
+        };
+        assert!(at("watch-along.example").is_ok(), "its own name");
+        assert!(matches!(
+            at("other.example"),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName
+                    | rustls::CertificateError::NotValidForNameContext { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn hex_string_writes_two_lowercase_digits_a_byte() {
+        assert_eq!(hex_string(&[0x00, 0xab, 0x0f]), "00ab0f");
+        assert_eq!(hex_string(&[]), "");
     }
 
     #[test]

@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (QP 26) otherwise. Before, such a box always encoded on the CPU.
 
 ### Fixed
+- The watch-along relay waives the TLS hostname check only for an IP
+  host, as Arlo's URLs use; a DNS host must match its certificate. The
+  certificate's SHA-256 is logged when the waiver applies, and the
+  certificate itself at `debug`, to bind the relay to Arlo's names next.
 - RTSP sessions of clients that disconnected without a TEARDOWN (a crash,
   a network cut, an NVR restart) were never removed, so the 64-session
   pool slowly filled up until every new client was refused. Sessions now
