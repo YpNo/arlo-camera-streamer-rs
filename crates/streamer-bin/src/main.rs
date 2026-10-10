@@ -108,8 +108,28 @@ struct Cli {
         default_value = "/etc/arlo-streamer/streamer.toml"
     )]
     config: PathBuf,
+    /// Log line format: `text` for a terminal, `json` (one object per
+    /// line) for a log pipeline.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        env = "STREAMER_LOG_FORMAT",
+        default_value_t = LogFormat::Text
+    )]
+    log_format: LogFormat,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// How log lines are written to stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum LogFormat {
+    /// Human-readable lines.
+    Text,
+    /// One JSON object per line: `timestamp`, `level`, `target`, the
+    /// event's fields at the top level, and the enclosing `spans`.
+    Json,
 }
 
 #[derive(Debug, Clone, Copy, Subcommand)]
@@ -145,7 +165,7 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing()?;
+    init_tracing(cli.log_format)?;
     let config = load_config(&cli.config).await?;
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run_daemon(config).await,
@@ -642,19 +662,45 @@ fn line_and_column(text: &str, offset: usize) -> String {
     format!(" (line {line}, column {column})")
 }
 
-fn init_tracing() -> Result<()> {
+fn init_tracing(format: LogFormat) -> Result<()> {
     let (filter, invalid) = log_filter(std::env::var(EnvFilter::DEFAULT_ENV).ok());
-    // stderr keeps stdout for command output (`list-devices`).
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_writer(std::io::stderr)
-        .try_init()
+    // stderr keeps stdout for command output (`list-devices`). Colours
+    // only on a terminal: a container log or a file got escape codes.
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    tracing::subscriber::set_global_default(subscriber(format, filter, ansi, std::io::stderr))
         .map_err(|e| anyhow::anyhow!("failed to init tracing: {e}"))?;
     if let Some(e) = invalid {
         warn!(error = %e, "RUST_LOG does not parse; logging at {FALLBACK_LOG_FILTER}");
     }
     Ok(())
+}
+
+/// The log subscriber for `format`, writing through `writer`; `ansi`
+/// colours the text format.
+fn subscriber<W>(
+    format: LogFormat,
+    filter: EnvFilter,
+    ansi: bool,
+    writer: W,
+) -> Box<dyn tracing::Subscriber + Send + Sync>
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_writer(writer);
+    match format {
+        LogFormat::Text => Box::new(builder.with_ansi(ansi).finish()),
+        LogFormat::Json => Box::new(
+            builder
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(true)
+                .finish(),
+        ),
+    }
 }
 
 /// The filter for `RUST_LOG`: the default when unset, and plain `info`
@@ -673,6 +719,89 @@ fn log_filter(spec: Option<String>) -> (EnvFilter, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// A writer appending to a shared buffer.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Emit one event inside a span through `format`; returns what was
+    /// written.
+    fn log_line(format: LogFormat) -> String {
+        let capture = Capture::default();
+        let out = capture.0.clone();
+        let sub = subscriber(format, EnvFilter::new("info"), false, move || {
+            capture.clone()
+        });
+        tracing::subscriber::with_default(sub, || {
+            let span = tracing::info_span!("run", camera = "CAM1");
+            let _entered = span.enter();
+            info!(attempt = 2, "live attached");
+        });
+        let bytes = out.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn json_logs_are_one_object_per_line_with_the_fields_at_the_top() {
+        let text = log_line(LogFormat::Json);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let line: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON");
+
+        assert_eq!(line["level"], "INFO");
+        assert_eq!(line["message"], "live attached");
+        assert_eq!(line["attempt"], 2);
+        assert!(
+            line["target"]
+                .as_str()
+                .unwrap()
+                .starts_with("arlo_camera_streamer")
+        );
+        assert!(line["timestamp"].is_string());
+        assert_eq!(line["spans"][0]["name"], "run");
+        assert_eq!(line["spans"][0]["camera"], "CAM1");
+    }
+
+    #[test]
+    fn text_logs_stay_human_readable() {
+        let text = log_line(LogFormat::Text);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(text.trim()).is_err(),
+            "{text}"
+        );
+        assert!(text.contains("live attached"), "{text}");
+        assert!(text.contains("run{camera=\"CAM1\"}"), "{text}");
+        assert!(
+            !text.contains('\u{1b}'),
+            "no escape codes off a terminal: {text:?}"
+        );
+    }
+
+    #[test]
+    fn log_format_defaults_to_text_and_takes_json() {
+        let default = Cli::try_parse_from(["arlo-camera-streamer"]).unwrap();
+        assert_eq!(default.log_format, LogFormat::Text);
+        let json = Cli::try_parse_from([
+            "arlo-camera-streamer",
+            "list-devices",
+            "--log-format",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(json.log_format, LogFormat::Json);
+        assert!(Cli::try_parse_from(["arlo-camera-streamer", "--log-format", "xml"]).is_err());
+    }
 
     /// `VarError::NotUnicode` prints the value, and the boot error chain
     /// is printed in full: the token reached the container log.

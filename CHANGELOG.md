@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it.
 
 ### Added
+- `--log-format json` (or `STREAMER_LOG_FORMAT=json`): one JSON object per
+  log line, the event's fields at the top level and the enclosing spans
+  (the camera among them) in `spans`, for log pipelines.
 - `GET /admin/cameras/{id}/thumbnail.jpg`: the JPEG the camera's idle
   frame shows, behind the admin bearer token; `404` before Arlo provided
   one. It reads the daemon's copy and reaches neither Arlo nor the camera.
@@ -38,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   camera still runs one pipeline whichever server a client uses.
 
 ### Changed
+- Text log lines carry colour escape codes only on a terminal; container
+  logs and files showed them as `\x1b[2m…`.
 - The boot log names the encoder element and its rate control
   (`element=vah264lpenc rate-control=cqp`), and warns when a GPU render
   node is present but `auto` falls back to x264, with each reason.

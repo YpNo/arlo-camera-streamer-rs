@@ -86,7 +86,7 @@ subtle     = "2"
 secrecy    = "0.10"
 
 # ---- CLI ----
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # ---- GStreamer (media adapter only) ----
 gstreamer             = "0.25"

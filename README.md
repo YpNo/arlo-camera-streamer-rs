@@ -204,6 +204,7 @@ budget and probe 0 to 86400 s).
 | `ARLO_IMAP_PASSWORD` (or whatever you put in `arlo.mfa.password_env`) | IMAP password, when `arlo.mfa.kind = "email"` uses a mailbox. |
 | `STREAMER_ADMIN_TOKEN` | **Required** by `run`. Bearer token for `/admin/*`, at least 16 bytes (`openssl rand -hex 32`). |
 | `RUST_LOG` | Optional. Log filter, default `info,arlo_camera_streamer=debug`; see [Logging and debugging](#logging-and-debugging). |
+| `STREAMER_LOG_FORMAT` | Optional. `text` (default) or `json`, one object per line for a log pipeline; same as `--log-format`. See [Logging and debugging](#logging-and-debugging). |
 | `GST_DEBUG` | Optional. GStreamer's own debug output, off by default; see [GStreamer debugging](#gstreamer-debugging). |
 
 ## Usage
@@ -615,6 +616,16 @@ a default level, then `target=level` overrides, comma-separated. Levels
 are `error`, `warn`, `info`, `debug`, `trace`. Unset, the daemon uses
 `info,arlo_camera_streamer=debug`; the Docker image sets
 `info,arlo_camera_streamer=info`.
+
+Lines go to stderr. Text lines carry colours only on a terminal. For a
+log pipeline (Loki, Elasticsearch, `jq`), `--log-format json` or
+`STREAMER_LOG_FORMAT=json` writes one JSON object per line: `timestamp`,
+`level`, `target`, `message` and the event's fields at the top level, and
+the enclosing spans (`camera` among them) in `spans`:
+
+```json
+{"timestamp":"2026-10-10T07:52:51.393Z","level":"INFO","message":"state transition","from":"Activating","to":"Live","signal":"LiveAttached","target":"streamer_app::orchestrator","spans":[{"camera":"ABC1234567890","name":"run"}]}
+```
 
 | Target | What it logs | Turn up for |
 |---|---|---|

@@ -122,6 +122,7 @@ dependencies = [
  "gstreamer",
  "secrecy",
  "serde",
+ "serde_json",
  "streamer-app",
  "streamer-domain",
  "streamer-infra-arlo",
