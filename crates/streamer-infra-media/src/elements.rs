@@ -86,7 +86,12 @@ pub const HLS: &[&str] = &[
 /// [`MediaError::Pipeline`] naming every missing element.
 pub fn check(hls: bool) -> Result<(), MediaError> {
     let hls_elements: &[&str] = if hls { HLS } else { &[] };
-    let missing = missing(ALWAYS.iter().chain(hls_elements));
+    require(ALWAYS.iter().chain(hls_elements))
+}
+
+/// Fail naming every name in `elements` with no registered factory.
+fn require<'a>(elements: impl IntoIterator<Item = &'a &'a str>) -> Result<(), MediaError> {
+    let missing = missing(elements);
     if missing.is_empty() {
         return Ok(());
     }
@@ -193,6 +198,40 @@ mod tests {
             return;
         };
         assert_listed(&factories, HLS);
+    }
+
+    #[test]
+    fn require_fails_naming_only_the_missing_elements() {
+        gst::init().unwrap();
+        let err = require(["queue", "no-such-element"].iter()).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("missing GStreamer element(s): no-such-element ("),
+            "{message}"
+        );
+        assert!(!message.contains("queue"), "{message}");
+    }
+
+    #[test]
+    fn require_passes_when_every_element_is_registered() {
+        gst::init().unwrap();
+        assert!(require(["queue", "capsfilter"].iter()).is_ok());
+    }
+
+    /// The real lists, with and without HLS, on this host: CI has every
+    /// plugin, a bare host skips.
+    #[test]
+    fn check_passes_where_the_plugins_are_installed() {
+        gst::init().unwrap();
+        for hls in [false, true] {
+            if let Err(e) = check(hls) {
+                assert!(
+                    std::env::var(REQUIRE_ENV).as_deref() != Ok("1"),
+                    "hls={hls}: {e}"
+                );
+                eprintln!("skipping: {e}");
+            }
+        }
     }
 
     #[test]
