@@ -860,8 +860,14 @@ Releasing is therefore: bump `version` in `Cargo.toml`, move the
   bad `/admin/cameras/{id}` is answered `400`. The ops and admin
   listeners close a connection that sends no request head within 10 s
   and hold at most 64 connections each; the RTSP server keeps at most 64
-  sessions. Both HTTP listeners bind loopback by default — keep them
-  there or put a reverse proxy in front.
+  sessions, and removes a session 30 s after its client's last request or
+  RTCP report (every common client keeps it alive sooner: go2rtc every
+  25 s). The HLS segmenters connect to a second RTSP server bound to
+  `127.0.0.1` with its own session pool, so LAN clients cannot use up
+  their sessions; a LAN host can still hold all 64 public ones, which
+  shuts the NVR out until it stops: the RTSP port is meant for a trusted
+  LAN. Both HTTP listeners bind loopback by default — keep them there or
+  put a reverse proxy in front.
 - The image runs as uid/gid `10001`, ships no shell tools beyond `tini`,
   and every published digest carries SLSA provenance and an SPDX SBOM
   (`docker buildx imagetools inspect <ref> --format '{{json .Provenance}}'`).

@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control when the GPU's HuC firmware is loaded, at constant quality
   (QP 26) otherwise. Before, such a box always encoded on the CPU.
 
+### Fixed
+- RTSP sessions of clients that disconnected without a TEARDOWN (a crash,
+  a network cut, an NVR restart) were never removed, so the 64-session
+  pool slowly filled up until every new client was refused. Sessions now
+  expire 30 s after their client's last keep-alive; the timeout is
+  announced in the `Session` header (go2rtc, ffmpeg and VLC keep alive
+  within it).
+- The HLS segmenters connect to a second RTSP server on `127.0.0.1` with
+  its own session pool, so LAN clients cannot use up their sessions. A
+  camera still runs one pipeline whichever server a client uses.
+
 ### Changed
 - The boot log names the encoder element and its rate control
   (`element=vah264lpenc rate-control=cqp`), and warns when a GPU render
