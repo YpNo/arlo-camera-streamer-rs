@@ -28,30 +28,16 @@ use std::sync::{Arc, RwLock};
 
 use arlo_rs::client::ArloClient;
 use arlo_rs::models::api::Device;
-use async_trait::async_trait;
 
 use streamer_domain::camera::CameraId;
 use streamer_domain::error::DomainError;
 
+use crate::arlo_api::ArloApi;
 use crate::error::arlo_to_domain;
-
-/// Thin seam over "list all Arlo devices", so the cache logic can be
-/// unit-tested with a fake instead of a live `ArloClient`.
-#[async_trait]
-trait DeviceLister: Send + Sync {
-    async fn list(&self) -> Result<Vec<Device>, DomainError>;
-}
-
-#[async_trait]
-impl DeviceLister for ArloClient {
-    async fn list(&self) -> Result<Vec<Device>, DomainError> {
-        self.get_devices().await.map_err(arlo_to_domain)
-    }
-}
 
 /// Shared cache mapping a [`CameraId`] to its full arlo-rs [`Device`].
 pub struct DeviceRegistry {
-    lister: Arc<dyn DeviceLister>,
+    api: Arc<dyn ArloApi>,
     cache: RwLock<HashMap<String, Arc<Device>>>,
     /// Held across a refetch, so misses that arrive together wait for
     /// one device-list call instead of each making their own.
@@ -64,12 +50,12 @@ impl DeviceRegistry {
     /// first [`resolve`](Self::resolve).
     #[must_use]
     pub fn new(client: Arc<ArloClient>) -> Self {
-        Self::with_lister(client)
+        Self::with_api(client)
     }
 
-    fn with_lister(lister: Arc<dyn DeviceLister>) -> Self {
+    pub(crate) fn with_api(api: Arc<dyn ArloApi>) -> Self {
         Self {
-            lister,
+            api,
             cache: RwLock::new(HashMap::new()),
             refresh: tokio::sync::Mutex::new(()),
         }
@@ -116,7 +102,7 @@ impl DeviceRegistry {
     }
 
     async fn refresh(&self) -> Result<(), DomainError> {
-        let devices = self.lister.list().await?;
+        let devices = self.api.devices().await.map_err(arlo_to_domain)?;
         let map: HashMap<String, Arc<Device>> = devices
             .into_iter()
             .map(|d| (d.device_id.clone(), Arc::new(d)))
@@ -132,57 +118,17 @@ impl DeviceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::arlo_api::fake::{FakeArlo, Outcome};
+    use std::time::Duration;
 
-    fn device(id: &str) -> Device {
-        Device {
-            device_id: id.to_string(),
-            parent_id: id.to_string(),
-            device_type: "camera".to_string(),
-            device_name: format!("cam-{id}"),
-            unique_id: format!("uniq-{id}"),
-            state: "provisioned".to_string(),
-            mac_address: None,
-            firm_version: None,
-            hw_version: None,
-            model_id: None,
-            presigned_last_image_url: None,
-            x_cloud_id: Some(format!("xc-{id}")),
-            automation_revision: None,
-            allowed_mqtt_topics: vec![],
-            connectivity: None,
-        }
-    }
-
-    struct FakeLister {
-        devices: Vec<&'static str>,
-        calls: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl DeviceLister for FakeLister {
-        async fn list(&self) -> Result<Vec<Device>, DomainError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.devices.iter().map(|id| device(id)).collect())
-        }
-    }
-
-    struct FailingLister;
-
-    #[async_trait]
-    impl DeviceLister for FailingLister {
-        async fn list(&self) -> Result<Vec<Device>, DomainError> {
-            Err(DomainError::AdapterTransport("boom".to_string()))
-        }
+    fn registry(fake: FakeArlo) -> (Arc<FakeArlo>, DeviceRegistry) {
+        let fake = Arc::new(fake);
+        (fake.clone(), DeviceRegistry::with_api(fake))
     }
 
     #[tokio::test]
     async fn resolve_unknown_camera_after_fetch_returns_unknown_camera() {
-        let lister = Arc::new(FakeLister {
-            devices: vec!["CAM1"],
-            calls: AtomicUsize::new(0),
-        });
-        let registry = DeviceRegistry::with_lister(lister);
+        let (_, registry) = registry(FakeArlo::with_devices(&["CAM1"]));
 
         let err = registry
             .resolve(&CameraId::new("NOPE"))
@@ -194,11 +140,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_known_camera_returns_matching_device() {
-        let lister = Arc::new(FakeLister {
-            devices: vec!["CAM1", "CAM2"],
-            calls: AtomicUsize::new(0),
-        });
-        let registry = DeviceRegistry::with_lister(lister);
+        let (_, registry) = registry(FakeArlo::with_devices(&["CAM1", "CAM2"]));
 
         let device = registry
             .resolve(&CameraId::new("CAM2"))
@@ -211,11 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_hit_does_not_refetch_after_first_population() {
-        let lister = Arc::new(FakeLister {
-            devices: vec!["CAM1"],
-            calls: AtomicUsize::new(0),
-        });
-        let registry = DeviceRegistry::with_lister(lister.clone());
+        let (fake, registry) = registry(FakeArlo::with_devices(&["CAM1"]));
 
         registry
             .resolve(&CameraId::new("CAM1"))
@@ -226,25 +164,24 @@ mod tests {
             .await
             .expect("second");
 
-        assert_eq!(lister.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(FakeArlo::calls(&fake.device_calls), 1);
     }
 
     #[tokio::test]
     async fn resolve_miss_refetches_once() {
-        let lister = Arc::new(FakeLister {
-            devices: vec!["CAM1"],
-            calls: AtomicUsize::new(0),
-        });
-        let registry = DeviceRegistry::with_lister(lister.clone());
+        let (fake, registry) = registry(FakeArlo::with_devices(&["CAM1"]));
 
         let _ = registry.resolve(&CameraId::new("GHOST")).await;
 
-        assert_eq!(lister.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(FakeArlo::calls(&fake.device_calls), 1);
     }
 
     #[tokio::test]
     async fn resolve_propagates_fetch_failure() {
-        let registry = DeviceRegistry::with_lister(Arc::new(FailingLister));
+        let (_, registry) = registry(FakeArlo {
+            devices_outcome: Outcome::Fails,
+            ..FakeArlo::with_devices(&["CAM1"])
+        });
 
         let err = registry
             .resolve(&CameraId::new("CAM1"))
@@ -258,45 +195,27 @@ mod tests {
     /// stale `parent_id` until a restart.
     #[tokio::test]
     async fn invalidate_makes_the_next_resolve_refetch() {
-        let lister = Arc::new(FakeLister {
-            devices: vec!["CAM1"],
-            calls: AtomicUsize::new(0),
-        });
-        let registry = DeviceRegistry::with_lister(lister.clone());
+        let (fake, registry) = registry(FakeArlo::with_devices(&["CAM1"]));
         let cam = CameraId::new("CAM1");
 
         registry.resolve(&cam).await.expect("first");
         registry.invalidate(&cam);
         registry.resolve(&cam).await.expect("after invalidate");
 
-        assert_eq!(lister.calls.load(Ordering::SeqCst), 2);
-    }
-
-    /// Takes a while to answer, so concurrent misses overlap.
-    struct SlowLister {
-        calls: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl DeviceLister for SlowLister {
-        async fn list(&self) -> Result<Vec<Device>, DomainError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            Ok(vec![device("CAM1"), device("CAM2")])
-        }
+        assert_eq!(FakeArlo::calls(&fake.device_calls), 2);
     }
 
     #[tokio::test]
     async fn concurrent_misses_share_one_refetch() {
-        let lister = Arc::new(SlowLister {
-            calls: AtomicUsize::new(0),
+        let (fake, registry) = registry(FakeArlo {
+            devices_delay: Duration::from_millis(50),
+            ..FakeArlo::with_devices(&["CAM1", "CAM2"])
         });
-        let registry = DeviceRegistry::with_lister(lister.clone());
         let (a, b) = (CameraId::new("CAM1"), CameraId::new("CAM2"));
 
         let (ra, rb) = tokio::join!(registry.resolve(&a), registry.resolve(&b));
 
         assert!(ra.is_ok() && rb.is_ok());
-        assert_eq!(lister.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(FakeArlo::calls(&fake.device_calls), 1);
     }
 }

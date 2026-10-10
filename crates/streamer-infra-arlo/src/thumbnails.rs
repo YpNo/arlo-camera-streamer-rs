@@ -35,6 +35,7 @@ use streamer_domain::error::DomainError;
 use streamer_domain::port::ArloThumbnailSource;
 use streamer_domain::thumbnail::check_thumbnail;
 
+use crate::arlo_api::ArloApi;
 use crate::error::arlo_to_domain;
 use crate::snapshot_cache::{SnapshotUrlCache, is_snapshot_url};
 
@@ -141,7 +142,7 @@ fn is_public_ip(ip: IpAddr) -> bool {
 /// Adapter that exposes the Arlo snapshot as the domain
 /// [`ArloThumbnailSource`] port.
 pub struct ArloThumbnailSourceAdapter {
-    client: Arc<ArloClient>,
+    client: Arc<dyn ArloApi>,
     http: reqwest::Client,
     snapshots: Arc<SnapshotUrlCache>,
 }
@@ -154,6 +155,14 @@ impl ArloThumbnailSourceAdapter {
     #[must_use]
     pub fn new(
         client: Arc<ArloClient>,
+        http: reqwest::Client,
+        snapshots: Arc<SnapshotUrlCache>,
+    ) -> Self {
+        Self::with_api(client, http, snapshots)
+    }
+
+    pub(crate) fn with_api(
+        client: Arc<dyn ArloApi>,
         http: reqwest::Client,
         snapshots: Arc<SnapshotUrlCache>,
     ) -> Self {
@@ -176,7 +185,7 @@ impl ArloThumbnailSourceAdapter {
     /// The device list's presigned URL for `camera`, or `None` when the
     /// device has none or it is not an `https` URL with a host.
     async fn device_list_url(&self, camera: &CameraId) -> Result<Option<String>, DomainError> {
-        let devices = self.client.get_devices().await.map_err(arlo_to_domain)?;
+        let devices = self.client.devices().await.map_err(arlo_to_domain)?;
         let url = devices
             .iter()
             .find(|d| d.device_id == camera.as_str())
@@ -287,6 +296,8 @@ fn transport_error(what: &str, e: reqwest::Error) -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arlo_api::fake::{FakeArlo, Outcome, device};
+    use arlo_rs::models::api::Device;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -518,5 +529,56 @@ mod tests {
         .await;
         let err = policy_client.get(&url).send().await.unwrap_err();
         assert!(err.is_redirect(), "{err}");
+    }
+
+    fn adapter(fake: FakeArlo) -> ArloThumbnailSourceAdapter {
+        ArloThumbnailSourceAdapter::with_api(
+            Arc::new(fake),
+            test_client(),
+            Arc::new(SnapshotUrlCache::default()),
+        )
+    }
+
+    fn listing(url: Option<&str>) -> FakeArlo {
+        let fake = FakeArlo::with_devices(&[]);
+        *fake.devices.lock().unwrap() = vec![Device {
+            presigned_last_image_url: url.map(str::to_string),
+            ..device("CAM1")
+        }];
+        fake
+    }
+
+    #[tokio::test]
+    async fn no_thumbnail_when_the_device_list_has_none() {
+        let thumb = adapter(listing(None)).last_thumbnail(&cam()).await.unwrap();
+        assert!(thumb.is_none());
+    }
+
+    /// A cloud-supplied URL into the LAN or over plain http is never
+    /// fetched.
+    #[tokio::test]
+    async fn a_device_list_url_that_is_not_https_to_a_public_host_is_refused() {
+        for url in [
+            "http://arlolastimage-z1.arlo.com/x.jpg",
+            "https://192.168.1.1/x.jpg",
+        ] {
+            let thumb = adapter(listing(Some(url)))
+                .last_thumbnail(&cam())
+                .await
+                .unwrap();
+            assert!(thumb.is_none(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_device_list_is_an_adapter_error() {
+        let err = adapter(FakeArlo {
+            devices_outcome: Outcome::Fails,
+            ..FakeArlo::with_devices(&["CAM1"])
+        })
+        .last_thumbnail(&cam())
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DomainError::AdapterTransport(_)), "{err:?}");
     }
 }

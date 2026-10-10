@@ -10,9 +10,9 @@
 //!   register and tear down the per-camera launch-string factories
 //!   used by [`crate::multiplexer::PipelineRegistry`].
 //!
-//! Runtime validation (binding 8554, serving a real client) is Phase 5
-//! work — this module is excluded from coverage by design (see
-//! `.github/workflows/ci.yml`).
+//! `tests/rtsp_sessions.rs` drives it with a raw RTSP client (session
+//! expiry, the two pools, one media per mount); `tests/live_session.rs`
+//! with real pipelines.
 //!
 //! ## Why a dedicated main-loop thread?
 //!
