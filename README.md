@@ -396,8 +396,10 @@ Like the RTSP port, it is meant for a trusted LAN.
 ### Home Assistant (MQTT)
 
 With an `[mqtt]` table (see the example config), the daemon publishes
-each camera's state to an MQTT broker and announces it to Home
-Assistant through MQTT discovery: each camera appears as a device with
+each camera's state to your MQTT broker, the one Home Assistant's MQTT
+integration already uses (the image ships no broker, and the compose
+file adds none). It announces each camera to Home Assistant through MQTT
+discovery: each camera appears as a device with
 its **State** (`idle`, `activating`, `live`, `battery-protect`,
 `failed`), **Live** and **Viewed in the Arlo app** flags and **Live time
 today**, plus a bridge device with the **Arlo connection**; no YAML.
@@ -426,6 +428,20 @@ password_env = "STREAMER_MQTT_PASSWORD"
   (many LAN brokers have no TLS) with a warning at boot.
 - **Two daemons on one broker** need different `base_topic`s (the client
   id derives from it).
+- **Broker access**: give the daemon its own broker user, allowed to
+  write its base topic and the discovery prefix and nothing else. With
+  Mosquitto's `acl_file`:
+
+  ```text
+  user arlo
+  topic write arlo-camera-streamer/#
+  topic write homeassistant/#
+  ```
+
+  Check it: a broker drops a publish its ACL denies without telling the
+  client (MQTT 3.1.1), so a wrong ACL only shows as entities that never
+  appear or stay unavailable in Home Assistant. Bad credentials, on the
+  other hand, are logged (`refused by the broker`) and retried.
 
 ### Frigate integration
 
