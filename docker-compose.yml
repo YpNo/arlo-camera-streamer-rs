@@ -10,6 +10,7 @@
 #        ARLO_PASSWORD=…
 #        ARLO_IMAP_PASSWORD=…     # only for an IMAP mailbox second factor
 #        STREAMER_ADMIN_TOKEN=…   # at least 16 bytes: openssl rand -hex 32
+#        STREAMER_MQTT_PASSWORD=… # only with [mqtt]: your broker user's password
 #   3. The one interactive login, which pairs the second factor, stores the
 #      session in the data volume and lists the device ids:
 #        docker compose run --rm arlo-camera-streamer list-devices --config /etc/arlo-streamer/streamer.toml
