@@ -65,6 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   camera still runs one pipeline whichever server a client uses.
 
 ### Changed
+- arlo-rs 0.3.1: the MQTT subscription log states the device counts and
+  names the devices without an xCloudId, instead of always ending in
+  "no xCloud ⇒ legacy get_devices, no camera events".
 - The idle picture is drawn once a second and repeated up to 15 fps
   (`imagefreeze`, ADR 0010) instead of being drawn 15 times a second:
   its branch costs about 3 % of a core instead of 37–56 % per connected
