@@ -49,7 +49,9 @@ use streamer_domain::port::ArloEventSource;
 
 use crate::arlo_api::ArloApi;
 use crate::error::arlo_to_domain;
-use crate::event_mapper::{activity_state, map_event, property_keys, snapshot_url};
+use crate::event_mapper::{
+    activity_state, device_resource_id, map_event, property_keys, snapshot_url,
+};
 use crate::snapshot_cache::SnapshotUrlCache;
 
 /// Adapter that exposes the arlo-rs MQTT event bus as the domain
@@ -144,7 +146,7 @@ fn observe_raw(event: &ArloEvent, mapped: Option<&CameraEvent>) {
     );
     if let Some(kind) = mapped.and_then(pulse_kind) {
         debug!(resource = ?event.resource, kind, "camera trigger pulse");
-    } else if mapped.is_none() && event.resource.starts_with("cameras/") {
+    } else if mapped.is_none() && device_resource_id(&event.resource).is_some() {
         debug!(
             resource = ?event.resource,
             ?keys,

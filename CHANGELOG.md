@@ -47,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (QP 26) otherwise. Before, such a box always encoded on the CPU.
 
 ### Fixed
+- A video doorbell's motion never woke its stream, and its idle picture
+  never got a snapshot: its events come as `doorbells/<id>`, and only
+  `cameras/<id>` was read. Both are read now.
 - The idle picture's caption (STANDBY, LIVE IN ARLO APP) was hidden under
   the snapshot, which is scaled to the whole frame and was drawn after
   it: it is drawn over the snapshot now.

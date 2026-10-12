@@ -66,6 +66,10 @@ streamer relies on:
   and `alertStreamActive`, `startUserStream`, `fullFrameSnapshot`,
   `startRecord`, `stopRecord`, which carry nothing a motion event did not
   already say.
+- A video doorbell's events have `resource: "doorbells/<deviceId>"`,
+  with the same properties: its `allowedMqttTopics` grant
+  `out/doorbells/<deviceId>/#` and no `cameras/` topic (2026-10-12: its
+  motion reached the app but not the daemon, which read `cameras/` only).
 - The `idle` report after a stream ends arrives 0.34 to 0.8 s after the
   last viewer leaves (four runs, 2026-10-01).
 

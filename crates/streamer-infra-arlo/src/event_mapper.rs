@@ -4,15 +4,19 @@
 //! The Arlo event bus delivers a wide variety of resource / action /
 //! property combinations; the streamer only cares about a small subset:
 //!
+//! `{class}` is `cameras` or `doorbells`: a video doorbell publishes its
+//! own events under `doorbells/{device_id}` (the broker grants it no
+//! `cameras/` topic), and they carry the camera vocabulary.
+//!
 //! | Trigger                 | Resource pattern        | Property predicate                            |
 //! |-------------------------|-------------------------|-----------------------------------------------|
-//! | [`CameraEvent::Motion`] | `cameras/{device_id}`   | `motionDetected == true`                      |
-//! | [`CameraEvent::Audio`]  | `cameras/{device_id}`   | `audioDetected == true`                       |
-//! | [`CameraEvent::ManualStream`] | `cameras/{device_id}` | `activityState == "userStreamActive"`     |
-//! | [`CameraEvent::ManualStreamEnded`] | `cameras/{device_id}` | `activityState == "idle"`            |
-//! | [`CameraEvent::Online`] | `cameras/{device_id}`   | `connectionState == "available"`              |
-//! | [`CameraEvent::Offline`]| `cameras/{device_id}`   | `connectionState == "unavailable"`            |
-//! | [`CameraEvent::SnapshotAvailable`] | `cameras/{device_id}` | `presignedLastImageUrl` is a non-empty string |
+//! | [`CameraEvent::Motion`] | `{class}/{device_id}`   | `motionDetected == true`                      |
+//! | [`CameraEvent::Audio`]  | `{class}/{device_id}`   | `audioDetected == true`                       |
+//! | [`CameraEvent::ManualStream`] | `{class}/{device_id}` | `activityState == "userStreamActive"`     |
+//! | [`CameraEvent::ManualStreamEnded`] | `{class}/{device_id}` | `activityState == "idle"`            |
+//! | [`CameraEvent::Online`] | `{class}/{device_id}`   | `connectionState == "available"`              |
+//! | [`CameraEvent::Offline`]| `{class}/{device_id}`   | `connectionState == "unavailable"`            |
+//! | [`CameraEvent::SnapshotAvailable`] | `{class}/{device_id}` | `presignedLastImageUrl` is a non-empty string |
 //!
 //! Precedence is the table order: a payload carrying both a motion
 //! flag and an activity state is the motion recording starting, and the
@@ -34,7 +38,9 @@ use tracing::debug;
 use streamer_domain::camera::CameraId;
 use streamer_domain::event::CameraEvent;
 
-const CAMERAS_PREFIX: &str = "cameras/";
+/// Resource prefixes of the devices that stream: cameras (Arlo Q
+/// included) and video doorbells.
+const DEVICE_PREFIXES: [&str; 2] = ["cameras/", "doorbells/"];
 const ACTIVITY_STATE: &str = "activityState";
 const USER_STREAM_ACTIVE: &str = "userStreamActive";
 const ACTIVITY_IDLE: &str = "idle";
@@ -44,7 +50,7 @@ const PRESIGNED_LAST_IMAGE_URL: &str = "presignedLastImageUrl";
 /// [`None`] when the event is uninteresting or malformed.
 #[must_use]
 pub fn map_event(event: &ArloEvent) -> Option<CameraEvent> {
-    let raw_id = extract_device_id(&event.resource)?;
+    let raw_id = device_resource_id(&event.resource)?;
     // The bus is network input: an id outside the id rule never becomes
     // a `CameraId` (it would reach the logs and a file name).
     let device_id = match CameraId::parse(raw_id) {
@@ -82,7 +88,7 @@ pub fn map_event(event: &ArloEvent) -> Option<CameraEvent> {
 /// camera. The URL is a presigned credential: callers must not log it.
 #[must_use]
 pub fn snapshot_url(event: &ArloEvent) -> Option<(&str, &str)> {
-    let device_id = extract_device_id(&event.resource)?;
+    let device_id = device_resource_id(&event.resource)?;
     let url = event
         .properties
         .as_ref()?
@@ -123,9 +129,12 @@ pub fn property_keys(props: Option<&Value>) -> Vec<&str> {
     keys
 }
 
-fn extract_device_id(resource: &str) -> Option<&str> {
-    resource
-        .strip_prefix(CAMERAS_PREFIX)
+/// The device id of a `cameras/<id>` or `doorbells/<id>` resource.
+#[must_use]
+pub fn device_resource_id(resource: &str) -> Option<&str> {
+    DEVICE_PREFIXES
+        .iter()
+        .find_map(|prefix| resource.strip_prefix(prefix))
         .filter(|id| !id.is_empty())
 }
 
@@ -162,6 +171,35 @@ mod tests {
             CameraEvent::Motion {
                 device_id: CameraId::new("CAM1")
             }
+        );
+    }
+
+    /// A video doorbell publishes its events under `doorbells/<id>`: the
+    /// broker grants no `cameras/` topic for it.
+    #[test]
+    fn a_doorbell_s_events_map_like_a_camera_s() {
+        let motion = ev("doorbells/DB1", Some(json!({ "motionDetected": true })));
+        assert_eq!(
+            map_event(&motion),
+            Some(CameraEvent::Motion {
+                device_id: CameraId::new("DB1")
+            })
+        );
+        let viewed = ev(
+            "doorbells/DB1",
+            Some(json!({ "activityState": "userStreamActive" })),
+        );
+        assert!(matches!(
+            map_event(&viewed),
+            Some(CameraEvent::ManualStream { .. })
+        ));
+        let snapshot = ev(
+            "doorbells/DB1",
+            Some(json!({ "presignedLastImageUrl": "https://s3.example/x.jpg" })),
+        );
+        assert_eq!(
+            snapshot_url(&snapshot),
+            Some(("DB1", "https://s3.example/x.jpg"))
         );
     }
 
@@ -350,8 +388,9 @@ mod tests {
     #[rstest]
     #[case("modes")]
     #[case("subscriptions/USER123")]
-    #[case("doorbells/DBELL1")]
+    #[case("chimes/CHIME1")]
     #[case("cameras/")] // empty device id
+    #[case("doorbells/")]
     #[case("camera/CAM1")] // singular, not the prefix we expect
     #[case("")]
     fn ignores_non_camera_resources(#[case] resource: &str) {
