@@ -76,6 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - arlo-rs 0.3.1: the MQTT subscription log states the device counts and
   names the devices without an xCloudId, instead of always ending in
   "no xCloud ⇒ legacy get_devices, no camera events".
+- Dependencies refreshed within their versions (29 crates, among them
+  tokio 1.53.2, hyper 1.12.0, aws-lc-rs 1.18.2, serde_json 1.0.154);
+  every direct dependency is on its latest major.
 - The idle picture is drawn once a second and repeated up to 15 fps
   (`imagefreeze`, ADR 0010) instead of being drawn 15 times a second:
   its branch costs about 3 % of a core instead of 37–56 % per connected
