@@ -185,7 +185,7 @@ budget and probe 0 to 86400 s).
 | `webrtc.live_stall_timeout_secs`    | u64            | `10` (floor 4)       | Seconds without inbound video before the live source is declared lost and the output returns to idle (ADR 0004). |
 | `output.video_encoder`              | `auto`/`x264`/`va`/`vaapi`/`v4l2`/`nvenc` | `auto` | `auto` probes the host at boot (NVIDIA, Intel/AMD, V4L2, then x264); an explicit name fails the boot when it does not work (see [GPU encoding](#gpu-encoding)). |
 | `output.bitrate_kbps`               | u32 (256..=20000) | `2048`           | Bitrate of each camera's stream; a constant-quality encoder (Intel low power without HuC) ignores it. |
-| `output.rtsp.bind`                  | `host:port`    | `0.0.0.0:8554`       | Embedded RTSP server.                                    |
+| `output.rtsp.bind`                  | `host:port`    | `0.0.0.0:8554`       | Embedded RTSP server (TCP; RTP is interleaved on it).    |
 | `output.metrics_bind`               | `host:port`    | `127.0.0.1:9090`     | Prometheus + healthchecks.                               |
 | `output.admin_bind`                 | `host:port`    | `127.0.0.1:9091`     | `/admin/*` write API.                                    |
 | `output.hls.dir`                    | path           | (off)                | Enables HLS: `<dir>/<stream_name>/index.m3u8` + segments (ADR 0006). Serve it with any web server, or the Compose `hls` profile ([Serving HLS](#serving-hls)). Keeps each camera's encoder running. |
@@ -766,7 +766,7 @@ each pipeline at every state change; `dot -Tpng` turns it into a picture
 of what was actually built. Two warnings are known to be harmless:
 `gupnp … 1900: Address already in use` at live start (libnice's UPnP
 probe) and `Sticky event misordering, got 'segment' before 'caps'` when a
-UDP client joins a media that already plays for another client.
+client joins a media that already plays for another client.
 
 ### Checking the RTSP output from outside
 
@@ -781,12 +781,10 @@ GST_DEBUG=rtspsrc:4 gst-launch-1.0 rtspsrc location=rtsp://<host>:8554/<stream_n
   ! decodebin ! autovideosink
 ```
 
-```bash
-# VLC over TCP (the GUI equivalent is Preferences → Input / Codecs → RTP over RTSP (TCP))
-vlc --rtsp-tcp rtsp://<host>:8554/<stream_name>
-```
-
-Use TCP when UDP is filtered between you and the host.
+RTP goes over TCP only, interleaved on the RTSP connection: published
+from a container over TCP, the port could never carry RTP over UDP back
+to a client. A client that asks for UDP first (VLC, GStreamer, ffmpeg)
+is refused and switches to TCP at once; Frigate's go2rtc uses TCP anyway.
 While a client is connected, `GET /admin/state` is the quickest view of
 what the daemon thinks each camera is doing, and `streamer_camera_state`
 on `/metrics` the same for a dashboard.

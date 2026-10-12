@@ -63,6 +63,7 @@ const INTERNAL_HOST: &str = "127.0.0.1";
 const LOOP_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 use gstreamer::glib;
+use gstreamer_rtsp::RTSPLowerTrans;
 use gstreamer_rtsp_server::prelude::*;
 use gstreamer_rtsp_server::{
     RTSPMedia, RTSPMediaFactory, RTSPMountPoints, RTSPServer, RTSPSessionPool, RTSPSuspendMode,
@@ -343,11 +344,18 @@ fn expiry_watch(pool: &RTSPSessionPool) -> glib::Source {
     )
 }
 
-/// A shared factory for `launch` whose media is keyed on the path alone.
+/// A shared factory for `launch` whose media is keyed on the path alone,
+/// with RTP interleaved on the RTSP connection.
+///
+/// TCP only: the container publishes the RTSP port over TCP, and RTP over
+/// UDP never reaches a client through it. A client that tried UDP first
+/// (VLC, GStreamer) waited 5 to 10 s for nothing before retrying over
+/// TCP; refused (461), it retries at once. go2rtc uses TCP anyway.
 fn shared_factory(launch: &str) -> RTSPMediaFactory {
     let factory: RTSPMediaFactory = path_keyed::PathKeyedFactory::default().upcast();
     factory.set_launch(launch);
     factory.set_shared(true);
+    factory.set_protocols(RTSPLowerTrans::TCP);
     factory
 }
 

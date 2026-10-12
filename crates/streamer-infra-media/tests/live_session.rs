@@ -453,10 +453,17 @@ async fn thumbnail_declaring_a_huge_frame_is_refused_without_disturbing_the_clie
     assert!(!probe.interrupted(), "the refusal interrupted the client");
 }
 
+/// Under rtspsrc's 5 s UDP timeout: a client that offers UDP first
+/// shows the picture without ever waiting for UDP packets.
+const NO_UDP_WAIT: Duration = Duration::from_secs(3);
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn second_client_over_udp_joins_a_playing_media() {
-    // With HLS on, the segmenter is always the first client, so every
-    // viewer joins a media that is already playing (VLC over UDP).
+async fn a_client_offering_udp_first_joins_over_tcp_at_once() {
+    // VLC offers UDP first. Through the container's TCP-only port mapping
+    // its UDP never arrived, and it waited 10 s before retrying over TCP.
+    // UDP is refused now (`rtsp_sessions.rs`): the client must take the
+    // refusal as "use TCP", not as an error. It joins a media that is
+    // already playing, as with HLS on (the segmenter is first).
     let _serial = SERIAL.lock().await;
     if !gstreamer_ready() {
         return;
@@ -469,10 +476,10 @@ async fn second_client_over_udp_joins_a_playing_media() {
         "first client never showed the idle screen"
     );
 
-    let second = RtspProbe::connect_over(&stack.url(), "udp");
+    let second = RtspProbe::connect_over(&stack.url(), "udp+tcp");
     assert!(
-        eventually(PICTURE_TIMEOUT, || shows_idle(&second)).await,
-        "a UDP client joining a playing media got no picture (frames={})",
+        eventually(NO_UDP_WAIT, || shows_idle(&second)).await,
+        "a client offering UDP first got no picture within {NO_UDP_WAIT:?} (frames={})",
         second.frames()
     );
     assert!(!second.interrupted(), "the joining client saw an error");

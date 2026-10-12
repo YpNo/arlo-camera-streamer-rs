@@ -1,6 +1,7 @@
 //! The RTSP server's sessions: expired ones are removed, a keep-alive
 //! keeps one, the timeout is announced, the HLS segmenters' loopback
-//! server keeps its own pool, and both servers share one media per mount.
+//! server keeps its own pool, both servers share one media per mount, and
+//! RTP goes over TCP only.
 //!
 //! A raw RTSP client drives the server, so each test decides when a
 //! session is created, kept alive or abandoned (no TEARDOWN, as after a
@@ -24,6 +25,8 @@ const SHORT: RtspLimits = RtspLimits {
     max_sessions: 64,
     session_timeout_secs: 2,
 };
+const TCP_TRANSPORT: &str = "RTP/AVP/TCP;unicast;interleaved=0-1";
+const UDP_TRANSPORT: &str = "RTP/AVP;unicast;client_port=50000-50001";
 /// gst-rtsp-server grants a few seconds beyond the timeout.
 const EXPIRY_WAIT: Duration = Duration::from_secs(15);
 
@@ -121,12 +124,18 @@ impl RawClient {
     /// DESCRIBE then SETUP of the video track over TCP; the session id is
     /// kept for later requests. Returns the SETUP response.
     fn set_up(&mut self, url: &str) -> Response {
+        self.set_up_offering(url, TCP_TRANSPORT)
+    }
+
+    /// DESCRIBE then SETUP of the video track, offering `transports` (a
+    /// `Transport` header value, preferred first).
+    fn set_up_offering(&mut self, url: &str, transports: &str) -> Response {
         let describe = self.request("DESCRIBE", url, "Accept: application/sdp\r\n");
         assert_eq!(describe.status, 200, "{}", describe.headers);
         let setup = self.request(
             "SETUP",
             &format!("{url}/stream=0"),
-            "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n",
+            &format!("Transport: {transports}\r\n"),
         );
         self.session = setup
             .headers
@@ -264,4 +273,30 @@ fn both_servers_share_one_media_per_mount() {
     assert_eq!(segmenter.set_up(&internal).status, 200);
 
     assert_eq!(built.load(Ordering::SeqCst), 1, "one media for the mount");
+}
+
+/// RTP over UDP never reaches a client through a container that
+/// publishes the RTSP port over TCP only: a client trying UDP first (VLC,
+/// GStreamer) waited 5 to 10 s for nothing before retrying over TCP.
+/// Refused (461), it retries over TCP at once.
+#[test]
+fn rtp_over_udp_is_refused_and_the_retry_over_tcp_accepted() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !gstreamer_ready() {
+        return;
+    }
+    let (_server, url) = server(SHORT);
+
+    let mut client = RawClient::connect(&url);
+    let refused = client.set_up_offering(&url, UDP_TRANSPORT);
+    assert_eq!(refused.status, 461, "{}", refused.headers);
+    let accepted = client.set_up_offering(&url, TCP_TRANSPORT);
+    assert_eq!(accepted.status, 200, "{}", accepted.headers);
+    assert!(
+        accepted.headers.contains("RTP/AVP/TCP"),
+        "{}",
+        accepted.headers
+    );
 }

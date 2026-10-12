@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (QP 26) otherwise. Before, such a box always encoded on the CPU.
 
 ### Fixed
+- In the container, VLC showed the stream 10 s late (GStreamer clients
+  5 s): it asked for RTP over UDP first, which the TCP-only port mapping
+  never carried back, and waited for it before retrying over TCP. The
+  RTSP server offers TCP only now, so a client asking for UDP is refused
+  and switches at once. The first frame arrives in under 0.4 s.
 - A video doorbell's motion never woke its stream, and its idle picture
   never got a snapshot: its events come as `doorbells/<id>`, and only
   `cameras/<id>` was read. Both are read now.
