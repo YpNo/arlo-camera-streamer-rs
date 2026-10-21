@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control when the GPU's HuC firmware is loaded, at constant quality
   (QP 26) otherwise. Before, such a box always encoded on the CPU.
 
+### Security
+- rustls-webpki 0.103.16 (RUSTSEC-2026-0382: certificate verification
+  could accept distrusted intermediates) and webpki-roots 1.0.10
+  (RUSTSEC-2026-0381: distrusted emSign intermediates were still
+  trusted), for every TLS connection: Arlo, the watch-along relay, the
+  MQTT broker. rustls 0.23.46 (RUSTSEC-2026-0346: `Debug` of a client
+  session value printed TLS secrets; nothing here formats one).
+
 ### Fixed
 - In the container, VLC showed the stream 10 s late (GStreamer clients
   5 s): it asked for RTP over UDP first, which the TCP-only port mapping
