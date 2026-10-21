@@ -66,10 +66,35 @@ streamer relies on:
   and `alertStreamActive`, `startUserStream`, `fullFrameSnapshot`,
   `startRecord`, `stopRecord`, which carry nothing a motion event did not
   already say.
-- A video doorbell's events have `resource: "doorbells/<deviceId>"`,
-  with the same properties: its `allowedMqttTopics` grant
-  `out/doorbells/<deviceId>/#` and no `cameras/` topic (2026-10-12: its
-  motion reached the app but not the daemon, which read `cameras/` only).
+- A video doorbell (Essential Video Doorbell, 2026-10-12 to 10-21) is
+  its own base station and publishes on two resources: its camera
+  events (`motionDetected`, `activityState`, `fullFrameSnapshotAvailable`
+  with `presignedFullFrameSnapshotUrl`, `batteryLevel`) under
+  `cameras/<deviceId>`, and its ring (`buttonPressed: true`, no "released"
+  event) and `sipCallActive` under `doorbells/<deviceId>`.
+- **A shared account never gets a video doorbell's camera events.** Its
+  `allowedMqttTopics` for the doorbell hold `out/doorbells/<id>/#` and
+  per-resource topics, no `out/cameras/<id>/#`, and the broker refuses
+  that filter in the SUBACK. Motion went missing with the doorbell
+  armed and the app notifying; the ring arrived. The owner account's
+  grant is `d/<xCloudId>/out/#` per device, and the doorbell's motion,
+  snapshots and ring all arrive. The cameras are unaffected. pyaarlo
+  users report the same (hass-aarlo #542, #1169).
+- What the shared account does get from the doorbell: `basestation/
+  wakeup` and an empty `basestation/is` (both answers to the app's
+  requests, addressed to the app's user), and `u/<userId>/in/library/add`
+  (`mediaUploadNotification`, with the device id and a last image)
+  25 to 55 s after a recording, when the account is told of one.
+- The legacy SSE stream (`GET /hmsweb/client/subscribe`, the API
+  headers, `Accept: text/event-stream`) answers 200 and `{"status":
+  "connected"}`. In one run of six it then carried the doorbell's motion
+  to the shared account and closed right after; in the other five it
+  stayed silent, the owner account included. Not a usable channel.
+- pyaarlo's base-station ping (`notify` with `{"action": "set",
+  "resource": "subscriptions/<userId>_web", "properties": {"devices":
+  [<id>]}}`, every 60 s) is answered on `out/subscriptions/…` but adds a
+  second subscription: every camera event then arrives twice. It does
+  not bring the doorbell's motion to a shared account.
 - The `idle` report after a stream ends arrives 0.34 to 0.8 s after the
   last viewer leaves (four runs, 2026-10-01).
 

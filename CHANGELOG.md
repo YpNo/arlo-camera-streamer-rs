@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it.
 
 ### Added
+- A video doorbell's ring starts the live stream like motion (same
+  cooldown and budget): `buttonPressed` under `doorbells/<id>`. On an
+  account the doorbell is shared with, the ring is the only trigger:
+  Arlo never sends a shared account the doorbell's motion (README,
+  "Which Arlo account").
 - `[mqtt]`: each camera's state published to an MQTT broker with Home
   Assistant discovery (ADR 0009): state, live, app view and live time
   per camera, the Arlo connection, and the idle picture when
@@ -60,9 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never carried back, and waited for it before retrying over TCP. The
   RTSP server offers TCP only now, so a client asking for UDP is refused
   and switches at once. The first frame arrives in under 0.4 s.
-- A video doorbell's motion never woke its stream, and its idle picture
-  never got a snapshot: its events come as `doorbells/<id>`, and only
-  `cameras/<id>` was read. Both are read now.
 - The idle picture's caption (STANDBY, LIVE IN ARLO APP) was hidden under
   the snapshot, which is scaled to the whole frame and was drawn after
   it: it is drawn over the snapshot now.

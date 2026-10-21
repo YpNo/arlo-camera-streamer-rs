@@ -542,6 +542,12 @@ impl CameraOrchestrator {
                 };
                 signal
             }
+            CameraEvent::Ring { .. } => {
+                let Some(signal) = self.motion_signal("ring") else {
+                    return Ok(());
+                };
+                signal
+            }
             CameraEvent::ManualStream { .. } => {
                 self.on_user_view_started();
                 self.sync_user_view_notice().await;
@@ -1808,6 +1814,30 @@ mod tests {
             sr.stop_count().await >= 1,
             "teardown must pair with detach on the Live→Idle exit"
         );
+        assert_eq!(sr.call_count().await, 1);
+    }
+
+    /// A doorbell ring is a trigger like motion: it goes live (a ring
+    /// reaches a shared account; the doorbell's motion does not).
+    #[tokio::test(start_paused = true)]
+    async fn a_doorbell_ring_goes_live_like_motion() {
+        let cfg = camera_cfg(2, 60);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        tx.send(CameraEvent::Ring {
+            device_id: CameraId::new("CAM"),
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let calls = media.calls().await;
+        token.cancel();
+        handle.await.unwrap();
+        assert!(calls.iter().any(|c| matches!(c, MediaCall::AttachLive(_))));
         assert_eq!(sr.call_count().await, 1);
     }
 

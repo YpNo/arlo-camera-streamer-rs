@@ -161,6 +161,7 @@ const fn pulse_kind(event: &CameraEvent) -> Option<&'static str> {
     match event {
         CameraEvent::Motion { .. } => Some("motion"),
         CameraEvent::Audio { .. } => Some("audio"),
+        CameraEvent::Ring { .. } => Some("ring"),
         _ => None,
     }
 }
@@ -307,6 +308,10 @@ mod tests {
         assert_eq!(
             pulse_kind(&CameraEvent::Audio { device_id: cam() }),
             Some("audio")
+        );
+        assert_eq!(
+            pulse_kind(&CameraEvent::Ring { device_id: cam() }),
+            Some("ring")
         );
         assert_eq!(pulse_kind(&CameraEvent::Online { device_id: cam() }), None);
     }

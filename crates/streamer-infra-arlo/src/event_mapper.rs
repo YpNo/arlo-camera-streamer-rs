@@ -4,14 +4,16 @@
 //! The Arlo event bus delivers a wide variety of resource / action /
 //! property combinations; the streamer only cares about a small subset:
 //!
-//! `{class}` is `cameras` or `doorbells`: a video doorbell publishes its
-//! own events under `doorbells/{device_id}` (the broker grants it no
-//! `cameras/` topic), and they carry the camera vocabulary.
+//! `{class}` is `cameras` or `doorbells`. A video doorbell's camera
+//! events (motion, snapshots, activity) come under `cameras/{device_id}`;
+//! its ring comes under `doorbells/{device_id}` (live captures,
+//! 2026-10-21).
 //!
 //! | Trigger                 | Resource pattern        | Property predicate                            |
 //! |-------------------------|-------------------------|-----------------------------------------------|
 //! | [`CameraEvent::Motion`] | `{class}/{device_id}`   | `motionDetected == true`                      |
 //! | [`CameraEvent::Audio`]  | `{class}/{device_id}`   | `audioDetected == true`                       |
+//! | [`CameraEvent::Ring`]   | `{class}/{device_id}`   | `buttonPressed == true`                       |
 //! | [`CameraEvent::ManualStream`] | `{class}/{device_id}` | `activityState == "userStreamActive"`     |
 //! | [`CameraEvent::ManualStreamEnded`] | `{class}/{device_id}` | `activityState == "idle"`            |
 //! | [`CameraEvent::Online`] | `{class}/{device_id}`   | `connectionState == "available"`              |
@@ -41,6 +43,7 @@ use streamer_domain::event::CameraEvent;
 /// Resource prefixes of the devices that stream: cameras (Arlo Q
 /// included) and video doorbells.
 const DEVICE_PREFIXES: [&str; 2] = ["cameras/", "doorbells/"];
+const BUTTON_PRESSED: &str = "buttonPressed";
 const ACTIVITY_STATE: &str = "activityState";
 const USER_STREAM_ACTIVE: &str = "userStreamActive";
 const ACTIVITY_IDLE: &str = "idle";
@@ -67,6 +70,9 @@ pub fn map_event(event: &ArloEvent) -> Option<CameraEvent> {
     }
     if matches_bool_true(props, "audioDetected") {
         return Some(CameraEvent::Audio { device_id });
+    }
+    if matches_bool_true(props, BUTTON_PRESSED) {
+        return Some(CameraEvent::Ring { device_id });
     }
     if let Some(mapped) = map_activity_state(&device_id, props) {
         return Some(mapped);
@@ -174,32 +180,34 @@ mod tests {
         );
     }
 
-    /// A video doorbell publishes its events under `doorbells/<id>`: the
-    /// broker grants no `cameras/` topic for it.
+    /// A video doorbell's ring, as captured on 2026-10-21 (shared and
+    /// owner account alike): `doorbells/<id>`, `buttonPressed: true`.
     #[test]
-    fn a_doorbell_s_events_map_like_a_camera_s() {
-        let motion = ev("doorbells/DB1", Some(json!({ "motionDetected": true })));
+    fn a_doorbell_ring_is_a_ring() {
+        let ring = ev("doorbells/DB1", Some(json!({ "buttonPressed": true })));
+        assert_eq!(
+            map_event(&ring),
+            Some(CameraEvent::Ring {
+                device_id: CameraId::new("DB1")
+            })
+        );
+        let not_pressed = ev("doorbells/DB1", Some(json!({ "buttonPressed": false })));
+        assert!(map_event(&not_pressed).is_none());
+        // The doorbell's own SIP call state accompanies a live session.
+        let sip = ev("doorbells/DB1", Some(json!({ "sipCallActive": true })));
+        assert!(map_event(&sip).is_none());
+    }
+
+    /// The doorbell's motion comes under its camera resource (owner
+    /// account, 2026-10-21), like any camera's.
+    #[test]
+    fn a_doorbell_s_motion_comes_as_a_camera_s() {
+        let motion = ev("cameras/DB1", Some(json!({ "motionDetected": true })));
         assert_eq!(
             map_event(&motion),
             Some(CameraEvent::Motion {
                 device_id: CameraId::new("DB1")
             })
-        );
-        let viewed = ev(
-            "doorbells/DB1",
-            Some(json!({ "activityState": "userStreamActive" })),
-        );
-        assert!(matches!(
-            map_event(&viewed),
-            Some(CameraEvent::ManualStream { .. })
-        ));
-        let snapshot = ev(
-            "doorbells/DB1",
-            Some(json!({ "presignedLastImageUrl": "https://s3.example/x.jpg" })),
-        );
-        assert_eq!(
-            snapshot_url(&snapshot),
-            Some(("DB1", "https://s3.example/x.jpg"))
         );
     }
 

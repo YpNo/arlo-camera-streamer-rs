@@ -37,7 +37,8 @@ Frigate's pull from Arlo's push**:
 | Viewed in app | You watch the camera in the Arlo app: the daemon relays the app's own stream, picture and sound (ADR 0007); if Arlo hands out none, the idle frame reads `LIVE IN ARLO APP`. Motion resumes when you close the app | Awake (because of you) |
 
 The transition is driven by Arlo's **MQTT event bus**: when the camera
-fires a motion event, the daemon negotiates a WebRTC session with Arlo's
+fires a motion event (or someone rings a video doorbell), the daemon
+negotiates a WebRTC session with Arlo's
 gateway, splices the live H.264 into the persistent GStreamer pipeline,
 and reverts to idle once the camera goes quiet, or as soon as the live
 source itself dies (ADR 0004).
@@ -83,7 +84,9 @@ to see the contracts. The ADRs document the load-bearing decisions:
   - **`gstreamer1.0-nice`** — libnice ICE for `webrtcbin`. **Required for live streaming.** Without it, live fails at motion with `pipeline error: webrtcbin has no sink request pad` (the idle stream still works, which makes it easy to miss).
   - the `gst-rtsp-server` library (Debian: `libgstrtspserver-1.0-0`).
   - *Optional* GPU encoding plugins — Intel/AMD: `gstreamer1.0-vaapi` plus the VA drivers (`intel-media-va-driver` / `mesa-va-drivers`; the newer `va` plugin ships in `gstreamer1.0-plugins-bad`); Raspberry Pi 4 family: `v4l2h264enc` from `gstreamer1.0-plugins-good`; NVIDIA: `nvh264enc` from `gstreamer1.0-plugins-bad` with the driver libraries. `video_encoder = "auto"` picks whatever works (see [GPU encoding](#gpu-encoding)).
-- An Arlo cloud account with at least one camera.
+- An Arlo cloud account with at least one camera: a separate account
+  the cameras are shared with, or the owner account for a video
+  doorbell's motion ([Which Arlo account](#which-arlo-account)).
 - An IMAP mailbox you can poll for the Arlo MFA OTP, or be ready to
   type the OTP on stdin (cold-start only).
 
@@ -226,6 +229,29 @@ budget and probe 0 to 86400 s).
 7. Point Frigate (or any NVR) at the same URL ([Frigate integration](#frigate-integration)).
 
 Something not as described? [Logging and debugging](#logging-and-debugging) says which lines to look for.
+
+### Which Arlo account
+
+Give the daemon **its own Arlo account, with the cameras shared to it**
+(shared from the Arlo app). The daemon's session then never
+competes with yours, and whoever controls the host controls only what
+was shared, not your Arlo account.
+
+One exception: **a video doorbell's motion never reaches a shared
+account.** Arlo's event broker grants a shared account the doorbell's
+ring (`doorbells/<id>`) but refuses it the doorbell's camera topic,
+where its motion is published, whatever the access rights. The doorbell
+then goes live when someone **rings**, not on motion. Cameras are not
+affected. (Seen on an Essential Video Doorbell, 2026-10; the same
+behaviour is reported for pyaarlo in hass-aarlo issues #542 and #1169.)
+
+For motion on a video doorbell, run the daemon with the **owner
+account**. Its motion, snapshots and ring then all arrive. Know what
+that means first: the daemon then holds your main Arlo credentials, so
+anyone who controls the host or reads its configuration and session
+file can view, change or delete your whole Arlo account, its other
+devices and its subscription. Keep the `.env` and the state directory
+readable by the daemon only, and the admin endpoints on loopback.
 
 ### First run: find your device ids
 
