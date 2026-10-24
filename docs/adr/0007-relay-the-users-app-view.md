@@ -157,3 +157,19 @@ CA passes, whoever it names. Binding the relay to Arlo's identity (an
 expected Arlo name, or a default SPKI pin) needs the certificate's
 names, which the relay now logs at `debug` (the DER, public data) with
 its SHA-256 at `info`; the next live run records them.
+
+## Update — 2026-10-24: bound to Arlo's domain
+
+The live run of 2026-10-12 recorded the certificate: it names only
+`*.wowza.arlo.com` (subject Arlo Technologies, Inc.), issued by DigiCert
+Global G2 TLS RSA SHA256 2020 CA1, valid to 2027-01-03. On an IP host
+the relay now accepts a trusted chain only if the certificate is valid
+for a host of `arlo.com`: the names it presents choose the host, and
+rustls checks the certificate against it like any server name (a
+wildcard through one host it covers). Any other certificate is refused
+and logged with the names it presented.
+
+A name rather than a key pin: the certificate is renewed within three
+months, and a pin of its key would break the relay at Arlo's next
+renewal. The operator pin (`arlo.watch_along_cert_sha256`) stays for a
+chain the system does not trust.

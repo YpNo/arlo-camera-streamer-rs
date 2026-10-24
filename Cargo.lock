@@ -2966,6 +2966,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-native-certs",
+ "rustls-webpki",
  "streamer-domain",
  "thiserror 2.0.21",
  "tokio",

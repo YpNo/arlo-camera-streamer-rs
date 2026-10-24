@@ -21,9 +21,10 @@
 //! probe sent it, is accepted (2026-09-30), and the loop needs to own
 //! keep-alives, RTCP receiver reports and the loss signals anyway.
 //!
-//! TLS: the certificate chain is verified against the system roots, and
-//! only the hostname check is waived — the URL names a raw IP no
-//! certificate can match. An operator can pin the end-entity certificate
+//! TLS: the certificate chain is verified against the system roots. The
+//! URL names a raw IP no certificate can match, so the certificate must
+//! instead be valid for a host of Arlo's domain (`arlo.com`; Arlo's is
+//! `*.wowza.arlo.com`). An operator can pin the end-entity certificate
 //! instead (`arlo.watch_along_cert_sha256`) when Arlo's chain is not
 //! public; the relay then refuses anything else. See [`RelayTls`].
 //!
@@ -1036,8 +1037,8 @@ async fn tls_handshake(
 /// How the relay authenticates the watch-along host (ADR 0007).
 ///
 /// Default: the certificate chain is verified against the system roots
-/// and only the hostname check is waived, because Arlo hands out a raw
-/// IP that no certificate names. Pinned: the end-entity certificate's
+/// and, since Arlo hands out a raw IP that no certificate names, the
+/// certificate must be valid for a host of Arlo's domain. Pinned: the end-entity certificate's
 /// SHA-256 must match (`arlo.watch_along_cert_sha256`), for a chain the
 /// system does not trust; the log prints the presented fingerprint when
 /// a chain is refused, so the operator can copy it.
@@ -1061,7 +1062,7 @@ impl fmt::Debug for RelayTls {
 }
 
 impl RelayTls {
-    /// Chain verification with the hostname waived, or a certificate pin
+    /// Chain verification bound to Arlo's domain, or a certificate pin
     /// when `pinned_cert_sha256` (64 hex digits) is given.
     ///
     /// # Errors
@@ -1109,11 +1110,77 @@ impl RelayTls {
     }
 }
 
-/// Chain-verifying certificate check with the hostname waived, or a pin.
+/// Chain-verifying certificate check bound to Arlo's domain, or a pin.
 #[derive(Debug)]
 struct WatchAlongVerifier {
     chain: Arc<WebPkiServerVerifier>,
     pinned: Option<[u8; 32]>,
+}
+
+/// The domain a watch-along certificate must name a host of, when the
+/// relay dials a raw IP (Arlo's certificate: `*.wowza.arlo.com`,
+/// 2026-10-12).
+const ARLO_DOMAIN: &str = "arlo.com";
+
+impl WatchAlongVerifier {
+    /// The chain is trusted but cannot name the raw IP dialed: accept it
+    /// only if rustls finds it valid for a host of [`ARLO_DOMAIN`]. The
+    /// presented names only choose which host to check; the check itself
+    /// is rustls's (a wildcard is checked through one host it covers).
+    fn verify_arlo_name(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        ocsp_response: &[u8],
+        now: UnixTime,
+        presented: [u8; 32],
+        name_error: rustls::Error,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let names = presented_dns_names(end_entity);
+        let arlo_host = names.iter().find_map(|name| arlo_host_for(name));
+        if let Some(host) = arlo_host
+            && let Ok(verified) =
+                self.chain
+                    .verify_server_cert(end_entity, intermediates, &host, ocsp_response, now)
+        {
+            info!(
+                sha256 = %fingerprint_hex(presented),
+                host = ?host,
+                "watch-along certificate trusted for Arlo's domain (raw IP dialed)"
+            );
+            return Ok(verified);
+        }
+        // Certificate names are public: they say what was refused.
+        warn!(
+            sha256 = %fingerprint_hex(presented),
+            ?names,
+            "watch-along certificate names no host of arlo.com; set arlo.watch_along_cert_sha256 to pin it"
+        );
+        Err(name_error)
+    }
+}
+
+/// The DNS names a certificate presents (wildcards included); none when
+/// it does not parse.
+fn presented_dns_names(end_entity: &CertificateDer<'_>) -> Vec<String> {
+    webpki::EndEntityCert::try_from(end_entity)
+        .map(|cert| {
+            cert.valid_dns_names()
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A host of [`ARLO_DOMAIN`] that `name` covers: the name itself, or for
+/// a wildcard one host under it. `None` outside Arlo's domain.
+fn arlo_host_for(name: &str) -> Option<ServerName<'static>> {
+    let host = name.strip_prefix("*.").map_or_else(
+        || name.to_string(),
+        |parent| format!("watch-along.{parent}"),
+    );
+    let in_domain = host == ARLO_DOMAIN || host.ends_with(&format!(".{ARLO_DOMAIN}"));
+    in_domain.then(|| ServerName::try_from(host).ok()).flatten()
 }
 
 impl ServerCertVerifier for WatchAlongVerifier {
@@ -1146,20 +1213,16 @@ impl ServerCertVerifier for WatchAlongVerifier {
             now,
         ) {
             Ok(verified) => Ok(verified),
-            // A certificate cannot name the raw IP Arlo's URL gives: only
-            // then is the name check waived. A DNS host must match.
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::NotValidForName
-                | rustls::CertificateError::NotValidForNameContext { .. },
-            )) if matches!(server_name, ServerName::IpAddress(_)) => {
-                info!(
-                    sha256 = %fingerprint_hex(presented),
-                    "watch-along certificate chain trusted; hostname check waived (raw IP)"
-                );
-                // Public data, for binding the relay to Arlo's names later
-                // (`xxd -r -p | openssl x509 -inform der -noout -text`).
-                debug!(der_hex = %hex_string(end_entity.as_ref()), "watch-along certificate");
-                Ok(ServerCertVerified::assertion())
+            // A certificate cannot name the raw IP Arlo's URL gives: it
+            // must then name a host of Arlo's domain instead, which rustls
+            // checks like any server name. A DNS host must match itself.
+            Err(
+                e @ rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::NotValidForName
+                    | rustls::CertificateError::NotValidForNameContext { .. },
+                ),
+            ) if matches!(server_name, ServerName::IpAddress(_)) => {
+                self.verify_arlo_name(end_entity, intermediates, ocsp_response, now, presented, e)
             }
             Err(e) => {
                 warn!(
@@ -2090,12 +2153,22 @@ mod tests {
         rcgen::CertifiedIssuer::self_signed(params, rcgen::KeyPair::generate().unwrap()).unwrap()
     }
 
+    /// A leaf issued by `ca` for the name Arlo's watch-along host
+    /// presented (2026-10-12).
     fn leaf_of(
         ca: &rcgen::CertifiedIssuer<'_, rcgen::KeyPair>,
         expired: bool,
     ) -> CertificateDer<'static> {
-        let mut params =
-            rcgen::CertificateParams::new(vec!["watch-along.example".to_string()]).unwrap();
+        leaf_named(ca, &["*.wowza.arlo.com"], expired)
+    }
+
+    fn leaf_named(
+        ca: &rcgen::CertifiedIssuer<'_, rcgen::KeyPair>,
+        names: &[&str],
+        expired: bool,
+    ) -> CertificateDer<'static> {
+        let names = names.iter().map(|n| (*n).to_string()).collect::<Vec<_>>();
+        let mut params = rcgen::CertificateParams::new(names).unwrap();
         if expired {
             params.not_before = rcgen::date_time_ymd(2020, 1, 1);
             params.not_after = rcgen::date_time_ymd(2021, 1, 1);
@@ -2128,12 +2201,48 @@ mod tests {
         v.verify_server_cert(cert, &[], &ip, &[], UnixTime::now())
     }
 
-    /// Only the name mismatch of a raw-IP dial is waived.
+    /// A raw-IP dial cannot match a name, so the certificate must name a
+    /// host of Arlo's domain instead, checked by rustls itself.
     #[test]
-    fn verifier_accepts_a_trusted_chain_on_a_raw_ip() {
+    fn verifier_accepts_a_trusted_chain_naming_an_arlo_host_on_a_raw_ip() {
         let ca = test_ca();
         let v = verifier_trusting(ca.der(), None);
-        assert!(verify(&v, &leaf_of(&ca, false)).is_ok());
+        for names in [
+            &["*.wowza.arlo.com"][..],
+            &["relay.arlo.com"],
+            &["arlo.com"],
+            &["other.example", "*.wowza.arlo.com"],
+        ] {
+            assert!(
+                verify(&v, &leaf_named(&ca, names, false)).is_ok(),
+                "{names:?}"
+            );
+        }
+    }
+
+    /// Second security sweep M1, rest: with the name waived on a raw IP,
+    /// any publicly trusted certificate passed, whatever it named.
+    #[test]
+    fn verifier_refuses_a_trusted_chain_for_another_domain_on_a_raw_ip() {
+        let ca = test_ca();
+        let v = verifier_trusting(ca.der(), None);
+        for names in [
+            &["watch-along.example"][..],
+            &["arlo.com.evil.example"],
+            &["evilarlo.com"],
+            &["*.example"],
+        ] {
+            assert!(
+                matches!(
+                    verify(&v, &leaf_named(&ca, names, false)),
+                    Err(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::NotValidForName
+                            | rustls::CertificateError::NotValidForNameContext { .. }
+                    ))
+                ),
+                "{names:?}"
+            );
+        }
     }
 
     /// Second security sweep M1: the waiver covered DNS hosts too, so any
@@ -2142,7 +2251,7 @@ mod tests {
     fn verifier_checks_the_name_of_a_dns_host() {
         let ca = test_ca();
         let v = verifier_trusting(ca.der(), None);
-        let leaf = leaf_of(&ca, false);
+        let leaf = leaf_named(&ca, &["watch-along.example"], false);
         let at = |name: &str| {
             let host = ServerName::try_from(name.to_string()).unwrap();
             v.verify_server_cert(&leaf, &[], &host, &[], UnixTime::now())

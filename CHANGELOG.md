@@ -52,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (QP 26) otherwise. Before, such a box always encoded on the CPU.
 
 ### Security
+- The watch-along relay dials a raw IP, so it waived the certificate's
+  name and any publicly trusted certificate passed, whatever it named.
+  The certificate must now be valid for a host of `arlo.com` (Arlo's
+  names `*.wowza.arlo.com`); anything else is refused and logged with
+  the names it presented (ADR 0007).
 - rustls-webpki 0.103.16 (RUSTSEC-2026-0382: certificate verification
   could accept distrusted intermediates) and webpki-roots 1.0.10
   (RUSTSEC-2026-0381: distrusted emSign intermediates were still

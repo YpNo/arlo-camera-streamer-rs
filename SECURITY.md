@@ -29,8 +29,9 @@ newest release (`ghcr.io/ypno/arlo-camera-streamer-rs:v<version>`).
   (Frigate consumes them on the LAN). Bind them to a trusted interface or
   front them with a proxy.
 - **TLS to Arlo's watch-along host** (ADR 0007) verifies the certificate
-  chain against the system roots and waives only the hostname check,
-  because Arlo hands out a raw IP no certificate names. A certificate pin
+  chain against the system roots. Arlo hands out a raw IP no certificate
+  names, so the certificate must instead be valid for a host of
+  `arlo.com` (Arlo's names `*.wowza.arlo.com`). A certificate pin
   (`arlo.watch_along_cert_sha256`) replaces the chain check when needed.
   All other Arlo traffic is fully validated.
 

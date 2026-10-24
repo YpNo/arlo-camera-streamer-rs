@@ -26,6 +26,7 @@ gstreamer-rtsp-server = { workspace = true }
 gstreamer-sdp         = { workspace = true }
 gstreamer-webrtc      = { workspace = true }
 rustls                = { workspace = true }
+rustls-webpki         = { workspace = true }
 rustls-native-certs   = { workspace = true }
 ring                  = { workspace = true }
 thiserror             = { workspace = true }

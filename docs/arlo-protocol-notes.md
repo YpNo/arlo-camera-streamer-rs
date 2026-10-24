@@ -143,9 +143,11 @@ returns an RTSPS stream any client can join without disturbing the app.
 
 About that RTSPS server:
 
-- It is addressed by IP. Its certificate chains to a public root (seen
-  2026-10-10) but cannot name the IP, so only the hostname check can be
-  waived.
+- It is addressed by IP. Its certificate chains to a public root
+  (DigiCert Global G2 TLS RSA SHA256 2020 CA1) and names only
+  `*.wowza.arlo.com` (subject Arlo Technologies, Inc.; seen 2026-10-12,
+  valid to 2027-01-03), not the IP. The relay requires a name under
+  `arlo.com` instead.
 - A plain RTSP client plays it (OPTIONS, DESCRIBE, SETUP over
   TCP-interleaved, PLAY). GStreamer's `rtspsrc` is refused at SETUP with
   403, for a reason not identified; the token is not it.

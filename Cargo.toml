@@ -54,6 +54,9 @@ mqttbytes    = "0.6"
 rustls-native-certs = "0.8"
 ring = "0.17"
 rustls       = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# The certificate parser rustls itself uses (same version, no new crate):
+# the watch-along relay reads which names a certificate presents.
+rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 url          = "2"
 futures      = "0.3"
 async-trait  = "0.1"
