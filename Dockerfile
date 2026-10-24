@@ -9,7 +9,7 @@
 # The build stage carries the dev headers; runtime carries only the .so
 # files.
 # ----------------------------------------------------------------------
-FROM rust:1.99.0-slim-trixie@sha256:24e632c09342c20abf8312cf4f61430a911c01ed3a5e4c02b87292b1c39c5273 AS builder
+FROM rust:1.99.1-slim-trixie@sha256:aab42391a986424e22d6a3ec14f37bc6dd3dacff4d457ca7cccd781e02297cc6 AS builder
 
 # System packages required to build the gstreamer-rs crates against
 # system GStreamer, plus what arlo-rs's transport needs: `wreq` links

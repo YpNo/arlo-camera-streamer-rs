@@ -10,7 +10,7 @@
 [![Docker Hub](https://img.shields.io/docker/v/ypno/arlo-camera-streamer-rs?sort=semver&logo=docker&logoColor=white&label=docker.io)](https://hub.docker.com/r/ypno/arlo-camera-streamer-rs)
 [![codecov](https://codecov.io/gh/YpNo/arlo-camera-streamer-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/YpNo/arlo-camera-streamer-rs)
 [![Quality gate](https://sonarcloud.io/api/project_badges/measure?project=YpNo_arlo-camera-streamer-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=YpNo_arlo-camera-streamer-rs)
-[![MSRV](https://img.shields.io/badge/MSRV-1.99.0-blue.svg)](https://github.com/YpNo/arlo-camera-streamer-rs)
+[![MSRV](https://img.shields.io/badge/MSRV-1.99.1-blue.svg)](https://github.com/YpNo/arlo-camera-streamer-rs)
 [![GStreamer](https://img.shields.io/badge/GStreamer-1.22%2B-brightgreen.svg)](https://gstreamer.freedesktop.org/)
 [![arlo-rs](https://img.shields.io/crates/v/arlo-rs.svg?label=arlo-rs)](https://crates.io/crates/arlo-rs)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -74,7 +74,7 @@ to see the contracts. The ADRs document the load-bearing decisions:
 
 ## Prerequisites
 
-- **Rust** ≥ 1.99.0 (`rustup toolchain install 1.99.0`; the MSRV follows arlo-rs).
+- **Rust** ≥ 1.99.1 (`rustup toolchain install 1.99.1`; the MSRV follows arlo-rs).
 - **GStreamer 1.22+** with the plugin set below.
   - `gstreamer1.0-plugins-base`
   - `gstreamer1.0-plugins-good` (also provides `gdkpixbufoverlay` for the idle thumbnail)
