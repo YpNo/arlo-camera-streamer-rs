@@ -60,6 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session value printed TLS secrets; nothing here formats one).
 
 ### Fixed
+- `streamer_camera_state` reported a camera in no state at all until its
+  first state change: every row started at 0. A camera's `idle` row
+  starts at 1 now (every camera starts idle).
 - In the container, VLC showed the stream 10 s late (GStreamer clients
   5 s): it asked for RTP over UDP first, which the TCP-only port mapping
   never carried back, and waited for it before retrying over TCP. The

@@ -226,12 +226,15 @@ impl Metrics {
     }
 
     /// Pre-create the per-camera gauge rows so they appear at scrape
-    /// time even before any event has fired. Idempotent.
+    /// time even before any event has fired, with `idle` set: every
+    /// camera starts idle, and a camera that never changes state would
+    /// otherwise be reported in none. Call it once per camera, before
+    /// its first state change.
     pub fn prewarm_camera(&self, camera: &CameraId) {
         for state in STATE_LABELS {
-            let _ = self
-                .camera_state
-                .with_label_values(&[camera.as_str(), state]);
+            self.camera_state
+                .with_label_values(&[camera.as_str(), state])
+                .set(i64::from(*state == "idle"));
         }
     }
 
@@ -448,13 +451,17 @@ mod tests {
         CameraId::new(id)
     }
 
+    /// Every camera starts idle: a camera that never changed state was
+    /// reported in no state at all (2026-10-22, two of three cameras).
     #[test]
-    fn prewarm_camera_seeds_all_state_rows() {
+    fn prewarm_camera_seeds_every_state_row_with_idle_set() {
         let m = Metrics::new(1, "0.1.0").unwrap();
         m.prewarm_camera(&cam("CAM"));
         let out = m.render().unwrap();
         for state in STATE_LABELS {
-            let needle = format!("streamer_camera_state{{camera=\"CAM\",state=\"{state}\"}} 0");
+            let value = u8::from(*state == "idle");
+            let needle =
+                format!("streamer_camera_state{{camera=\"CAM\",state=\"{state}\"}} {value}");
             assert!(
                 out.contains(&needle),
                 "expected pre-warm row {needle}, got:\n{out}"
