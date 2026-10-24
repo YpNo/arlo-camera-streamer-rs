@@ -4,7 +4,7 @@ Profile: `service` (a daemon that runs unattended next to an NVR). Full
 rigor: boundaries, failure-path tests, ADRs, CI.
 
 ## Stack
-- Rust 1.99.0 (pinned in `rust-toolchain.toml` and `mise.toml`; follows
+- Rust 1.99.1 (pinned in `rust-toolchain.toml` and `mise.toml`; follows
   `arlo-rs` 0.2.0's MSRV), edition 2024, tokio, GStreamer 1.22+ via
   gstreamer-rs 0.25, axum 0.8, prometheus 0.14.
 - Six-crate workspace, hexagonal: `streamer-domain` (ports + types),
@@ -14,15 +14,15 @@ rigor: boundaries, failure-path tests, ADRs, CI.
   `[patch.crates-io]` at the end of `Cargo.toml` (never commit it on).
 
 ## Verified commands (2026-09-27)
-On this workstation every cargo command runs inside the `rust-build`
+On this workstation every cargo command runs inside the `rust`
 distrobox (BoringSSL under `wreq` needs libclang there):
 
 ```bash
 # one-shot form (mise exec selects the pinned toolchain inside the container)
-distrobox enter rust-build -- bash -lc 'cd ~/workspace/arlo-camera-streamer/arlo-camera-streamer-rs && LIBCLANG_PATH=/usr/lib/llvm-19/lib mise exec -- cargo test -p streamer-domain -p streamer-app -p streamer-infra-arlo -p streamer-infra-ops --all-features'
+distrobox enter rust -- bash -lc 'cd ~/workspace/arlo-camera-streamer/arlo-camera-streamer-rs && LIBCLANG_PATH=/usr/lib/llvm-19/lib mise exec -- cargo test -p streamer-domain -p streamer-app -p streamer-infra-arlo -p streamer-infra-ops --all-features'
 
 # interactive form
-distrobox enter rust-build
+distrobox enter rust
 export LIBCLANG_PATH=/usr/lib/llvm-19/lib
 P="--workspace"   # the four-crate subset is no longer needed
 alias cargo='mise exec -- cargo'
@@ -40,10 +40,13 @@ alias cargo='mise exec -- cargo'
 | release binary (Linux box with GStreamer dev headers) | `cargo build --release --locked --package arlo-camera-streamer` → `target/release/arlo-camera-streamer` |
 
 ## Runtime constraints
-- Since 2026-09-27 the `rust-build` container has the GStreamer 1.26 dev
-  and runtime packages (Debian trixie), so the **whole workspace builds and
-  tests there** (`cargo test --workspace --all-features` inside the
-  container). The host still has none. Pipeline behaviour needs a camera.
+- The `rust` container (it replaced `rust-build` around 2026-10-22) has
+  the GStreamer 1.26 dev and runtime packages (Debian trixie), so the
+  **whole workspace builds and tests there** (`cargo test --workspace
+  --all-features` inside the container). The media integration tests
+  also need `gstreamer1.0-nice` in it (`nicesrc`/`nicesink`); without it
+  they fail on purpose under `STREAMER_REQUIRE_GST_IT=1`. The host still
+  has none. Pipeline behaviour needs a camera.
 - Root disk is small; `target/` directories of the sibling projects grow
   to tens of GB. Clean them before an image build.
 - Coverage gate: 88 % via tarpaulin (measured 90.24 % on 2026-10-10, GStreamer files
