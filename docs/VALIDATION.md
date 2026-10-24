@@ -18,7 +18,7 @@ this file records whether reality agreed. Update it after every live gate
 | Encoder `x264` (ADR 0008) | 2026-10-03 | every gate above; `auto` resolves to it on a box with VA elements and no render node. |
 | Encoder `vaapi` | before 2026-09-28 | ran on the owner's Intel box in an earlier phase. |
 | Encoder `va` (low power) | 2026-10-24 | `auto` → `vah264lpenc`, constant quality (qp 26), on the HD 530 of the Frigate box in rootless podman (`keep-groups`); every gate since 2026-10-12 ran on it. |
-| Relay TLS chain verification (ADR 0007) | 2026-10-12 | Arlo's chain trusted by the system roots (DigiCert Global G2); the certificate names only `*.wowza.arlo.com`. Binding to `arlo.com` (2026-10-24): integration-tested, live gate on the next app view. |
+| Relay TLS, bound to Arlo's domain (ADR 0007) | 2026-10-24 | Arlo's chain trusted by the system roots (DigiCert Global G2); the certificate names only `*.wowza.arlo.com` (2026-10-12). With the binding: `trusted for Arlo's domain`, `host=watch-along.wowza.arlo.com`, view relayed, the 60 s probe re-attached under the same check, and the view ended at the next probe. |
 | Encoders `v4l2`, `nvenc` | **never** | written from element documentation. |
 | Several cameras at once | 2026-10-24 | 3 cameras, Frigate (go2rtc) attached to each: 15 min, ~22 % of a core in all, RSS settling near 250 MiB, no RTSP session expired; go2rtc's own `TEARDOWN` and reconnect rebuilt a mount in under a second. |
 | RTSP over TCP only | 2026-10-12 | first frame 0.3 s over TCP; a UDP-first client (GStreamer, VLC) waited 5–10 s before 0.3.0 and is now refused and switches at once (VLC instant, 2026-10-22). |
