@@ -58,6 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trusted), for every TLS connection: Arlo, the watch-along relay, the
   MQTT broker. rustls 0.23.46 (RUSTSEC-2026-0346: `Debug` of a client
   session value printed TLS secrets; nothing here formats one).
+- tokio 1.54.1 (RUSTSEC-2026-0386: `AsyncFd::new` and related
+  constructors violate I/O safety; the streamer does not call them).
 
 ### Fixed
 - `streamer_camera_state` reported a camera in no state at all until its
