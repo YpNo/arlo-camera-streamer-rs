@@ -99,7 +99,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arlo-camera-streamer"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2863,7 +2863,7 @@ dependencies = [
 
 [[package]]
 name = "streamer-app"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2881,7 +2881,7 @@ dependencies = [
 
 [[package]]
 name = "streamer-domain"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2895,7 +2895,7 @@ dependencies = [
 
 [[package]]
 name = "streamer-infra-arlo"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arlo-rs",
  "async-trait",
@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "streamer-infra-media"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2942,7 +2942,7 @@ dependencies = [
 
 [[package]]
 name = "streamer-infra-ops"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",

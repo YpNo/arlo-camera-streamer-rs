@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-24
+
+The GPU encoder on Intel's free driver, an idle stream cheap enough to
+leave Frigate attached to every camera (three of them: about 0.22 core
+on the GPU encoder, against about 2 cores in 0.2), Home Assistant over
+MQTT, a video doorbell's ring as a trigger, and the watch-along relay
+bound to Arlo's domain.
+
+**Upgrading:** remove any `[output.dash]` table from the configuration;
+the daemon now refuses to start with one (it never wrote DASH). Clients
+that ask for RTP over UDP are refused and switch to TCP on their own.
+
 ### Removed
 - `[output.dash]`, parsed and ignored since 0.1 (GStreamer cannot write
   DASH that browsers play without gst-plugins-rs, ADR 0006). A config that
@@ -554,7 +566,8 @@ First release: the daemon as validated on the owner's camera and box.
 - Documentation still described the retired SSE bus and a Chromium
   requirement; both are gone since the move to `arlo-rs` 0.2.0.
 
-[Unreleased]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.1.0...v0.1.1
