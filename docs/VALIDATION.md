@@ -17,9 +17,15 @@ this file records whether reality agreed. Update it after every live gate
 | MFA login, IMAP factor | 2026-10-03 | fresh cache path, 13 s to `authentication complete`, file mode 0600, code 9261 on the trusted-browser probe of a new device id. |
 | Encoder `x264` (ADR 0008) | 2026-10-03 | every gate above; `auto` resolves to it on a box with VA elements and no render node. |
 | Encoder `vaapi` | before 2026-09-28 | ran on the owner's Intel box in an earlier phase. |
-| Relay TLS chain verification (ADR 0007, revised 2026-10-03) | **never** | first gate decides: a trusted chain logs `hostname check waived`, an untrusted one logs the fingerprint to pin in `arlo.watch_along_cert_sha256`. |
-| Encoders `va`, `v4l2`, `nvenc` | **never** | written from element documentation; first run on the Frigate box. |
-| Several cameras at once | **never** | per-camera actors, unit-tested only. |
+| Encoder `va` (low power) | 2026-10-24 | `auto` → `vah264lpenc`, constant quality (qp 26), on the HD 530 of the Frigate box in rootless podman (`keep-groups`); every gate since 2026-10-12 ran on it. |
+| Relay TLS chain verification (ADR 0007) | 2026-10-12 | Arlo's chain trusted by the system roots (DigiCert Global G2); the certificate names only `*.wowza.arlo.com`. Binding to `arlo.com` (2026-10-24): integration-tested, live gate on the next app view. |
+| Encoders `v4l2`, `nvenc` | **never** | written from element documentation. |
+| Several cameras at once | 2026-10-24 | 3 cameras, Frigate (go2rtc) attached to each: 15 min, ~22 % of a core in all, RSS settling near 250 MiB, no RTSP session expired; go2rtc's own `TEARDOWN` and reconnect rebuilt a mount in under a second. |
+| RTSP over TCP only | 2026-10-12 | first frame 0.3 s over TCP; a UDP-first client (GStreamer, VLC) waited 5–10 s before 0.3.0 and is now refused and switches at once (VLC instant, 2026-10-22). |
+| Idle picture once a second (ADR 0010) | 2026-10-22 | VLC: the snapshot with the caption over it, at once. |
+| Video doorbell (Essential) | 2026-10-22 | ring → `Live` in 3.5 s on a shared account. Its motion reaches the owner account only (2026-10-21, `cameras/<id>` over MQTT); Arlo never sends it to a shared one (2026-10-12 to 10-21). |
+| MQTT state for Home Assistant (ADR 0009) | partial | connected to the owner's Mosquitto (plain `mqtt://` on the LAN) and publishing, 2026-10-12; Home Assistant's discovery not checked yet. |
+| Container shutdown | 2026-10-24 | `podman stop` → exit code 0. |
 | H.265 camera | **never** | code path present, the owner's camera sends H.264. |
 | Container image from the release workflow | **partial** | `v0.1.0` and `v0.1.1` published for amd64 and arm64 (2026-10-04, 2026-10-07). The trixie image (next release) built locally 2026-10-07: Trivy finds no fixable CRITICAL or HIGH, no setuid binaries, boots read-only with no capabilities up to the login. Run under podman 2026-10-06 with a read-only root filesystem, no capabilities and caches on a tmpfs: clean up to the Arlo login (offline). The full run belongs to the Frigate box deployment (`docker-compose.yml`). |
 | `linux/arm64` image | **never run** | built by the release workflow since 2026-10-04 (`IMAGE_PLATFORMS` lists both platforms); running it on a Pi is still owed. |

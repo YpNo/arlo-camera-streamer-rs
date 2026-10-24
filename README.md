@@ -857,29 +857,25 @@ on `/metrics` the same for a dashboard.
 
 ## Performance
 
-Measured on an Intel i5-6500T (4 cores, Skylake) with **software**
-`x264enc` at 720p15, one camera:
+Measured on an Intel i5-6500T (4 cores, Skylake, HD 530), 720p15:
 
-| State                            | CPU (share of one core) |
-|----------------------------------|-------------------------|
-| No RTSP client connected         | ~0%                     |
-| Idle stream, client connected    | ~0.6 core               |
-| Live stream                      | ~0.85 core              |
+| Setup | CPU (share of one core) |
+|---|---|
+| No RTSP client connected | ~0 |
+| 3 idle cameras, Frigate attached to each, GPU encoder (`va` low power), 0.3.0 | **~0.22 core in all** (2026-10-24, 15 min) |
+| One idle camera with a client, `x264`, 0.3.0 (bench of the idle chain) | ~0.14 core |
+| One idle camera with a client, `x264`, 0.2 | ~0.6 core |
+| One live camera, `x264`, 0.2 | ~0.85 core |
 
-Idle and live cost almost the same because the stream runs whenever a
-client is connected (Frigate stays connected 24/7): live only adds the
-decode (~0.25 core). CPU therefore scales with the number of
-**connected** cameras, not with how many are live. On a 4-core box that
-is a ceiling of roughly **6 idle / 4–5 concurrently live** cameras.
-
-A bench of the idle chain on the same chip (one camera) showed where the
-idle cost went up to 0.2: drawing the idle picture (the thumbnail blended
-into every frame, plus the caption) was about 0.4 core, x264 about 0.08
-on that nearly static picture. Since 0.3.0 the picture is drawn once a
-second and repeated ([ADR 0010](./docs/adr/0010-idle-picture-drawn-once-a-second.md)):
-the idle branch costs about 3 % of a core, 14 % with x264. The figures
-in the table above predate that change and will be measured again. A GPU
-encoder now takes most of what is left; see [GPU encoding](#gpu-encoding).
+The stream runs whenever a client is connected, and Frigate stays
+connected around the clock, so CPU scales with the number of
+**connected** cameras. Since 0.3.0 the idle picture is drawn once a
+second and repeated ([ADR 0010](./docs/adr/0010-idle-picture-drawn-once-a-second.md)),
+which made an idle camera cheap; with a GPU encoder (see
+[GPU encoding](#gpu-encoding)) three of them cost less than a quarter of
+a core. Three idle cameras cost about 2 cores in 0.2. A live camera adds
+the decode of Arlo's stream (~0.25 core with `x264` in 0.2; not
+measured again since). Memory settles near 250 MiB for three cameras.
 
 > The `gupnp … 1900: Address already in use` warnings at live start are
 > harmless — libnice's UPnP probe colliding with local bridge
