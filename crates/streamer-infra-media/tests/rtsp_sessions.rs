@@ -275,6 +275,21 @@ fn both_servers_share_one_media_per_mount() {
     assert_eq!(built.load(Ordering::SeqCst), 1, "one media for the mount");
 }
 
+/// A port already taken fails the start, so the daemon can refuse to boot
+/// before it logs in to Arlo (third sweep, S3-Z1).
+#[test]
+fn a_port_in_use_fails_the_start() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !gstreamer_ready() {
+        return;
+    }
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = taken.local_addr().expect("addr").port();
+    assert!(RtspServer::start_with(&format!("127.0.0.1:{port}"), SHORT).is_err());
+}
+
 /// A query on the mount's URL used to build a second media for
 /// the camera, which took its live wiring and, once gone, left the
 /// viewers' media without live video (third sweep, S3-M1).

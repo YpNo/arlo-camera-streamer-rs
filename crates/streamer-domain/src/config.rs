@@ -143,6 +143,27 @@ fn split_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
 
 /// Topic levels of `[A-Za-z0-9_-]`, `/`-separated, none empty: never a
 /// wildcard (`+`, `#`) or a `$` system topic. Empty only if `may_be_empty`.
+/// An environment variable name: letters, digits and `_`, not starting
+/// with a digit, at most 128 bytes. The value of a `*password_env` that is
+/// not one is never echoed: it is likely the password itself, pasted in
+/// the wrong place (third sweep, S3-L8).
+fn validate_env_name(key: &str, value: &str) -> Result<(), DomainError> {
+    let mut chars = value.chars();
+    let ok = value.len() <= 128
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(DomainError::InvalidConfig(format!(
+            "{key} is not an environment variable name (letters, digits and _, not starting \
+             with a digit): put the variable's name there and the secret in the environment"
+        )))
+    }
+}
+
 fn validate_topic_prefix(name: &str, value: &str, may_be_empty: bool) -> Result<(), DomainError> {
     if value.is_empty() && may_be_empty {
         return Ok(());
@@ -634,6 +655,22 @@ impl CooldownConfig {
 }
 
 impl StreamerConfig {
+    /// Every `*password_env` names an environment variable.
+    fn validate_password_envs(&self) -> Result<(), DomainError> {
+        validate_env_name("arlo.password_env", &self.arlo.password_env)?;
+        if let MfaConfig::Email(EmailMfaConfig {
+            password_env: Some(name),
+            ..
+        }) = &self.arlo.mfa
+        {
+            validate_env_name("arlo.mfa.password_env", name)?;
+        }
+        if let Some(name) = self.mqtt.as_ref().and_then(|m| m.password_env.as_deref()) {
+            validate_env_name("mqtt.password_env", name)?;
+        }
+        Ok(())
+    }
+
     /// Cross-field checks the parser cannot express: no two cameras may
     /// share an `arlo_device_id` (the second would replace the first's
     /// routes) or a `stream_name` (the second would replace the first's
@@ -671,6 +708,7 @@ impl StreamerConfig {
             }
         }
         validate_bitrate("output.bitrate_kbps", self.output.bitrate_kbps)?;
+        self.validate_password_envs()?;
         if let Some(mqtt) = &self.mqtt {
             mqtt.validate()?;
         }
@@ -729,6 +767,36 @@ mod tests {
 
     /// The shipped example must always parse: it is the first thing a new
     /// user runs, and a stale key there is a boot failure in production.
+    /// A password pasted where its variable's name goes was echoed in the
+    /// boot error (third sweep, S3-L8): refused without the value.
+    #[test]
+    fn a_password_env_that_is_no_variable_name_is_refused_without_its_value() {
+        let raw = include_str!("../../../config/streamer.example.toml");
+        let mut cfg: StreamerConfig = toml::from_str(raw).expect("parses");
+        cfg.validate().expect("the example validates");
+        for bad in ["hunter2 pass!", "9STARTS_WITH_DIGIT", ""] {
+            cfg.arlo.password_env = bad.to_string();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("arlo.password_env"), "{err}");
+            assert!(
+                bad.is_empty() || !err.contains(bad),
+                "the value is not echoed: {err}"
+            );
+        }
+        cfg.arlo.password_env = "ARLO_PASSWORD".to_string();
+        cfg.mqtt = Some(
+            toml::from_str(
+                "url = \"mqtt://broker\"\nusername = \"arlo\"\npassword_env = \"s3cret value\"",
+            )
+            .expect("mqtt"),
+        );
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("mqtt.password_env") && !err.contains("s3cret"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn example_config_file_parses_matching_documented_defaults() {
         let raw = include_str!("../../../config/streamer.example.toml");

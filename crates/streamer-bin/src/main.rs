@@ -345,6 +345,14 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
     // is up.
     let ops_listener = bind_listener("metrics_bind", &config.output.metrics_bind).await?;
     let admin_listener = bind_listener("admin_bind", &config.output.admin_bind).await?;
+    // The RTSP port and the relay's TLS policy too: either failing after
+    // a successful login made a restart policy log in to Arlo at every
+    // restart (third sweep, S3-Z1), and neither needs Arlo.
+    let rtsp_server =
+        RtspServer::start(&config.output.rtsp.bind).context("failed to start RTSP server")?;
+    let relay_tls =
+        streamer_infra_media::RelayTls::from_config(config.arlo.watch_along_cert_sha256.as_deref())
+            .context("watch-along TLS policy")?;
     let ops_shutdown = CancellationToken::new();
     let ops_server = OpsServer::new(metrics.clone(), readiness.clone());
     let ops_task = {
@@ -387,16 +395,11 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
     } = arlo_adapters(&config, arlo_client)?;
 
     // -- Media adapter --
-    let rtsp_server =
-        RtspServer::start(&config.output.rtsp.bind).context("failed to start RTSP server")?;
     let pipeline_registry = Arc::new(GstPipelineRegistry::new(
         rtsp_server.clone(),
         encoders,
         thumbnail_dir,
     ));
-    let relay_tls =
-        streamer_infra_media::RelayTls::from_config(config.arlo.watch_along_cert_sha256.as_deref())
-            .context("watch-along TLS policy")?;
     let media: Arc<dyn streamer_domain::port::MediaMultiplexer> =
         Arc::new(GstMediaMultiplexer::new(
             pipeline_registry.clone(),

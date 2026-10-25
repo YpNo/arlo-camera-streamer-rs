@@ -99,6 +99,13 @@ that ask for RTP over UDP are refused and switch to TCP on their own.
   constructors violate I/O safety; the streamer does not call them).
 
 ### Fixed
+- The RTSP port and the relay's TLS policy are set up before the Arlo
+  login: a taken port 8554 (or a bad certificate pin) failed the boot
+  only after a successful login, so a restart policy logged in to Arlo
+  at every restart.
+- A `*password_env` that is no environment variable name (a password
+  pasted in the wrong place) is refused at load, naming the key only; it
+  used to be printed in the "not set" error.
 - The continuous-live cap did not hold the camera idle: the next motion
   pulse, about 10 s later, woke it again, and a source lost right after
   the attach was renegotiated at every pulse. Motion now waits
