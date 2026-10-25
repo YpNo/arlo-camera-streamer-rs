@@ -70,9 +70,7 @@ pub use live_rtp_sink::{
 };
 pub use live_watch::{RtpActivity, stall_verdict};
 pub use multiplexer::{GstMediaMultiplexer, PipelineRegistry};
-pub use pipeline_desc::{
-    DashBranchConfig, HlsBranchConfig, OutputBranches, build_output_branches, rtsp_mount_path,
-};
-pub use rtsp::RtspServer;
+pub use pipeline_desc::{HlsBranchConfig, OutputBranches, build_output_branches, rtsp_mount_path};
+pub use rtsp::{RtspLimits, RtspServer};
 pub use rtsp_relay::RelayTls;
 pub use splice::{KeyframeWatcher, is_keyframe};

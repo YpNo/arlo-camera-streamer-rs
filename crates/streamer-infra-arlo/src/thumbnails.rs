@@ -35,6 +35,7 @@ use streamer_domain::error::DomainError;
 use streamer_domain::port::ArloThumbnailSource;
 use streamer_domain::thumbnail::check_thumbnail;
 
+use crate::arlo_api::ArloApi;
 use crate::error::arlo_to_domain;
 use crate::snapshot_cache::{SnapshotUrlCache, is_snapshot_url};
 
@@ -68,6 +69,9 @@ pub fn http_client(user_agent: &str) -> Result<reqwest::Client, reqwest::Error> 
         .redirect(redirect_policy())
         .referer(false)
         .dns_resolver(Arc::new(PublicOnlyResolver))
+        // A proxy would resolve the host itself, past PublicOnlyResolver
+        // (third sweep, S3-L4): HTTPS_PROXY / ALL_PROXY are ignored.
+        .no_proxy()
         .https_only(true)
         .build()
 }
@@ -107,14 +111,36 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
     }
 }
 
+/// The IPv4 address a well-known-prefix NAT64 address (`64:ff9b::/96`)
+/// stands for: a gateway translates it to that host, private or not.
+fn nat64_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let s = v6.segments();
+    (s[..6] == [0x64, 0xff9b, 0, 0, 0, 0]).then(|| {
+        let [.., hi, lo] = s;
+        std::net::Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo))
+    })
+}
+
+/// The local-use NAT64 prefix (`64:ff9b:1::/48`, RFC 8215): what it
+/// translates to is the network's choice, so it is never public.
+fn is_local_use_nat64(v6: std::net::Ipv6Addr) -> bool {
+    let s = v6.segments();
+    s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1
+}
+
 /// Whether `ip` is reachable on the public internet: not loopback,
 /// private, link-local, shared (CGNAT), unspecified, broadcast,
-/// documentation or multicast; IPv4-mapped IPv6 judged as its IPv4.
+/// documentation, benchmarking, IETF-assigned, reserved or multicast;
+/// IPv4-mapped and NAT64 (`64:ff9b::/96`) IPv6 judged as their IPv4, the
+/// local-use NAT64 prefix (`64:ff9b:1::/48`) never public.
 fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
+            let [a, b, c, _] = v4.octets();
             let shared_cgnat = a == 100 && (64..128).contains(&b);
+            let benchmarking = a == 198 && (b == 18 || b == 19);
+            let ietf_assigned = a == 192 && b == 0 && c == 0;
+            let reserved = a >= 240;
             !(v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
@@ -123,10 +149,14 @@ fn is_public_ip(ip: IpAddr) -> bool {
                 || v4.is_documentation()
                 || v4.is_multicast()
                 || shared_cgnat
+                || benchmarking
+                || ietf_assigned
+                || reserved
                 || a == 0)
         }
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped().or_else(|| nat64_ipv4(v6)) {
             Some(v4) => is_public_ip(IpAddr::V4(v4)),
+            None if is_local_use_nat64(v6) => false,
             None => {
                 !(v6.is_loopback()
                     || v6.is_unspecified()
@@ -141,7 +171,7 @@ fn is_public_ip(ip: IpAddr) -> bool {
 /// Adapter that exposes the Arlo snapshot as the domain
 /// [`ArloThumbnailSource`] port.
 pub struct ArloThumbnailSourceAdapter {
-    client: Arc<ArloClient>,
+    client: Arc<dyn ArloApi>,
     http: reqwest::Client,
     snapshots: Arc<SnapshotUrlCache>,
 }
@@ -154,6 +184,14 @@ impl ArloThumbnailSourceAdapter {
     #[must_use]
     pub fn new(
         client: Arc<ArloClient>,
+        http: reqwest::Client,
+        snapshots: Arc<SnapshotUrlCache>,
+    ) -> Self {
+        Self::with_api(client, http, snapshots)
+    }
+
+    pub(crate) fn with_api(
+        client: Arc<dyn ArloApi>,
         http: reqwest::Client,
         snapshots: Arc<SnapshotUrlCache>,
     ) -> Self {
@@ -176,7 +214,7 @@ impl ArloThumbnailSourceAdapter {
     /// The device list's presigned URL for `camera`, or `None` when the
     /// device has none or it is not an `https` URL with a host.
     async fn device_list_url(&self, camera: &CameraId) -> Result<Option<String>, DomainError> {
-        let devices = self.client.get_devices().await.map_err(arlo_to_domain)?;
+        let devices = self.client.devices().await.map_err(arlo_to_domain)?;
         let url = devices
             .iter()
             .find(|d| d.device_id == camera.as_str())
@@ -287,6 +325,8 @@ fn transport_error(what: &str, e: reqwest::Error) -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arlo_api::fake::{FakeArlo, Outcome, device};
+    use arlo_rs::models::api::Device;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -483,10 +523,23 @@ mod tests {
             "fe80::1",
             "ff02::1",
             "::ffff:192.168.1.1",
+            // NAT64 of a private address, and the local-use NAT64 prefix
+            // (third sweep, S3-L5).
+            "64:ff9b::c0a8:101",
+            "64:ff9b:1::1",
+            // Benchmarking, IETF protocol assignments, reserved.
+            "198.18.0.1",
+            "192.0.0.1",
+            "240.0.0.1",
         ] {
             assert!(!is_public_ip(ip.parse().unwrap()), "{ip} must be refused");
         }
-        for ip in ["52.216.0.1", "2600:1f18::1", "::ffff:52.216.0.1"] {
+        for ip in [
+            "52.216.0.1",
+            "2600:1f18::1",
+            "::ffff:52.216.0.1",
+            "64:ff9b::34d8:1",
+        ] {
             assert!(is_public_ip(ip.parse().unwrap()), "{ip} is public");
         }
     }
@@ -518,5 +571,56 @@ mod tests {
         .await;
         let err = policy_client.get(&url).send().await.unwrap_err();
         assert!(err.is_redirect(), "{err}");
+    }
+
+    fn adapter(fake: FakeArlo) -> ArloThumbnailSourceAdapter {
+        ArloThumbnailSourceAdapter::with_api(
+            Arc::new(fake),
+            test_client(),
+            Arc::new(SnapshotUrlCache::default()),
+        )
+    }
+
+    fn listing(url: Option<&str>) -> FakeArlo {
+        let fake = FakeArlo::with_devices(&[]);
+        *fake.devices.lock().unwrap() = vec![Device {
+            presigned_last_image_url: url.map(str::to_string),
+            ..device("CAM1")
+        }];
+        fake
+    }
+
+    #[tokio::test]
+    async fn no_thumbnail_when_the_device_list_has_none() {
+        let thumb = adapter(listing(None)).last_thumbnail(&cam()).await.unwrap();
+        assert!(thumb.is_none());
+    }
+
+    /// A cloud-supplied URL into the LAN or over plain http is never
+    /// fetched.
+    #[tokio::test]
+    async fn a_device_list_url_that_is_not_https_to_a_public_host_is_refused() {
+        for url in [
+            "http://arlolastimage-z1.arlo.com/x.jpg",
+            "https://192.168.1.1/x.jpg",
+        ] {
+            let thumb = adapter(listing(Some(url)))
+                .last_thumbnail(&cam())
+                .await
+                .unwrap();
+            assert!(thumb.is_none(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_device_list_is_an_adapter_error() {
+        let err = adapter(FakeArlo {
+            devices_outcome: Outcome::Fails,
+            ..FakeArlo::with_devices(&["CAM1"])
+        })
+        .last_thumbnail(&cam())
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DomainError::AdapterTransport(_)), "{err:?}");
     }
 }

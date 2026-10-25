@@ -10,6 +10,7 @@
 #        ARLO_PASSWORD=…
 #        ARLO_IMAP_PASSWORD=…     # only for an IMAP mailbox second factor
 #        STREAMER_ADMIN_TOKEN=…   # at least 16 bytes: openssl rand -hex 32
+#        STREAMER_MQTT_PASSWORD=… # only with [mqtt]: your broker user's password
 #   3. The one interactive login, which pairs the second factor, stores the
 #      session in the data volume and lists the device ids:
 #        docker compose run --rm arlo-camera-streamer list-devices --config /etc/arlo-streamer/streamer.toml
@@ -29,7 +30,7 @@ services:
   arlo-camera-streamer:
     # Pin a release; `latest` follows the newest one. Same image on
     # docker.io/ypno/arlo-camera-streamer-rs. amd64 and arm64.
-    image: ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.1
+    image: ghcr.io/ypno/arlo-camera-streamer-rs:v0.3.0
     container_name: arlo-camera-streamer
     # A non-zero exit means the daemon stopped on its own (the Arlo event bus
     # ended, a camera task died) after releasing every live session. A failed
@@ -62,10 +63,12 @@ services:
       # - "127.0.0.1:9090:9090"
       # - "127.0.0.1:9091:9091"
     # Hardware H.264 encoder for video_encoder = "auto". Uncomment what the
-    # box has; the boot log names the winner: `video encoder (auto) encoder=…`.
-    # The device must be usable by uid 10001, so add the group that owns it
-    # on the host, by number: `getent group render` (VA-API) or
-    # `getent group video` (Raspberry Pi).
+    # box has (or put it in a docker-compose.override.yml beside this file,
+    # gitignored); the boot log names the winner: `video encoder (auto)
+    # encoder=…`. The device must be usable by uid 10001, so add the group
+    # that owns it on the host, by number: `getent group render` (VA-API) or
+    # `getent group video` (Raspberry Pi). Rootless podman cannot map that
+    # group: put your user in it and use `- keep-groups` instead.
     # devices:
     #   - /dev/dri:/dev/dri            # Intel / AMD GPU (VA-API)
     #   - /dev/video11:/dev/video11    # Raspberry Pi 4 / Zero 2 / CM4
@@ -79,10 +82,6 @@ services:
     #         - driver: nvidia
     #           count: 1
     #           capabilities: [gpu, video]
-    devices:
-      - /dev/dri/renderD128:/dev/dri/renderD128
-    group_add:
-      - "992"
     read_only: true
     tmpfs:
       - /tmp
@@ -96,3 +95,35 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Opt-in web server for the HLS output, off by default:
+  #   docker compose --profile hls up -d
+  # Needs [output.hls] dir = "/var/lib/arlo-streamer/hls" in the config.
+  # Playlists: http://<host>:8080/hls/<stream_name>/index.m3u8
+  # Web pages a LAN browser opens can reach this port, unlike the RTSP one:
+  # deploy/nginx-hls.conf answers only local host names and no other
+  # origin. HLS_PUBLISH in .env binds it to one address, e.g.
+  # HLS_PUBLISH=192.168.1.10:8080 (all interfaces by default).
+  hls:
+    profiles: [hls]
+    image: docker.io/nginxinc/nginx-unprivileged:1.30.5-alpine@sha256:15c994d10d6d78658721c3bcafff14cb281fba2a4bdf9d5ba92c416a472516e3
+    container_name: arlo-camera-streamer-hls
+    restart: unless-stopped
+    # The daemon's own uid, so the segments it writes are readable here.
+    user: "10001:10001"
+    volumes:
+      - ./data/hls:/usr/share/nginx/html/hls:ro
+      - ./deploy/nginx-hls.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "${HLS_PUBLISH:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

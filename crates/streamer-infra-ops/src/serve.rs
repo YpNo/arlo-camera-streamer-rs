@@ -119,6 +119,7 @@ impl Slots {
     /// A slot for a connection from `ip`, or `None` when it must be
     /// refused.
     fn try_acquire(&self, ip: IpAddr) -> Option<Slot> {
+        let ip = peer_key(ip);
         if ip.is_loopback() {
             let permit = self
                 .shared
@@ -142,6 +143,19 @@ impl Slots {
             _permit: permit,
             peer: Some((self.per_peer.clone(), ip)),
         })
+    }
+}
+
+/// The address a peer is counted under: IPv4-mapped IPv6 as its IPv4 (so
+/// `::ffff:127.0.0.1` is loopback), other IPv6 per /64, the usual
+/// allocation to one host or LAN, which can rotate addresses within it.
+fn peer_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) if !v6.is_loopback() => {
+            let bits = u128::from(v6) & !u128::from(u64::MAX);
+            IpAddr::V6(std::net::Ipv6Addr::from(bits))
+        }
+        canonical => canonical,
     }
 }
 
@@ -387,6 +401,35 @@ mod tests {
         let reply = read_to_end(&mut health).await;
         assert!(String::from_utf8_lossy(&reply).ends_with("pong"));
         shutdown.cancel();
+    }
+
+    /// One IPv6 host rotating its addresses within its /64 filled every
+    /// slot, and a v4-mapped loopback peer was treated as remote (third
+    /// sweep, S3-L3).
+    #[test]
+    fn slots_count_an_ipv6_peer_per_64_and_map_v4_loopback() {
+        let slots = Slots::new(&ServeLimits {
+            max_connections: 8,
+            max_per_peer: 2,
+            loopback_reserve: 1,
+            ..ServeLimits::default()
+        });
+        let host = |last: &str| format!("2001:db8:1:2::{last}").parse::<IpAddr>().unwrap();
+        let _one = slots.try_acquire(host("1")).expect("first");
+        let _two = slots
+            .try_acquire(host("2"))
+            .expect("second address, same /64");
+        assert!(slots.try_acquire(host("3")).is_none(), "the /64 holds two");
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(slots.try_acquire(other).is_some(), "another /64");
+
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let held: Vec<_> = (0..4).filter_map(|_| slots.try_acquire(mapped)).collect();
+        assert_eq!(
+            held.len(),
+            4,
+            "v4-mapped loopback is loopback: no per-peer cap"
+        );
     }
 
     #[test]

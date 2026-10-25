@@ -21,6 +21,13 @@ pub enum CameraEvent {
         /// Camera that triggered the event.
         device_id: CameraId,
     },
+    /// Someone rang a video doorbell. Same handling as motion; it also
+    /// reaches an account the doorbell is shared with, which Arlo never
+    /// sends the doorbell's motion to.
+    Ring {
+        /// Doorbell that was rung.
+        device_id: CameraId,
+    },
     /// The user opened a live view in the Arlo app
     /// (`activityState == "userStreamActive"`). Observed only: Arlo
     /// refuses a second transport while the app streams, so motion
@@ -61,6 +68,7 @@ impl CameraEvent {
         match self {
             Self::Motion { device_id }
             | Self::Audio { device_id }
+            | Self::Ring { device_id }
             | Self::ManualStream { device_id }
             | Self::ManualStreamEnded { device_id }
             | Self::SnapshotAvailable { device_id }
@@ -93,6 +101,9 @@ mod tests {
                 device_id: id.clone(),
             },
             CameraEvent::Audio {
+                device_id: id.clone(),
+            },
+            CameraEvent::Ring {
                 device_id: id.clone(),
             },
             CameraEvent::ManualStream {

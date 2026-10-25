@@ -319,7 +319,13 @@ mod tests {
             _signal: &str,
         ) {
         }
-        fn record_motion(&self, _camera: &CameraId, _outcome: streamer_domain::MotionOutcome) {}
+        fn record_motion(
+            &self,
+            _camera: &CameraId,
+            _trigger: &str,
+            _outcome: streamer_domain::MotionOutcome,
+        ) {
+        }
         fn record_budget(&self, _camera: &CameraId, _decision: streamer_domain::BudgetDecision) {}
         fn record_splice(
             &self,

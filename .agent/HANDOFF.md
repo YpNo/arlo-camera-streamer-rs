@@ -188,12 +188,12 @@ Open work is tracked in GitHub issue #3 (shipping 0.1.0, the live gates still
 owed, these ideas, loose ends). Update the issue, not only this list.
 
 1. ~~An MFA login skill~~ — done 2026-10-02 (`.agents/skills/arlo-mfa-login`).
-2. A reverse-engineering write-up: SDP shape, `sessionDisconnected` quirks,
-   TURN UDP-only observation, the User-Agent-keyed stream format and the
-   unframed packets of ADR 0007.
-3. Auto-populate `[[cameras]]` from the device inventory when the section is
-   empty (follow-up to item 5 above).
-4. Per-camera encoder or bitrate; MQTT state publishing for Home Assistant.
+2. ~~A reverse-engineering write-up~~ — done 2026-10-10
+   (`docs/arlo-protocol-notes.md`).
+3. ~~Auto-populate `[[cameras]]`~~ — done 2026-10-10 (an empty section
+   serves every camera on the account).
+4. ~~Per-camera encoder or bitrate~~ — done 2026-10-10. MQTT state
+   publishing for Home Assistant: in progress on `feat/0.3.0`.
 
 ---
 

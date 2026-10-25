@@ -65,7 +65,7 @@ pub struct Metrics {
     camera_state: IntGaugeVec,
     /// State-transition counter, labeled by `{camera, from, to, signal}`.
     state_transitions_total: IntCounterVec,
-    /// Motion / audio events received per camera, labeled by outcome.
+    /// Trigger pulses per camera, labeled by trigger and outcome.
     motion_events_total: IntCounterVec,
     /// Daily-budget decisions per camera, labeled by decision.
     budget_decisions_total: IntCounterVec,
@@ -143,9 +143,9 @@ impl Metrics {
         let motion_events_total = IntCounterVec::new(
             opts!(
                 "streamer_motion_events_total",
-                "Inbound motion / audio events, labeled by outcome."
+                "Inbound trigger pulses (motion, audio, ring, admin wake), labeled by trigger and outcome."
             ),
-            &["camera", "outcome"],
+            &["camera", "trigger", "outcome"],
         )?;
         let budget_decisions_total = IntCounterVec::new(
             opts!(
@@ -226,13 +226,22 @@ impl Metrics {
     }
 
     /// Pre-create the per-camera gauge rows so they appear at scrape
-    /// time even before any event has fired. Idempotent.
+    /// time even before any event has fired, with `idle` set: every
+    /// camera starts idle, and a camera that never changes state would
+    /// otherwise be reported in none. Call it once per camera, before
+    /// its first state change.
     pub fn prewarm_camera(&self, camera: &CameraId) {
         for state in STATE_LABELS {
-            let _ = self
-                .camera_state
-                .with_label_values(&[camera.as_str(), state]);
+            self.camera_state
+                .with_label_values(&[camera.as_str(), state])
+                .set(i64::from(*state == "idle"));
         }
+    }
+
+    /// Set the configured-cameras gauge, when the list is known only after
+    /// the login (an empty `[[cameras]]` filled from the account).
+    pub fn set_cameras_configured(&self, cameras: u32) {
+        self.cameras_configured.set(i64::from(cameras));
     }
 
     /// Update the Arlo-bus connectivity gauge.
@@ -307,9 +316,9 @@ impl MetricsRecorder for Metrics {
             .inc();
     }
 
-    fn record_motion(&self, camera: &CameraId, outcome: MotionOutcome) {
+    fn record_motion(&self, camera: &CameraId, trigger: &str, outcome: MotionOutcome) {
         self.motion_events_total
-            .with_label_values(&[camera.as_str(), outcome.as_label()])
+            .with_label_values(&[camera.as_str(), trigger, outcome.as_label()])
             .inc();
     }
 
@@ -414,6 +423,18 @@ mod tests {
         );
     }
 
+    /// An empty `[[cameras]]` is filled after the login.
+    #[test]
+    fn cameras_configured_can_be_set_once_known() {
+        let m = Metrics::new(0, "0.1.0").unwrap();
+        m.set_cameras_configured(3);
+        assert!(
+            m.render()
+                .unwrap()
+                .contains("streamer_cameras_configured 3")
+        );
+    }
+
     #[test]
     fn build_info_label_is_quoted() {
         let m = Metrics::new(1, "1.2.3-rc1").unwrap();
@@ -430,13 +451,17 @@ mod tests {
         CameraId::new(id)
     }
 
+    /// Every camera starts idle: a camera that never changed state was
+    /// reported in no state at all (2026-10-22, two of three cameras).
     #[test]
-    fn prewarm_camera_seeds_all_state_rows() {
+    fn prewarm_camera_seeds_every_state_row_with_idle_set() {
         let m = Metrics::new(1, "0.1.0").unwrap();
         m.prewarm_camera(&cam("CAM"));
         let out = m.render().unwrap();
         for state in STATE_LABELS {
-            let needle = format!("streamer_camera_state{{camera=\"CAM\",state=\"{state}\"}} 0");
+            let value = u8::from(*state == "idle");
+            let needle =
+                format!("streamer_camera_state{{camera=\"CAM\",state=\"{state}\"}} {value}");
             assert!(
                 out.contains(&needle),
                 "expected pre-warm row {needle}, got:\n{out}"
@@ -469,16 +494,20 @@ mod tests {
     fn record_motion_increments_per_outcome() {
         let m = Metrics::new(1, "0.1.0").unwrap();
         let id = cam("CAM");
-        m.record_motion(&id, MotionOutcome::Triggered);
-        m.record_motion(&id, MotionOutcome::Triggered);
-        m.record_motion(&id, MotionOutcome::Absorbed);
+        m.record_motion(&id, "motion", MotionOutcome::Triggered);
+        m.record_motion(&id, "motion", MotionOutcome::Triggered);
+        m.record_motion(&id, "motion", MotionOutcome::Absorbed);
+        m.record_motion(&id, "ring", MotionOutcome::Triggered);
         let out = m.render().unwrap();
-        assert!(
-            out.contains("streamer_motion_events_total{camera=\"CAM\",outcome=\"triggered\"} 2")
-        );
-        assert!(
-            out.contains("streamer_motion_events_total{camera=\"CAM\",outcome=\"absorbed\"} 1")
-        );
+        assert!(out.contains(
+            "streamer_motion_events_total{camera=\"CAM\",outcome=\"triggered\",trigger=\"motion\"} 2"
+        ));
+        assert!(out.contains(
+            "streamer_motion_events_total{camera=\"CAM\",outcome=\"triggered\",trigger=\"ring\"} 1"
+        ));
+        assert!(out.contains(
+            "streamer_motion_events_total{camera=\"CAM\",outcome=\"absorbed\",trigger=\"motion\"} 1"
+        ));
     }
 
     #[test]
@@ -547,6 +576,6 @@ mod tests {
         // Compile-time check that Metrics satisfies dyn MetricsRecorder.
         let m: Arc<dyn streamer_domain::port::MetricsRecorder> =
             Arc::new(Metrics::new(1, "0.1.0").unwrap());
-        m.record_motion(&cam("X"), MotionOutcome::Triggered);
+        m.record_motion(&cam("X"), "motion", MotionOutcome::Triggered);
     }
 }

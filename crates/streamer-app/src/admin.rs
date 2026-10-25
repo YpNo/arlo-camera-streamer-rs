@@ -37,9 +37,11 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 
+use bytes::Bytes;
 use streamer_domain::admin::{AdminError, CameraSnapshot, SystemSnapshot};
 use streamer_domain::camera::CameraId;
-use streamer_domain::port::AdminControl;
+use streamer_domain::error::DomainError;
+use streamer_domain::port::{AdminControl, MediaMultiplexer};
 
 /// Per-call admin timeout. The orchestrator should reply almost
 /// instantly (it's only handling one command between two select-loop
@@ -95,6 +97,8 @@ pub struct AdminControlActor {
     boot_instant: std::time::Instant,
     version: &'static str,
     arlo_connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Read for the idle frame's thumbnail; never asked to act.
+    media: Arc<dyn MediaMultiplexer>,
 }
 
 impl std::fmt::Debug for AdminControlActor {
@@ -112,17 +116,20 @@ impl std::fmt::Debug for AdminControlActor {
 impl AdminControlActor {
     /// Construct from a routing table built by `StreamerSystem`.
     /// `arlo_connected` is shared with the connection-status watcher
-    /// so the snapshot reflects the current bus state.
+    /// so the snapshot reflects the current bus state; `media` answers
+    /// the thumbnail reads.
     pub(crate) fn new(
         routes: HashMap<CameraId, AdminRoute>,
         version: &'static str,
         arlo_connected: Arc<std::sync::atomic::AtomicBool>,
+        media: Arc<dyn MediaMultiplexer>,
     ) -> Self {
         Self {
             routes: Arc::new(routes),
             boot_instant: std::time::Instant::now(),
             version,
             arlo_connected,
+            media,
         }
     }
 
@@ -185,6 +192,17 @@ impl AdminControl for AdminControlActor {
             .map_err(|_| AdminError::Unavailable("orchestrator dropped reply".to_string()))
     }
 
+    async fn thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, AdminError> {
+        self.route(camera)?;
+        self.media
+            .current_thumbnail(camera)
+            .await
+            .map_err(|e| match e {
+                DomainError::UnknownCamera(_) => AdminError::UnknownCamera(camera.clone()),
+                other => AdminError::Internal(other.to_string()),
+            })
+    }
+
     async fn manual_wake(&self, camera: &CameraId) -> Result<(), AdminError> {
         let route = self.route(camera)?;
         let (tx, rx) = oneshot::channel();
@@ -230,6 +248,112 @@ mod tests {
         }
     }
 
+    /// Holds the idle frames' thumbnails; nothing else is asked of it.
+    #[derive(Default)]
+    struct ThumbMedia {
+        thumbs: HashMap<CameraId, Bytes>,
+        fails: bool,
+    }
+
+    #[async_trait]
+    impl MediaMultiplexer for ThumbMedia {
+        async fn register(&self, _camera: &CameraId) -> Result<(), DomainError> {
+            Ok(())
+        }
+        async fn attach_live(
+            &self,
+            _camera: &CameraId,
+            _signaler: &dyn streamer_domain::port::WebrtcSignaler,
+        ) -> Result<streamer_domain::stream::LiveSession, DomainError> {
+            Err(DomainError::AdapterTransport("not in this stub".into()))
+        }
+        async fn attach_user_view(
+            &self,
+            _camera: &CameraId,
+            _url: &streamer_domain::stream::WatchAlongUrl,
+        ) -> Result<streamer_domain::stream::LiveSession, DomainError> {
+            Err(DomainError::AdapterTransport("not in this stub".into()))
+        }
+        async fn detach_live(&self, _camera: &CameraId) -> Result<(), DomainError> {
+            Ok(())
+        }
+        async fn refresh_thumbnail(
+            &self,
+            _camera: &CameraId,
+            _jpeg: Bytes,
+        ) -> Result<(), DomainError> {
+            Ok(())
+        }
+        async fn current_thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, DomainError> {
+            if self.fails {
+                return Err(DomainError::AdapterTransport("registry gone".into()));
+            }
+            Ok(self.thumbs.get(camera).cloned())
+        }
+        async fn set_user_view_notice(
+            &self,
+            _camera: &CameraId,
+            _shown: bool,
+        ) -> Result<(), DomainError> {
+            Ok(())
+        }
+    }
+
+    fn media() -> Arc<dyn MediaMultiplexer> {
+        Arc::new(ThumbMedia::default())
+    }
+
+    fn actor_with(media: ThumbMedia, cameras: &[&str]) -> AdminControlActor {
+        let routes = cameras
+            .iter()
+            .map(|id| (cam(id), silent_route(id, "idle").0))
+            .collect();
+        AdminControlActor::new(
+            routes,
+            "0.3.0",
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Arc::new(media),
+        )
+    }
+
+    #[tokio::test]
+    async fn thumbnail_is_the_idle_frames_for_a_configured_camera() {
+        let jpeg = Bytes::from_static(b"\xff\xd8jpeg");
+        let media = ThumbMedia {
+            thumbs: HashMap::from([(cam("CAM-A"), jpeg.clone())]),
+            ..ThumbMedia::default()
+        };
+        let actor = actor_with(media, &["CAM-A", "CAM-B"]);
+
+        assert_eq!(actor.thumbnail(&cam("CAM-A")).await.unwrap(), Some(jpeg));
+        assert_eq!(actor.thumbnail(&cam("CAM-B")).await.unwrap(), None);
+    }
+
+    /// An id outside the config is refused before the media is asked.
+    #[tokio::test]
+    async fn thumbnail_of_an_unconfigured_camera_is_unknown() {
+        let media = ThumbMedia {
+            thumbs: HashMap::from([(cam("GHOST"), Bytes::from_static(b"x"))]),
+            ..ThumbMedia::default()
+        };
+        let actor = actor_with(media, &["CAM-A"]);
+
+        let err = actor.thumbnail(&cam("GHOST")).await.unwrap_err();
+        assert!(matches!(err, AdminError::UnknownCamera(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_media_failure_is_an_internal_error() {
+        let media = ThumbMedia {
+            fails: true,
+            ..ThumbMedia::default()
+        };
+        let actor = actor_with(media, &["CAM-A"]);
+
+        let err = actor.thumbnail(&cam("CAM-A")).await.unwrap_err();
+        assert!(matches!(err, AdminError::Internal(_)), "{err:?}");
+    }
+
     /// A route whose orchestrator is silent: the admin mailbox is never
     /// read, the snapshot is whatever was last published.
     fn silent_route(id: &str, state: &str) -> (AdminRoute, mpsc::Receiver<AdminCommand>) {
@@ -250,6 +374,7 @@ mod tests {
             HashMap::new(),
             "0.1.0",
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            media(),
         );
         let err = actor.force_idle(&cam("MISSING")).await.unwrap_err();
         assert!(matches!(err, AdminError::UnknownCamera(_)));
@@ -266,6 +391,7 @@ mod tests {
             routes,
             "0.1.0",
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            media(),
         );
 
         let sys = actor.snapshot().await.expect("snapshot ok");
@@ -287,6 +413,7 @@ mod tests {
             routes,
             "0.1.0",
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            media(),
         );
 
         let started = std::time::Instant::now();
@@ -311,6 +438,7 @@ mod tests {
             routes,
             "0.1.0",
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            media(),
         );
 
         assert_eq!(
@@ -344,6 +472,7 @@ mod tests {
             routes,
             "0.1.0",
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            media(),
         );
         actor.force_idle(&cam("CAM")).await.expect("ack");
     }
@@ -368,6 +497,7 @@ mod tests {
             routes,
             "0.1.0",
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            media(),
         );
         actor.manual_wake(&cam("CAM")).await.expect("ack");
     }
@@ -378,6 +508,7 @@ mod tests {
             HashMap::new(),
             "0.1.0",
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            media(),
         );
         let s = format!("{actor:?}");
         assert!(s.contains("cameras"));
@@ -405,6 +536,7 @@ mod tests {
             routes,
             "test",
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            media(),
         );
         let err = actor.manual_wake(&CameraId::new("CAM")).await.unwrap_err();
         assert!(

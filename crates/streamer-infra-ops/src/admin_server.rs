@@ -6,6 +6,7 @@
 //! |--------|-------------------------------|-----------------------------------|
 //! | GET    | `/admin/state`                | System-wide snapshot (JSON).      |
 //! | GET    | `/admin/cameras/{id}`         | One-camera snapshot (JSON).       |
+//! | GET    | `/admin/cameras/{id}/thumbnail.jpg` | The idle frame's thumbnail (JPEG); 404 before the first. |
 //! | POST   | `/admin/cameras/{id}/wake`   | Inject a synthetic motion event.  |
 //! | POST   | `/admin/cameras/{id}/idle`   | Force the camera back to `Idle`.  |
 //!
@@ -59,6 +60,18 @@ const REJECTION_WARN_INTERVAL: Duration = Duration::from_mins(1);
 /// Peers remembered for the rejection rate limit; the map is cleared past
 /// it, so a scan from many addresses cannot grow it without bound.
 const MAX_TRACKED_PEERS: usize = 1024;
+/// Wrong tokens one peer may present per [`REJECTION_WARN_INTERVAL`];
+/// past it the peer gets 429 without a comparison until the interval
+/// ends (third sweep, S3-L2: guesses were limited only in the log).
+const MAX_FAILURES_PER_WINDOW: u32 = 10;
+
+/// One peer's recent rejections.
+#[derive(Debug, Clone, Copy)]
+struct PeerRejections {
+    window_start: Instant,
+    failures: u32,
+    warned_at: Option<Instant>,
+}
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -68,7 +81,7 @@ struct AppState {
     /// on drop, never printed) and exposed only for the comparison.
     token: Arc<SecretString>,
     /// When each peer's last rejection was logged at `warn`.
-    rejections: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    rejections: Arc<Mutex<HashMap<IpAddr, PeerRejections>>>,
 }
 
 /// Errors raised by [`AdminServer::new`].
@@ -158,6 +171,7 @@ impl AdminServer {
         Router::new()
             .route("/admin/state", get(handle_state))
             .route("/admin/cameras/{id}", get(handle_camera_state))
+            .route("/admin/cameras/{id}/thumbnail.jpg", get(handle_thumbnail))
             .route("/admin/cameras/{id}/wake", post(handle_wake))
             .route("/admin/cameras/{id}/idle", post(handle_idle))
             .route_layer(middleware::from_fn_with_state(
@@ -186,6 +200,14 @@ impl AdminServer {
 /// The authentication layer over every admin route: a request without the
 /// right bearer token gets the 401 before any extractor or handler runs.
 async fn require_bearer(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr);
+    if peer.is_some_and(|p| is_locked_out(&state.rejections, p.ip())) {
+        debug!(peer = ?peer, "admin: too many wrong tokens; refused without a comparison");
+        return too_many_failures();
+    }
     if check_auth(req.headers(), &state.token).is_some() {
         return next.run(req).await;
     }
@@ -194,11 +216,28 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
         .get::<MatchedPath>()
         .map_or("?", MatchedPath::as_str)
         .to_owned();
-    let peer = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| *addr);
     unauthorized(&state, req.method().as_str(), &route, peer)
+}
+
+/// The 429 for a peer past [`MAX_FAILURES_PER_WINDOW`]; the connection
+/// is closed, so pipelined guesses on it stop too.
+fn too_many_failures() -> Response {
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, "too many failed attempts").into_response();
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::RETRY_AFTER,
+        HeaderValue::from(REJECTION_WARN_INTERVAL.as_secs()),
+    );
+    headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
+    resp
+}
+
+/// Whether `ip` presented too many wrong tokens in the current interval.
+fn is_locked_out(rejections: &Mutex<HashMap<IpAddr, PeerRejections>>, ip: IpAddr) -> bool {
+    let seen = rejections.lock().unwrap_or_else(PoisonError::into_inner);
+    seen.get(&ip).is_some_and(|r| {
+        r.window_start.elapsed() < REJECTION_WARN_INTERVAL && r.failures >= MAX_FAILURES_PER_WINDOW
+    })
 }
 
 /// Constant-time comparison of two byte slices (`subtle`). Returns
@@ -234,7 +273,7 @@ fn bad_camera_id(e: &streamer_domain::error::DomainError) -> Response {
 /// per peer, at `debug` in between.
 fn unauthorized(state: &AppState, method: &str, route: &str, peer: Option<SocketAddr>) -> Response {
     let ip = peer.map(|p| p.ip());
-    if should_warn(&state.rejections, ip) {
+    if record_rejection(&state.rejections, ip) {
         warn!(method, route, peer = ?peer, "admin: rejected unauthenticated request (next report for this peer in a minute at most)");
     } else {
         debug!(method, route, peer = ?peer, "admin: rejected unauthenticated request");
@@ -245,24 +284,38 @@ fn unauthorized(state: &AppState, method: &str, route: &str, peer: Option<Socket
     resp
 }
 
-/// Whether a rejection from `ip` gets a `warn` line now.
-fn should_warn(rejections: &Mutex<HashMap<IpAddr, Instant>>, ip: Option<IpAddr>) -> bool {
+/// Count a rejection from `ip`; whether it gets a `warn` line now (at
+/// most once per [`REJECTION_WARN_INTERVAL`] per peer). An unknown peer
+/// always warns and is not counted.
+fn record_rejection(
+    rejections: &Mutex<HashMap<IpAddr, PeerRejections>>,
+    ip: Option<IpAddr>,
+) -> bool {
     let Some(ip) = ip else {
         return true;
     };
     let now = Instant::now();
     let mut seen = rejections.lock().unwrap_or_else(PoisonError::into_inner);
-    if seen
-        .get(&ip)
-        .is_some_and(|at| now.duration_since(*at) < REJECTION_WARN_INTERVAL)
-    {
-        return false;
-    }
-    if seen.len() >= MAX_TRACKED_PEERS {
+    if seen.len() >= MAX_TRACKED_PEERS && !seen.contains_key(&ip) {
         seen.clear();
     }
-    seen.insert(ip, now);
-    true
+    let entry = seen.entry(ip).or_insert(PeerRejections {
+        window_start: now,
+        failures: 0,
+        warned_at: None,
+    });
+    if now.duration_since(entry.window_start) >= REJECTION_WARN_INTERVAL {
+        entry.window_start = now;
+        entry.failures = 0;
+    }
+    entry.failures = entry.failures.saturating_add(1);
+    let warn = entry
+        .warned_at
+        .is_none_or(|at| now.duration_since(at) >= REJECTION_WARN_INTERVAL);
+    if warn {
+        entry.warned_at = Some(now);
+    }
+    warn
 }
 
 fn admin_error_to_response(err: AdminError) -> Response {
@@ -321,6 +374,30 @@ async fn handle_camera_state(State(state): State<AppState>, Path(id): Path<Strin
     debug!(camera = %id, "GET /admin/cameras/{id}");
     match state.admin.camera_snapshot(&id).await {
         Ok(s) => json_response(&s),
+        Err(e) => admin_error_to_response(e),
+    }
+}
+
+/// The JPEG the camera's idle frame shows. Read from the daemon's own
+/// copy: no request reaches Arlo or the camera.
+async fn handle_thumbnail(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let id = match CameraId::parse(&id) {
+        Ok(id) => id,
+        Err(e) => return bad_camera_id(&e),
+    };
+    debug!(camera = %id, "GET /admin/cameras/{id}/thumbnail.jpg");
+    match state.admin.thumbnail(&id).await {
+        Ok(Some(jpeg)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "no-store"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            jpeg,
+        )
+            .into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no thumbnail yet").into_response(),
         Err(e) => admin_error_to_response(e),
     }
 }
@@ -410,6 +487,16 @@ mod tests {
                 .push(camera.as_str().to_string());
             Ok(())
         }
+        async fn thumbnail(
+            &self,
+            camera: &CameraId,
+        ) -> Result<Option<axum::body::Bytes>, AdminError> {
+            match camera.as_str() {
+                "MISSING" => Err(AdminError::UnknownCamera(camera.clone())),
+                "NO_THUMB" => Ok(None),
+                _ => Ok(Some(axum::body::Bytes::from_static(b"\xff\xd8jpeg"))),
+            }
+        }
         async fn manual_wake(&self, camera: &CameraId) -> Result<(), AdminError> {
             self.wake_calls
                 .lock()
@@ -446,6 +533,7 @@ mod tests {
         let (server, admin) = make_server();
         for (method, uri) in [
             ("GET", "/admin/cameras/..%2F..%2Fetc"),
+            ("GET", "/admin/cameras/..%2F..%2Fetc/thumbnail.jpg"),
             ("POST", "/admin/cameras/forged%0Aline/wake"),
             ("POST", "/admin/cameras/a%20b/idle"),
         ] {
@@ -510,6 +598,64 @@ mod tests {
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let parsed: SystemSnapshot = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.version, "test");
+    }
+
+    async fn get_authed(server: &AdminServer, uri: &str) -> Response {
+        server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(String::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn thumbnail_is_served_as_an_uncached_jpeg() {
+        let (server, _admin) = make_server();
+
+        let response = get_authed(&server, "/admin/cameras/CAM1/thumbnail.jpg").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(headers[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(&body[..], b"\xff\xd8jpeg");
+    }
+
+    #[tokio::test]
+    async fn thumbnail_is_404_before_the_first_and_for_an_unknown_camera() {
+        let (server, _admin) = make_server();
+        for uri in [
+            "/admin/cameras/NO_THUMB/thumbnail.jpg",
+            "/admin/cameras/MISSING/thumbnail.jpg",
+        ] {
+            let response = get_authed(&server, uri).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    /// Behind the same bearer layer as every admin route.
+    #[tokio::test]
+    async fn thumbnail_requires_bearer_auth() {
+        let (server, _admin) = make_server();
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/cameras/CAM1/thumbnail.jpg")
+                    .body(String::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -712,9 +858,61 @@ mod tests {
         let seen = std::sync::Mutex::new(HashMap::new());
         let a: IpAddr = "192.0.2.1".parse().unwrap();
         let b: IpAddr = "192.0.2.2".parse().unwrap();
-        assert!(should_warn(&seen, Some(a)));
-        assert!(!should_warn(&seen, Some(a)), "same peer within the minute");
-        assert!(should_warn(&seen, Some(b)), "another peer");
-        assert!(should_warn(&seen, None), "an unknown peer always warns");
+        assert!(record_rejection(&seen, Some(a)));
+        assert!(
+            !record_rejection(&seen, Some(a)),
+            "same peer within the minute"
+        );
+        assert!(record_rejection(&seen, Some(b)), "another peer");
+        assert!(
+            record_rejection(&seen, None),
+            "an unknown peer always warns"
+        );
+    }
+
+    /// Wrong tokens were throttled in the log only: a peer could guess as
+    /// fast as it could pipeline requests (third sweep, S3-L2). Past the
+    /// limit it gets 429, and the token is not even compared.
+    #[tokio::test]
+    async fn a_peer_guessing_tokens_is_turned_away_and_others_are_not() {
+        let server = AdminServer::new(StubAdmin::arc(), SecretString::from(TOKEN)).unwrap();
+        let router = server.router();
+        let from = |peer: &str, token: &str| {
+            let mut req = Request::builder()
+                .uri("/admin/state")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(String::new())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+            req
+        };
+        for _ in 0..MAX_FAILURES_PER_WINDOW {
+            let response = router
+                .clone()
+                .oneshot(from("192.0.2.7:4000", "wrong-token-of-enough-bytes"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        for token in ["wrong-token-of-enough-bytes", TOKEN] {
+            let response = router
+                .clone()
+                .oneshot(from("192.0.2.7:4001", token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers().get(header::CONNECTION).unwrap(), "close");
+        }
+        let other = router
+            .clone()
+            .oneshot(from("192.0.2.8:4000", TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(
+            other.status(),
+            StatusCode::OK,
+            "another peer is not affected"
+        );
     }
 }

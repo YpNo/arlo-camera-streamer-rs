@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use secrecy::SecretString;
 use streamer_app::system::StreamerSystem;
-use streamer_domain::config::StreamerConfig;
+use streamer_domain::config::{StreamerConfig, VideoEncoder};
 use streamer_domain::error::DomainError;
 use streamer_domain::event::ConnectionStatus;
 use streamer_domain::port::{
@@ -64,8 +64,10 @@ use streamer_infra_arlo::{
     ArloClient, ArloEventSourceAdapter, ArloThumbnailSourceAdapter, ArloUserViewSourceAdapter,
     ArloWebrtcSignalerAdapter, DeviceRegistry, LoginBackoff, SnapshotUrlCache, boot::boot,
 };
+use streamer_infra_media::encoder::{EncoderBackend, EncoderPlan, VideoEncoding};
 use streamer_infra_media::{GstMediaMultiplexer, GstPipelineRegistry, RtspServer};
 use streamer_infra_ops::admin_server::check_admin_token;
+use streamer_infra_ops::mqtt::MqttSetup;
 use streamer_infra_ops::{AdminServer, Metrics, OpsServer, Readiness};
 
 use crate::signals::ShutdownSignals;
@@ -107,8 +109,28 @@ struct Cli {
         default_value = "/etc/arlo-streamer/streamer.toml"
     )]
     config: PathBuf,
+    /// Log line format: `text` for a terminal, `json` (one object per
+    /// line) for a log pipeline.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        env = "STREAMER_LOG_FORMAT",
+        default_value_t = LogFormat::Text
+    )]
+    log_format: LogFormat,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// How log lines are written to stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum LogFormat {
+    /// Human-readable lines.
+    Text,
+    /// One JSON object per line: `timestamp`, `level`, `target`, the
+    /// event's fields at the top level, and the enclosing `spans`.
+    Json,
 }
 
 #[derive(Debug, Clone, Copy, Subcommand)]
@@ -144,7 +166,7 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing()?;
+    init_tracing(cli.log_format)?;
     let config = load_config(&cli.config).await?;
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run_daemon(config).await,
@@ -170,24 +192,134 @@ async fn run_daemon(config: StreamerConfig) -> Result<()> {
         "configuration loaded"
     );
     if let Err(e) = run(config, signals).await {
-        error!(error = %e, "fatal error");
+        log_fatal(&e);
         return Err(e);
     }
     Ok(())
 }
 
-async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()> {
-    // -- GStreamer, before the Arlo login --
-    //
-    // A missing plugin otherwise shows only as a media torn down at each
-    // client connection, and a boot failure after the login costs one
-    // login per restart.
+/// The GStreamer side of the boot, before the Arlo login: every element
+/// the pipelines use, then each encoder setting the config uses probed
+/// on this host (ADR 0008: `auto` takes the first working backend, an
+/// explicit one must work or the boot fails). A missing plugin otherwise
+/// shows only as a media torn down at each client connection, and a boot
+/// failure after the login costs one login per restart.
+async fn prepare_gstreamer(config: &StreamerConfig) -> Result<EncoderPlan> {
     streamer_infra_media::elements::check(config.output.hls.is_some())
         .context("GStreamer plugins")?;
-    // The encoder is probed on this host (ADR 0008): `auto` takes the first
-    // working backend, an explicit one must work or the boot fails here.
-    let video_encoder = streamer_infra_media::encoder::resolve(config.output.video_encoder)
-        .context("no usable H.264 encoder")?;
+    let output = config.output.video_encoder;
+    let others = camera_encoder_settings(config);
+    // The dry runs block: off the runtime's worker threads.
+    let (output_backend, others) = tokio::task::spawn_blocking(move || {
+        let output_backend = streamer_infra_media::encoder::resolve(output)?;
+        let others = others
+            .into_iter()
+            .map(|setting| {
+                streamer_infra_media::encoder::resolve(setting).map(|backend| (setting, backend))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, streamer_infra_media::MediaError>((output_backend, others))
+    })
+    .await
+    .context("encoder probe task")?
+    .context("no usable H.264 encoder")?;
+    Ok(encoder_plan(config, output_backend, &others))
+}
+
+/// The cameras' own encoder settings that differ from the output's, each
+/// once: three cameras on `va` cost one probe.
+fn camera_encoder_settings(config: &StreamerConfig) -> Vec<VideoEncoder> {
+    let mut settings = Vec::new();
+    for setting in config.cameras.iter().filter_map(|c| c.video_encoder) {
+        if setting != config.output.video_encoder && !settings.contains(&setting) {
+            settings.push(setting);
+        }
+    }
+    settings
+}
+
+/// Every camera's encoder and bitrate: the output's, or the camera's own
+/// setting resolved in `others`. Only the cameras that differ are logged
+/// and listed.
+fn encoder_plan(
+    config: &StreamerConfig,
+    output: EncoderBackend,
+    others: &[(VideoEncoder, EncoderBackend)],
+) -> EncoderPlan {
+    let backend_for = |setting: VideoEncoder| {
+        others
+            .iter()
+            .find(|(resolved, _)| *resolved == setting)
+            .map_or(output, |(_, backend)| *backend)
+    };
+    let default = VideoEncoding {
+        backend: output,
+        bitrate_kbps: config.output.bitrate_kbps,
+    };
+    config
+        .cameras
+        .iter()
+        .fold(EncoderPlan::uniform(default), |plan, camera| {
+            let encoding = VideoEncoding {
+                backend: backend_for(camera.video_encoder_or(&config.output)),
+                bitrate_kbps: camera.bitrate_kbps_or(&config.output),
+            };
+            if encoding == default {
+                return plan;
+            }
+            info!(
+                camera = %camera.arlo_device_id,
+                encoder = encoding.backend.label(),
+                element = %encoding.backend.describe(),
+                bitrate_kbps = encoding.bitrate_kbps,
+                "camera encoding"
+            );
+            plan.with_camera(camera.arlo_device_id.clone(), encoding)
+        })
+}
+
+/// The MQTT adapter's setup when `[mqtt]` is configured, checked before
+/// the Arlo login: the URL, the password's env var, the CA file and the
+/// TLS setup.
+async fn prepare_mqtt(config: &StreamerConfig) -> Result<Option<MqttSetup>> {
+    let Some(mqtt) = &config.mqtt else {
+        return Ok(None);
+    };
+    let password = match &mqtt.password_env {
+        // VarError::NotUnicode prints the value: not passed on.
+        Some(name) => Some(SecretString::from(std::env::var(name).map_err(|_| {
+            anyhow::anyhow!("env var {name} (mqtt.password_env) is not set or not UTF-8")
+        })?)),
+        None => None,
+    };
+    let ca_pem = match &mqtt.ca_file {
+        Some(path) => Some(
+            tokio::fs::read(path)
+                .await
+                .with_context(|| format!("mqtt.ca_file {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let state_dir = config
+        .arlo
+        .session_cache_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let setup = MqttSetup::new(
+        mqtt,
+        password,
+        ca_pem.as_deref(),
+        state_dir,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .context("MQTT")?;
+    info!(url = %mqtt.url, base_topic = %mqtt.base_topic, "MQTT state publishing on");
+    Ok(Some(setup))
+}
+
+async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()> {
+    let encoders = prepare_gstreamer(&config).await?;
+    let mqtt = prepare_mqtt(&config).await?;
 
     // -- Observability handles --
     let cameras_count = u32::try_from(config.cameras.len()).unwrap_or(u32::MAX);
@@ -213,6 +345,14 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
     // is up.
     let ops_listener = bind_listener("metrics_bind", &config.output.metrics_bind).await?;
     let admin_listener = bind_listener("admin_bind", &config.output.admin_bind).await?;
+    // The RTSP port and the relay's TLS policy too: either failing after
+    // a successful login made a restart policy log in to Arlo at every
+    // restart (third sweep, S3-Z1), and neither needs Arlo.
+    let rtsp_server =
+        RtspServer::start(&config.output.rtsp.bind).context("failed to start RTSP server")?;
+    let relay_tls =
+        streamer_infra_media::RelayTls::from_config(config.arlo.watch_along_cert_sha256.as_deref())
+            .context("watch-along TLS policy")?;
     let ops_shutdown = CancellationToken::new();
     let ops_server = OpsServer::new(metrics.clone(), readiness.clone());
     let ops_task = {
@@ -246,6 +386,7 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
         info!("stopped before the Arlo login");
         return Ok(());
     };
+    let config = with_account_cameras(config, &arlo_client, &metrics).await?;
     let ArloAdapters {
         event_source,
         signaler,
@@ -254,16 +395,11 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
     } = arlo_adapters(&config, arlo_client)?;
 
     // -- Media adapter --
-    let rtsp_server =
-        RtspServer::start(&config.output.rtsp.bind).context("failed to start RTSP server")?;
     let pipeline_registry = Arc::new(GstPipelineRegistry::new(
         rtsp_server.clone(),
-        video_encoder,
+        encoders,
         thumbnail_dir,
     ));
-    let relay_tls =
-        streamer_infra_media::RelayTls::from_config(config.arlo.watch_along_cert_sha256.as_deref())
-            .context("watch-along TLS policy")?;
     let media: Arc<dyn streamer_domain::port::MediaMultiplexer> =
         Arc::new(GstMediaMultiplexer::new(
             pipeline_registry.clone(),
@@ -291,6 +427,9 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
     let shutdown = system.cancellation_token();
     let arlo_connected_flag = system.arlo_connected_flag();
     let admin_actor: Arc<dyn AdminControl> = Arc::new(system.admin_control());
+    // Its own stop, given after the cameras are released.
+    let mqtt_stop = CancellationToken::new();
+    let mqtt_task = mqtt.map(|setup| setup.spawn(admin_actor.clone(), mqtt_stop.clone()));
 
     // -- Background watchers --
     let conn_task = spawn_connection_watcher(
@@ -347,6 +486,13 @@ async fn run(config: StreamerConfig, mut signals: ShutdownSignals) -> Result<()>
     // even during the drain, makes the exit non-zero.
     let panics = system.panic_counter();
     drain_stage("streamer-system", system.shutdown()).await;
+    drain_stage("mqtt", async {
+        mqtt_stop.cancel();
+        if let Some(task) = mqtt_task {
+            let _ = task.await;
+        }
+    })
+    .await;
     drain_stage("connection-watcher", async {
         let _ = conn_task.await;
     })
@@ -549,6 +695,42 @@ async fn pause_unless_stopped(pause: Duration, signals: &mut ShutdownSignals) ->
     }
 }
 
+/// An empty `[[cameras]]` serves every camera on the account, named
+/// after the device (as `list-devices` would suggest). A config that
+/// lists cameras is returned as is.
+async fn with_account_cameras(
+    mut config: StreamerConfig,
+    client: &ArloClient,
+    metrics: &Metrics,
+) -> Result<StreamerConfig> {
+    if !config.cameras.is_empty() {
+        return Ok(config);
+    }
+    let devices = streamer_infra_arlo::discover_devices(client)
+        .await
+        .context("listing the account's cameras for an empty [[cameras]]")?;
+    anyhow::ensure!(
+        !devices.is_empty(),
+        "no [[cameras]] configured and the Arlo account has no camera"
+    );
+    config.cameras = streamer_domain::config::CameraConfig::for_devices(&devices);
+    warn!(
+        cameras = config.cameras.len(),
+        "no [[cameras]] configured: serving every camera on the account; \
+         list the ones to serve to choose (list-devices prints them)"
+    );
+    for camera in &config.cameras {
+        info!(
+            camera = %camera.arlo_device_id,
+            stream_name = %camera.stream_name,
+            "camera from the account"
+        );
+        metrics.prewarm_camera(&camera.arlo_device_id);
+    }
+    metrics.set_cameras_configured(u32::try_from(config.cameras.len()).unwrap_or(u32::MAX));
+    Ok(config)
+}
+
 fn arlo_adapters(config: &StreamerConfig, arlo_client: Arc<ArloClient>) -> Result<ArloAdapters> {
     // One shared HTTP client (https only, bounded in time and redirects)
     // so connection pooling kicks in across cameras when fetching
@@ -634,19 +816,51 @@ fn line_and_column(text: &str, offset: usize) -> String {
     format!(" (line {line}, column {column})")
 }
 
-fn init_tracing() -> Result<()> {
+fn init_tracing(format: LogFormat) -> Result<()> {
     let (filter, invalid) = log_filter(std::env::var(EnvFilter::DEFAULT_ENV).ok());
-    // stderr keeps stdout for command output (`list-devices`).
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_writer(std::io::stderr)
-        .try_init()
+    // stderr keeps stdout for command output (`list-devices`). Colours
+    // only on a terminal: a container log or a file got escape codes.
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    tracing::subscriber::set_global_default(subscriber(format, filter, ansi, std::io::stderr))
         .map_err(|e| anyhow::anyhow!("failed to init tracing: {e}"))?;
     if let Some(e) = invalid {
         warn!(error = %e, "RUST_LOG does not parse; logging at {FALLBACK_LOG_FILTER}");
     }
     Ok(())
+}
+
+/// Log the error that ends the daemon with its whole cause chain: the
+/// outer context alone (`GStreamer plugins`) said what failed, not why.
+fn log_fatal(e: &anyhow::Error) {
+    error!(error = %format_args!("{e:#}"), "fatal error");
+}
+
+/// The log subscriber for `format`, writing through `writer`; `ansi`
+/// colours the text format.
+fn subscriber<W>(
+    format: LogFormat,
+    filter: EnvFilter,
+    ansi: bool,
+    writer: W,
+) -> Box<dyn tracing::Subscriber + Send + Sync>
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_writer(writer);
+    match format {
+        LogFormat::Text => Box::new(builder.with_ansi(ansi).finish()),
+        LogFormat::Json => Box::new(
+            builder
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(true)
+                .finish(),
+        ),
+    }
 }
 
 /// The filter for `RUST_LOG`: the default when unset, and plain `info`
@@ -665,6 +879,176 @@ fn log_filter(spec: Option<String>) -> (EnvFilter, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// A writer appending to a shared buffer.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Emit one event inside a span through `format`; returns what was
+    /// written.
+    fn log_line(format: LogFormat) -> String {
+        let capture = Capture::default();
+        let out = capture.0.clone();
+        let sub = subscriber(format, EnvFilter::new("info"), false, move || {
+            capture.clone()
+        });
+        tracing::subscriber::with_default(sub, || {
+            let span = tracing::info_span!("run", camera = "CAM1");
+            let _entered = span.enter();
+            info!(attempt = 2, "live attached");
+        });
+        let bytes = out.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn example_config() -> StreamerConfig {
+        toml::from_str(include_str!("../../../config/streamer.example.toml")).expect("parses")
+    }
+
+    fn camera(
+        id: &str,
+        setting: Option<VideoEncoder>,
+        kbps: Option<u32>,
+    ) -> streamer_domain::config::CameraConfig {
+        streamer_domain::config::CameraConfig {
+            arlo_device_id: streamer_domain::camera::CameraId::new(id),
+            stream_name: streamer_domain::camera::StreamName::parse(id.to_lowercase())
+                .expect("stream name"),
+            codec_hint: None,
+            cooldown: streamer_domain::config::CooldownConfig::default(),
+            video_encoder: setting,
+            bitrate_kbps: kbps,
+        }
+    }
+
+    /// Three cameras on `va` cost one probe; the output's own setting none.
+    #[test]
+    fn each_camera_encoder_setting_is_probed_once() {
+        let mut config = example_config();
+        config.output.video_encoder = VideoEncoder::Auto;
+        config.cameras = vec![
+            camera("A", Some(VideoEncoder::Va), None),
+            camera("B", Some(VideoEncoder::Va), None),
+            camera("C", Some(VideoEncoder::Auto), None),
+            camera("D", Some(VideoEncoder::X264), None),
+            camera("E", None, None),
+        ];
+        assert_eq!(
+            camera_encoder_settings(&config),
+            vec![VideoEncoder::Va, VideoEncoder::X264]
+        );
+    }
+
+    #[test]
+    fn the_plan_applies_each_cameras_own_encoder_and_bitrate() {
+        use streamer_infra_media::encoder::RateControl;
+        let mut config = example_config();
+        config.output.video_encoder = VideoEncoder::Auto;
+        config.output.bitrate_kbps = 3000;
+        config.cameras = vec![
+            camera("PLAIN", None, None),
+            camera("SLOW", None, Some(1000)),
+            camera("GPU", Some(VideoEncoder::Va), None),
+        ];
+        let low_power = EncoderBackend::VaLowPower(RateControl::Cqp);
+
+        let plan = encoder_plan(
+            &config,
+            EncoderBackend::X264,
+            &[(VideoEncoder::Va, low_power)],
+        );
+
+        let of = |id: &str| plan.for_camera(&streamer_domain::camera::CameraId::new(id));
+        assert_eq!(of("PLAIN").backend, EncoderBackend::X264);
+        assert_eq!(of("PLAIN").bitrate_kbps, 3000);
+        assert_eq!(of("SLOW").backend, EncoderBackend::X264);
+        assert_eq!(of("SLOW").bitrate_kbps, 1000);
+        assert_eq!(of("GPU").backend, low_power);
+        assert_eq!(of("GPU").bitrate_kbps, 3000);
+    }
+
+    #[test]
+    fn the_fatal_error_line_carries_the_whole_cause_chain() {
+        let capture = Capture::default();
+        let out = capture.0.clone();
+        let sub = subscriber(LogFormat::Json, EnvFilter::new("info"), false, move || {
+            capture.clone()
+        });
+        let e = anyhow::anyhow!("missing GStreamer element(s): textoverlay")
+            .context("GStreamer plugins");
+
+        tracing::subscriber::with_default(sub, || log_fatal(&e));
+
+        let line: serde_json::Value =
+            serde_json::from_slice(&out.lock().unwrap()).expect("one JSON line");
+        assert_eq!(line["level"], "ERROR");
+        assert_eq!(
+            line["error"],
+            "GStreamer plugins: missing GStreamer element(s): textoverlay"
+        );
+    }
+
+    #[test]
+    fn json_logs_are_one_object_per_line_with_the_fields_at_the_top() {
+        let text = log_line(LogFormat::Json);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let line: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON");
+
+        assert_eq!(line["level"], "INFO");
+        assert_eq!(line["message"], "live attached");
+        assert_eq!(line["attempt"], 2);
+        assert!(
+            line["target"]
+                .as_str()
+                .unwrap()
+                .starts_with("arlo_camera_streamer")
+        );
+        assert!(line["timestamp"].is_string());
+        assert_eq!(line["spans"][0]["name"], "run");
+        assert_eq!(line["spans"][0]["camera"], "CAM1");
+    }
+
+    #[test]
+    fn text_logs_stay_human_readable() {
+        let text = log_line(LogFormat::Text);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(text.trim()).is_err(),
+            "{text}"
+        );
+        assert!(text.contains("live attached"), "{text}");
+        assert!(text.contains("run{camera=\"CAM1\"}"), "{text}");
+        assert!(
+            !text.contains('\u{1b}'),
+            "no escape codes off a terminal: {text:?}"
+        );
+    }
+
+    #[test]
+    fn log_format_defaults_to_text_and_takes_json() {
+        let default = Cli::try_parse_from(["arlo-camera-streamer"]).unwrap();
+        assert_eq!(default.log_format, LogFormat::Text);
+        let json = Cli::try_parse_from([
+            "arlo-camera-streamer",
+            "list-devices",
+            "--log-format",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(json.log_format, LogFormat::Json);
+        assert!(Cli::try_parse_from(["arlo-camera-streamer", "--log-format", "xml"]).is_err());
+    }
 
     /// `VarError::NotUnicode` prints the value, and the boot error chain
     /// is printed in full: the token reached the container log.

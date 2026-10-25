@@ -90,7 +90,12 @@ live_stall_timeout_secs = 10
 #             Zero 2, CM4; needs `/dev/video11`.
 #   "nvenc" — NVIDIA GPU (`nvh264enc`); needs the NVIDIA container toolkit.
 # An explicit name fails the boot when that encoder does not work here.
+# A camera can name its own (see [[cameras]]).
 video_encoder = "auto"
+# Bitrate of each camera's stream in kbit/s, 256..=20000 (default 2048).
+# An Intel low-power encoder without HuC firmware encodes at constant
+# quality and ignores it (README, "GPU encoding").
+# bitrate_kbps = 2048
 # Prometheus /metrics endpoint (per-camera state, transitions, live seconds).
 metrics_bind = "127.0.0.1:9090"
 # Operational /admin HTTP endpoint (force-wake, force-idle, state snapshot).
@@ -110,14 +115,30 @@ bind = "0.0.0.0:8554"
 # segment_secs    = 2      # floor 1; segments cut at keyframes (every 2 s)
 # playlist_length = 10     # floor 3; two more segments are kept on disk
 #
-# [output.dash] is parsed but not supported (see ADR 0006); the daemon
-# warns and ignores it.
+# There is no [output.dash]: it was removed in 0.3.0 (ADR 0006), and a
+# config that still has it is refused at boot. HLS serves browsers.
+
+# ---------------------------------------------------------------------------
+# Home Assistant over MQTT (optional; ADR 0009). Publishes each camera's
+# state and Home Assistant discovery documents; nothing on the broker can
+# act on a camera.
+# ---------------------------------------------------------------------------
+# [mqtt]
+# url              = "mqtts://broker.lan:8883"    # or mqtt://host (1883); no user:pass@
+# username         = "arlo"
+# password_env     = "STREAMER_MQTT_PASSWORD"     # env var holding the password
+# ca_file          = "/etc/arlo-streamer/ca.pem"  # private CA; system roots otherwise
+# base_topic       = "arlo-camera-streamer"
+# discovery_prefix = "homeassistant"              # "" = no discovery
+# thumbnails       = false                        # publish the idle JPEG (any broker client can read it)
 
 # ---------------------------------------------------------------------------
 # Cameras — one [[cameras]] block per Arlo device you want to expose.
 # `arlo_device_id` is the opaque id from the Arlo cloud. To list them,
 # with a ready-to-paste block per camera:
 #   arlo-camera-streamer list-devices --config <this file>
+# With no [[cameras]] block at all, the daemon serves every camera on the
+# account, each named after the device (the names list-devices suggests).
 # ---------------------------------------------------------------------------
 
 [[cameras]]
@@ -125,6 +146,9 @@ arlo_device_id = "REPLACE_WITH_DEVICE_ID"
 # URL path of the RTSP output: rtsp://<host>:8554/front_door
 stream_name    = "front_door"
 # codec_hint   = "h264"   # or "h265"; learned automatically on first stream
+# This camera's own encoder and bitrate, in place of [output]'s:
+# video_encoder = "x264"
+# bitrate_kbps  = 1024
 
 # Checked at boot: debounce_secs and max_continuous_live 1..=86400, the
 # other two 0..=86400 (0 = disabled). A session is cut the moment the daily

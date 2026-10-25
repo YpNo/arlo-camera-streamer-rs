@@ -48,7 +48,7 @@ arlo-camera-streamer list-devices --config /etc/arlo-streamer/streamer.toml
 ```
 
 ```bash
-distrobox enter rust-build -- bash -lc 'cd ~/workspace/arlo-camera-streamer/arlo-camera-streamer-rs && ARLO_PASSWORD="…" ./target/release/arlo-camera-streamer list-devices --config config/streamer.toml'
+distrobox enter rust -- bash -lc 'cd ~/workspace/arlo-camera-streamer/arlo-camera-streamer-rs && ARLO_PASSWORD="…" ./target/release/arlo-camera-streamer list-devices --config config/streamer.toml'
 ```
 
 ```bash

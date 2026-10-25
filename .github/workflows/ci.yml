@@ -1,12 +1,28 @@
 name: Rust CI
 
-# Minutes are metered (private repository). The workflow is staged —
-# format → clippy → test → coverage / SonarQube, with doc beside test — so
-# a failed stage skips the costlier ones (coverage alone is ~9 min);
-# docs-only changes do not run it; the weekly schedule runs the audit
-# only; Renovate's PRs skip coverage and SonarQube; the GitHub release and
-# the container image (one per released version, to GHCR) come last, after
-# every gate.
+# A change is gated once, on its own pull request. The `plan` job decides
+# what each run deserves, and every job keys off its outputs:
+#   - pull request changing Rust code (crates/, config/, Cargo.*, the
+#     toolchain and lint settings): format → clippy → test → doc, coverage,
+#     SonarQube, plus the audit. Renovate's: no coverage or SonarQube.
+#   - pull request changing a workflow only: format → clippy → test, to
+#     exercise the actions; no coverage, doc or SonarQube.
+#   - pull request changing the Dockerfile (or .dockerignore, .trivyignore):
+#     the image is built and scanned, never pushed.
+#   - any other pull request (Compose, deploy/, scripts/): the audit only.
+#   - push to main bringing a version with no release yet: format → clippy
+#     → test and the audit, then the release and the image. No coverage:
+#     the change was covered on its pull request.
+#   - any other push to main: the release job's image check only (a
+#     released version missing a platform is rebuilt); the code was gated
+#     on its pull request.
+#   - weekly schedule: the audit, one coverage and SonarQube baseline on
+#     main for the pull requests to compare against, and a scan of the
+#     published image (base-image and Debian fixes ship only with a
+#     release, so a fixable finding calls for a patch release).
+#   - workflow_dispatch: the gates; on main, then the release job.
+# A stage that fails skips the costlier ones after it. Docs-only changes
+# never trigger the workflow (paths-ignore); the secret scan has its own.
 on:
   pull_request:
     branches: [main, master]
@@ -47,19 +63,128 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      pull-requests: read # the files a pull request changes
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      docs: ${{ steps.plan.outputs.docs }}
+      coverage: ${{ steps.plan.outputs.coverage }}
+      sonar: ${{ steps.plan.outputs.sonar }}
+      audits: ${{ steps.plan.outputs.audits }}
+      image_pr: ${{ steps.plan.outputs.image_pr }}
+      image_scan: ${{ steps.plan.outputs.image_scan }}
+      release_check: ${{ steps.plan.outputs.release_check }}
+      new_version: ${{ steps.plan.outputs.new_version }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          PR_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          is() { [ "$1" = true ]; }
+          is_pr=false; [ "$EVENT" = pull_request ] && is_pr=true
+          on_main=false
+          case "$REF" in refs/heads/main|refs/heads/master) on_main=true;; esac
+          main_push=false; { [ "$EVENT" = push ] && is $on_main; } && main_push=true
+          dispatch=false; [ "$EVENT" = workflow_dispatch ] && dispatch=true
+          # Only a manual run on main may release: on another branch it
+          # would tag and publish unmerged code.
+          main_dispatch=false; { is $dispatch && is $on_main; } && main_dispatch=true
+          schedule=false; [ "$EVENT" = schedule ] && schedule=true
+          bot_pr=false
+          if is $is_pr; then
+            case "$ACTOR" in 'renovate[bot]'|'dependabot[bot]') bot_pr=true;; esac
+          fi
+          fork_pr=false; is $is_pr && [ "$PR_REPO" != "$REPO" ] && fork_pr=true
+
+          # What a pull request changes. An API error runs everything.
+          code=false; ci=false; image=false
+          if is $is_pr; then
+            # A rename counts by both paths: moving a file out of crates/
+            # changes the code too.
+            if files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" \
+                --jq '.[] | .filename, (.previous_filename // empty)'); then
+              has() { printf '%s\n' "$files" | grep -Eq "$1"; }
+              has '^(crates/|config/|\.cargo/|Cargo\.(toml|lock)$|(clippy|rustfmt|rust-toolchain)\.toml$|sonar-project\.properties$)' && code=true
+              has '^\.github/workflows/' && ci=true
+              has '^(Dockerfile|\.dockerignore|\.trivyignore)$' && image=true
+            else
+              echo "::warning::cannot list the pull request's files; running every job"
+              code=true; ci=true; image=true
+            fi
+          fi
+
+          # Whether main now holds a version with no release yet. An API
+          # error counts as new: the gates run, and the release job decides.
+          new_version=false
+          if is $main_push || is $main_dispatch; then
+            version=v$(gh api "repos/$REPO/contents/Cargo.toml?ref=$SHA" --jq .content \
+              | base64 -d | grep -m1 '^version' | cut -d'"' -f2)
+            if out=$(gh release view "$version" -R "$REPO" --json tagName 2>&1); then
+              echo "$version is released already"
+            elif printf '%s' "$out" | grep -qi 'release not found'; then
+              new_version=true
+            else
+              echo "::warning::cannot tell whether $version is released: $out"
+              new_version=true
+            fi
+          fi
+
+          build=false
+          { { is $is_pr && { is $code || is $ci; }; } || is $new_version || is $dispatch || is $schedule; } && build=true
+          docs=false; { is $is_pr && is $code; } && docs=true
+          coverage=false; { { is $is_pr && is $code && ! is $bot_pr; } || is $schedule; } && coverage=true
+          sonar=false; { is $coverage && ! is $fork_pr; } && sonar=true
+          audits=false; { is $is_pr || is $new_version || is $dispatch || is $schedule; } && audits=true
+          image_pr=false; { is $is_pr && is $image; } && image_pr=true
+          image_scan=$schedule
+          release_check=false; { is $main_push || is $main_dispatch; } && release_check=true
+
+          {
+            echo "### Plan for \`$EVENT\` (code=$code, workflows=$ci, image=$image)"
+            echo; echo '| job group | runs |'; echo '|---|---|'
+          } >> "$GITHUB_STEP_SUMMARY"
+          out() {
+            echo "$1=$2" >> "$GITHUB_OUTPUT"
+            echo "| $1 | $2 |" >> "$GITHUB_STEP_SUMMARY"
+            echo "$1=$2"
+          }
+          out build "$build"
+          out docs "$docs"
+          out coverage "$coverage"
+          out sonar "$sonar"
+          out audits "$audits"
+          out image_pr "$image_pr"
+          out image_scan "$image_scan"
+          out release_check "$release_check"
+          out new_version "$new_version"
+
   format:
     name: Check Formatting
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    # Root of the build chain: the weekly schedule is for the audit only,
-    # and every build job below `needs` this one.
-    if: github.event_name != 'schedule'
+    # Root of the build chain: everything below `needs` it, so a run the
+    # plan keeps build-free stops here.
+    needs: [plan]
+    if: needs.plan.outputs.build == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
-          toolchain: 1.99.0
+          toolchain: 1.99.1
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -80,7 +205,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
-          toolchain: 1.99.0
+          toolchain: 1.99.1
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -108,7 +233,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
-          toolchain: 1.99.0
+          toolchain: 1.99.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace --all-features
         env:
@@ -120,6 +245,8 @@ jobs:
     name: Security & License Audit
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    needs: [plan]
+    if: needs.plan.outputs.audits == 'true'
     permissions:
       contents: read
     steps:
@@ -128,7 +255,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
-          toolchain: 1.99.0
+          toolchain: 1.99.1
       - name: Install cargo-deny (pinned binary release, checksum-verified)
         # The action fetched its release asset with curl | tar and no
         # checksum; this is the same binary, verified like tarpaulin below.
@@ -148,7 +275,8 @@ jobs:
     name: Documentation Check
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    needs: [clippy]
+    needs: [plan, clippy]
+    if: needs.plan.outputs.docs == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install system build deps
@@ -160,7 +288,7 @@ jobs:
             libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
-          toolchain: 1.99.0
+          toolchain: 1.99.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo doc --workspace --no-deps --all-features
         env:
@@ -170,10 +298,11 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    needs: [test]
+    needs: [plan, test]
     # The costliest job (instrumented rebuild + the GStreamer integration
-    # tests, ~9 min): not for a dependency bump — the tests already ran.
-    if: github.actor != 'renovate[bot]'
+    # tests, ~9 min): a pull request changing Rust code, and the weekly
+    # baseline on main; never a dependency bot's PR or a merge.
+    if: needs.plan.outputs.coverage == 'true'
     permissions:
       contents: read
     steps:
@@ -190,7 +319,7 @@ jobs:
             gstreamer1.0-libav gstreamer1.0-nice
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-01
         with:
-          toolchain: 1.99.0
+          toolchain: 1.99.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-tarpaulin (pinned binary release, checksum-verified)
         # Bump both lines together; the digest is the one GitHub publishes
@@ -208,29 +337,27 @@ jobs:
         # Exclusions (files, not packages: `--exclude <pkg>` only stops a
         # package's tests from running while its lines still count, which
         # is how the first run reported the media crate at 0 %):
-        # - `crates/streamer-bin/*` — composition root, only glue
+        # - `crates/streamer-bin/src/main.rs` — composition root, only glue
+        #   (the binary's other modules count, with their tests).
         # - The GStreamer-bound media files count: `tests/live_session.rs`
-        #   drives them through real WebRTC calls (STREAMER_REQUIRE_GST_IT
-        #   makes a missing plugin fail instead of silently skipping).
-        # - I/O-heavy infra-arlo files — `boot.rs` async auth, `events.rs`
-        #   live MQTT bus, `stream_requester.rs` and `thumbnails.rs` real
-        #   network calls. Their pure logic (`event_mapper.rs`, `error.rs`,
-        #   the `build_arlo_rs_config` and `utf8_path` helpers) IS unit-tested
-        #   inline; the wrappers belong to integration tests against a real
-        #   Arlo account.
-        # Threshold: 86 — measured 88.25 % on 2026-09-28 with the media files
-        # counted. Raise deliberately; never set above what is held.
+        #   and `tests/rtsp_sessions.rs` drive them through real pipelines
+        #   (STREAMER_REQUIRE_GST_IT makes a missing plugin fail instead of
+        #   silently skipping).
+        # - `streamer-infra-arlo/src/boot.rs` — the live login; its helpers
+        #   are unit-tested inline.
+        # - `streamer-infra-arlo/src/arlo_api.rs` — the calls through to the
+        #   live arlo-rs client. The adapters around them are tested against
+        #   the fake in the same file.
+        # Threshold: 88 — measured 90.24 % on 2026-10-10 with these
+        # exclusions. Raise deliberately; never set above what is held.
         env:
           STREAMER_REQUIRE_GST_IT: "1"
         run: |
           cargo tarpaulin --workspace --all-features --timeout 180 --out xml \
-            --exclude arlo-camera-streamer \
-            --exclude-files 'crates/streamer-bin/*' \
+            --exclude-files 'crates/streamer-bin/src/main.rs' \
             --exclude-files 'crates/streamer-infra-arlo/src/boot.rs' \
-            --exclude-files 'crates/streamer-infra-arlo/src/events.rs' \
-            --exclude-files 'crates/streamer-infra-arlo/src/stream_requester.rs' \
-            --exclude-files 'crates/streamer-infra-arlo/src/thumbnails.rs' \
-            --fail-under 86
+            --exclude-files 'crates/streamer-infra-arlo/src/arlo_api.rs' \
+            --fail-under 88
       - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           fail_ci_if_error: false
@@ -240,8 +367,8 @@ jobs:
     name: SonarQube
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: [test]
-    if: github.actor != 'renovate[bot]' # a bump carries no code to analyse
+    needs: [plan, test]
+    if: needs.plan.outputs.sonar == 'true' # with coverage; not a fork's PR
     # Secrets are not readable in a job-level `if`, so the token is mapped
     # to the job environment and the scan step checks it: a fork or a
     # repository without the SonarCloud secret skips the scan instead of
@@ -258,19 +385,115 @@ jobs:
       - uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
         if: env.SONAR_TOKEN != ''
 
-  # The GitHub release, after every gate: a push to main whose Cargo.toml
-  # version has no release yet gets tagged `v<version>` with generated
-  # notes. SonarCloud is reporting only and does not hold a release back.
-  # The image jobs below key on `created`, so an image is published once
-  # per version, never for an unversioned push.
+  # A pull request changing the Dockerfile builds the image and scans it,
+  # as the release would (amd64 only), and pushes nothing: a broken build
+  # or a fixable CRITICAL/HIGH used to surface only once a version was
+  # tagged (0.2.0).
+  image-check:
+    name: Container image check (PR)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs: [plan]
+    if: needs.plan.outputs.image_pr == 'true'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          outputs: type=oci,dest=/tmp/image,tar=false
+          # Reads the release builds' cache; writes nothing, so a pull
+          # request never changes what a release starts from.
+          cache-from: type=gha,scope=image-linux/amd64
+      # Trivy is a pinned, checksum-verified binary run as plain steps,
+      # which are handed none of the job's tokens. trivy-action downloaded
+      # Trivy at run time with the job token in reach (its tags were
+      # hijacked in 2026-03). The image jobs reuse this step by its anchor:
+      # a composite action in the repository would be missing from an
+      # older tag's checkout.
+      - &install-trivy
+        name: Install Trivy (pinned binary release, checksum-verified)
+        # Bump the version and both digests together; the digests are the
+        # ones GitHub publishes for the (immutable) release assets.
+        env:
+          TRIVY_VERSION: "0.76.1"
+          TRIVY_SHA256_AMD64: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+          TRIVY_SHA256_ARM64: e174dff2a6dba5e3ae41f8d0537a6324405bd08132497340304c6b20e0f16a1f
+        run: |
+          case "$RUNNER_ARCH" in
+            X64) asset=Linux-64bit; digest=$TRIVY_SHA256_AMD64 ;;
+            ARM64) asset=Linux-ARM64; digest=$TRIVY_SHA256_ARM64 ;;
+            *) echo "::error::no Trivy digest for $RUNNER_ARCH"; exit 1 ;;
+          esac
+          curl -sSfL -o /tmp/trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_${asset}.tar.gz"
+          echo "${digest}  /tmp/trivy.tar.gz" | sha256sum --check --strict
+          sudo tar xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy
+          rm /tmp/trivy.tar.gz
+          trivy --version
+      - name: Vulnerability gate
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        run: |
+          trivy image --input /tmp/image --severity CRITICAL,HIGH \
+            --ignore-unfixed --ignorefile .trivyignore --exit-code 1
+
+  # The published image, scanned weekly: it changes only with a release,
+  # while advisories keep arriving for its Debian packages. A fixable
+  # CRITICAL or HIGH fails the run, which calls for a patch release.
+  image-scan:
+    name: Published image scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [plan]
+    if: needs.plan.outputs.image_scan == 'true'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(vars.IMAGE_PLATFORMS || '["linux/amd64"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .trivyignore
+          sparse-checkout-cone-mode: false
+      - *install-trivy
+      - name: Vulnerability gate
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:latest
+          TRIVY_PLATFORM: ${{ matrix.platform }}
+        run: |
+          # Lowercase: github.repository keeps the owner's case. The image
+          # is public, so it is pulled anonymously.
+          trivy image --severity CRITICAL,HIGH --ignore-unfixed \
+            --ignorefile .trivyignore --exit-code 1 "${IMAGE,,}"
+
+  # The GitHub release: a push to main whose Cargo.toml version has no
+  # release yet gets tagged `v<version>` with generated notes, once the
+  # gates the plan ran for it passed (coverage and SonarQube ran on the
+  # pull request). On every other push it only checks that each released
+  # version's image exists for every platform; its gates were skipped by
+  # the plan, hence `always()` and the explicit results below. The image
+  # jobs key on `image_missing`, so an image is published once per version.
   release:
     name: Create GitHub Release
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    needs: [format, clippy, test, security, doc, coverage]
+    needs: [plan, format, clippy, test, security]
     if: >-
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      always() && needs.plan.result == 'success' &&
+      needs.plan.outputs.release_check == 'true' &&
+      (needs.plan.outputs.new_version != 'true' ||
+       (needs.format.result == 'success' && needs.clippy.result == 'success' &&
+        needs.test.result == 'success' && needs.security.result == 'success'))
     permissions:
       contents: write
       packages: read
@@ -310,6 +533,32 @@ jobs:
             echo "::error::cannot tell whether $VERSION is released: $out"
             exit 1
           fi
+
+      - name: Commit the version is built from
+        id: commit
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CREATED: ${{ steps.exists.outputs.created }}
+        run: |
+          # A new release tags this commit; an existing one keeps its tag.
+          # A tag left without a release (a release deleted without its
+          # tag, a hand-pushed tag) on another commit would get the release
+          # while the image is built from this one: stop instead.
+          tagged=$(git rev-parse -q --verify "refs/tags/$VERSION^{commit}" || true)
+          if [ "$CREATED" = "true" ]; then
+            if [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
+              echo "::error::tag $VERSION points at $tagged, not $GITHUB_SHA, and has no release; delete the tag or bump the version"
+              exit 1
+            fi
+            sha="$GITHUB_SHA"
+          elif [ -n "$tagged" ]; then
+            sha="$tagged"
+          else
+            echo "::error::release $VERSION exists but its tag does not"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "$VERSION is built from $sha"
 
       # The image jobs key on this, not on `created`: a run cancelled or
       # failed after the tag can be re-run and still publish the image.
@@ -370,28 +619,14 @@ jobs:
           tag_name: ${{ steps.version.outputs.version }}
           name: Release ${{ steps.version.outputs.version }}
           generate_release_notes: true
-          target_commitish: ${{ github.sha }}
-
-      - name: Commit the version is built from
-        id: commit
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          CREATED: ${{ steps.exists.outputs.created }}
-        run: |
-          # A new release tags this commit; an existing one keeps its tag.
-          if [ "$CREATED" = "true" ]; then
-            sha="$GITHUB_SHA"
-          else
-            sha=$(git rev-list -n 1 "refs/tags/$VERSION")
-          fi
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "$VERSION is built from $sha"
+          target_commitish: ${{ steps.commit.outputs.sha }}
 
   # The container image, one per released version, to GHCR as
   # ghcr.io/<owner>/<repo>:<version>, :latest and :sha-<commit>, and to
   # Docker Hub as docker.io/<DOCKERHUB_USERNAME>/<repo> with the same tags
   # when the repository variable DOCKERHUB_USERNAME and the secret
-  # DOCKERHUB_TOKEN are set (GHCR alone otherwise). Built per platform on a
+  # DOCKERHUB_TOKEN (of the `release` environment) are set (GHCR alone
+  # otherwise). Built per platform on a
   # native runner and pushed by digest to every registry at once, scanned,
   # then tagged as one manifest list per registry. The platforms come from
   # the repository variable IMAGE_PLATFORMS (set to
@@ -411,7 +646,12 @@ jobs:
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 90
     needs: [release]
-    if: needs.release.outputs.image_missing == 'true'
+    # always(): the release job's own gates may have been skipped by the
+    # plan, and a skipped ancestor would skip this job too.
+    if: always() && needs.release.result == 'success' && needs.release.outputs.image_missing == 'true'
+    # DOCKERHUB_TOKEN is an environment secret of `release`, which only
+    # main may deploy to: a workflow pushed to another branch cannot read it.
+    environment: release
     strategy:
       fail-fast: true
       matrix:
@@ -476,31 +716,19 @@ jobs:
           cache-from: type=gha,scope=image-${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=image-${{ matrix.platform }}
       # Report HIGH and CRITICAL; stop on any fixable one (.trivyignore
-      # holds the reviewed exceptions, none so far).
-      - name: Vulnerability report
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      # holds the reviewed exceptions, none so far). Trivy is never handed
+      # this job's token (packages: write): see the install step.
+      - *install-trivy
+      - name: Vulnerability report and gate
         env:
           # The layout is a one-platform index (the image plus its
           # attestations); without this Trivy looks for linux/amd64 in it
-          # and fails on the arm64 leg. The action has no platform input,
-          # Trivy reads TRIVY_PLATFORM for --platform.
+          # and fails on the arm64 leg.
           TRIVY_PLATFORM: ${{ matrix.platform }}
-        with:
-          input: /tmp/image
-          format: table
-          severity: CRITICAL,HIGH
-          exit-code: '0'
-      - name: Vulnerability gate
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        env:
-          TRIVY_PLATFORM: ${{ matrix.platform }}
-        with:
-          input: /tmp/image
-          format: table
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          trivyignores: .trivyignore
-          exit-code: '1'
+        run: |
+          trivy image --input /tmp/image --severity CRITICAL,HIGH --exit-code 0
+          trivy image --input /tmp/image --severity CRITICAL,HIGH \
+            --ignore-unfixed --ignorefile .trivyignore --exit-code 1 --skip-db-update
       - run: rm -rf /tmp/image
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -547,6 +775,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs: [release, image]
+    if: always() && needs.release.result == 'success' && needs.image.result == 'success'
+    environment: release # DOCKERHUB_TOKEN, see the image job
     permissions:
       contents: read
       packages: write

@@ -101,3 +101,26 @@ configs load; the daemon warns that it is ignored and why.
 - Debian and Ubuntu ship `dashmp4mux` / `cmafmux` (gst-plugins-rs), or
   the image builds them.
 - The continuous encode cost matters on the target box.
+
+## Update — 2026-10-10: a loopback server of its own
+
+The segmenters shared the public server's session pool (64 sessions), so
+LAN clients holding every session stopped HLS. They now connect to a
+second `RTSPServer` bound to `127.0.0.1` on an ephemeral port, with its
+own pool, serving the same mount points. gst-rtsp-server keys a shared
+media on the request's port and path, which would have given each camera
+a second pipeline through that server; the factories now key on the path
+alone, so a camera keeps one pipeline and one splice. Both pools remove a
+session 30 s after its client's last keep-alive: before, nothing removed
+expired sessions, and every client that vanished without a TEARDOWN held
+one for good.
+
+## Update — 2026-10-10: DASH removed
+
+`[output.dash]` had been parsed and ignored since this decision, with a
+warning. It is removed: a config that still has the table is refused at
+boot with a message saying to delete it, rather than accepted and
+ignored. Re-adding DASH stays tied to the re-evaluation triggers above
+(gst-plugins-rs muxers packaged, or built into the image). HLS gained an
+opt-in web server in the Compose file (`--profile hls`, nginx serving
+playlists and segments only).

@@ -344,6 +344,59 @@ async fn rtsp_server_stopped_right_after_start_drops_promptly() {
     }
 }
 
+/// ADR 0010: the idle picture is drawn once a second and repeated, yet a
+/// new snapshot shows, a second one replaces it, and a media rebuilt for
+/// a new client starts on the latest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_snapshot_replaces_the_idle_picture_and_survives_a_rebuilt_media() {
+    let _serial = SERIAL.lock().await;
+    if !gstreamer_ready() {
+        return;
+    }
+    let stack = Stack::new(WebrtcConfig::default());
+    stack.media.register(&stack.camera).await.expect("register");
+    let probe = RtspProbe::connect(&stack.url());
+    assert!(
+        eventually(PICTURE_TIMEOUT, || shows_idle(&probe)).await,
+        "client never showed the idle screen"
+    );
+    let near = |probe: &RtspProbe, low: u64, high: u64| (low..=high).contains(&probe.mean_luma());
+
+    stack
+        .media
+        .refresh_thumbnail(&stack.camera, solid_jpeg(0xff80_8080))
+        .await
+        .expect("grey snapshot");
+    assert!(
+        eventually(PICTURE_TIMEOUT, || near(&probe, 105, 150)).await,
+        "the grey snapshot never showed: {}",
+        probe.mean_luma()
+    );
+    stack
+        .media
+        .refresh_thumbnail(&stack.camera, solid_jpeg(0xffd0_d0d0))
+        .await
+        .expect("light snapshot");
+    assert!(
+        eventually(PICTURE_TIMEOUT, || near(&probe, 170, 215)).await,
+        "the second snapshot did not replace the first: {}",
+        probe.mean_luma()
+    );
+    assert!(
+        !probe.interrupted(),
+        "a snapshot change interrupted the client"
+    );
+
+    drop(probe);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let again = RtspProbe::connect(&stack.url());
+    assert!(
+        eventually(PICTURE_TIMEOUT, || near(&again, 170, 215)).await,
+        "a rebuilt media lost the snapshot: {}",
+        again.mean_luma()
+    );
+}
+
 /// gdk-pixbuf decodes at the declared size: a 2.6 KB file declaring
 /// 12000×12000 took about 1 GB. The refresh refuses it before any decode,
 /// and the client keeps its picture.
@@ -360,6 +413,21 @@ async fn thumbnail_declaring_a_huge_frame_is_refused_without_disturbing_the_clie
         eventually(PICTURE_TIMEOUT, || shows_idle(&probe)).await,
         "client never showed the idle screen"
     );
+    assert_eq!(
+        stack.media.current_thumbnail(&stack.camera).await.unwrap(),
+        None
+    );
+    let shown = small_jpeg();
+    stack
+        .media
+        .refresh_thumbnail(&stack.camera, shown.clone())
+        .await
+        .expect("a valid thumbnail");
+    assert_eq!(
+        stack.media.current_thumbnail(&stack.camera).await.unwrap(),
+        Some(shown.clone()),
+        "the admin endpoint serves what the idle frame shows"
+    );
 
     let mut crafted = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08];
     crafted.extend(12000_u16.to_be_bytes());
@@ -372,6 +440,11 @@ async fn thumbnail_declaring_a_huge_frame_is_refused_without_disturbing_the_clie
         .expect_err("a huge declared frame must be refused");
 
     assert!(err.to_string().contains("12000x12000"), "{err}");
+    assert_eq!(
+        stack.media.current_thumbnail(&stack.camera).await.unwrap(),
+        Some(shown),
+        "a refused thumbnail replaces nothing"
+    );
     let frames = probe.frames();
     assert!(
         eventually(PICTURE_TIMEOUT, || probe.frames() > frames + 2).await,
@@ -380,10 +453,17 @@ async fn thumbnail_declaring_a_huge_frame_is_refused_without_disturbing_the_clie
     assert!(!probe.interrupted(), "the refusal interrupted the client");
 }
 
+/// Under rtspsrc's 5 s UDP timeout: a client that offers UDP first
+/// shows the picture without ever waiting for UDP packets.
+const NO_UDP_WAIT: Duration = Duration::from_secs(3);
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn second_client_over_udp_joins_a_playing_media() {
-    // With HLS on, the segmenter is always the first client, so every
-    // viewer joins a media that is already playing (VLC over UDP).
+async fn a_client_offering_udp_first_joins_over_tcp_at_once() {
+    // VLC offers UDP first. Through the container's TCP-only port mapping
+    // its UDP never arrived, and it waited 10 s before retrying over TCP.
+    // UDP is refused now (`rtsp_sessions.rs`): the client must take the
+    // refusal as "use TCP", not as an error. It joins a media that is
+    // already playing, as with HLS on (the segmenter is first).
     let _serial = SERIAL.lock().await;
     if !gstreamer_ready() {
         return;
@@ -396,10 +476,10 @@ async fn second_client_over_udp_joins_a_playing_media() {
         "first client never showed the idle screen"
     );
 
-    let second = RtspProbe::connect_over(&stack.url(), "udp");
+    let second = RtspProbe::connect_over(&stack.url(), "udp+tcp");
     assert!(
-        eventually(PICTURE_TIMEOUT, || shows_idle(&second)).await,
-        "a UDP client joining a playing media got no picture (frames={})",
+        eventually(NO_UDP_WAIT, || shows_idle(&second)).await,
+        "a client offering UDP first got no picture within {NO_UDP_WAIT:?} (frames={})",
         second.frames()
     );
     assert!(!second.interrupted(), "the joining client saw an error");
@@ -408,6 +488,44 @@ async fn second_client_over_udp_joins_a_playing_media() {
 
 /// A live white H.264 source, standing in for the app's watch-along
 /// stream; `num_buffers` bounds the finite variant.
+/// A real 64×48 JPEG, encoded by GStreamer.
+fn small_jpeg() -> bytes::Bytes {
+    encoded_jpeg("videotestsrc num-buffers=1")
+}
+
+/// A 64×48 JPEG of one colour (`0xAARRGGBB`).
+fn solid_jpeg(argb: u32) -> bytes::Bytes {
+    encoded_jpeg(&format!(
+        "videotestsrc pattern=solid-color foreground-color={argb} num-buffers=1"
+    ))
+}
+
+fn encoded_jpeg(source: &str) -> bytes::Bytes {
+    use gstreamer::prelude::*;
+    let pipeline = gstreamer::parse::launch(&format!(
+        "{source} ! video/x-raw,width=64,height=48 ! jpegenc ! appsink name=out sync=false"
+    ))
+    .expect("jpeg pipeline")
+    .downcast::<gstreamer::Bin>()
+    .expect("bin");
+    let sink = pipeline
+        .by_name("out")
+        .expect("appsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink type");
+    pipeline.set_state(gstreamer::State::Playing).expect("play");
+    let sample = sink
+        .try_pull_sample(gstreamer::ClockTime::from_seconds(5))
+        .expect("a frame");
+    pipeline.set_state(gstreamer::State::Null).expect("stop");
+    let buffer = sample
+        .buffer()
+        .expect("buffer")
+        .map_readable()
+        .expect("map");
+    bytes::Bytes::copy_from_slice(buffer.as_slice())
+}
+
 fn white_source(num_buffers: Option<u32>) -> String {
     let bound = num_buffers.map_or(String::new(), |n| format!(" num-buffers={n}"));
     format!(

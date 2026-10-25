@@ -29,8 +29,10 @@ newest release (`ghcr.io/ypno/arlo-camera-streamer-rs:v<version>`).
   (Frigate consumes them on the LAN). Bind them to a trusted interface or
   front them with a proxy.
 - **TLS to Arlo's watch-along host** (ADR 0007) verifies the certificate
-  chain against the system roots and waives only the hostname check,
-  because Arlo hands out a raw IP no certificate names. A certificate pin
+  chain against the system roots. Arlo hands out a raw IP no certificate
+  names, so the certificate must instead be valid for a host of Arlo's
+  watch-along tier, `*.wowza.arlo.com`, the name Arlo's certificate
+  carries; any other Arlo host is refused. A certificate pin
   (`arlo.watch_along_cert_sha256`) replaces the chain check when needed.
   All other Arlo traffic is fully validated.
 
@@ -40,8 +42,12 @@ newest release (`ghcr.io/ypno/arlo-camera-streamer-rs:v<version>`).
   GStreamer bindings and the BoringSSL used by `arlo-rs`'s HTTP client
   are native code behind audited Rust wrappers.
 - CI runs `cargo deny` (advisories, licences, duplicate crates) on every
-  change and weekly, `cargo audit` locally before releases, and Trivy on
-  the container image before any tag points at it. Dependencies and base
-  images are kept current by Renovate, with actions and images pinned to
-  digests.
+  change and weekly, `cargo audit` locally before releases, and Trivy (a
+  pinned, checksum-verified binary that is handed no token) on the
+  container image before any tag points at it, then weekly on the
+  published image: a fixable finding there calls for a patch release.
+  Dependencies and base images are kept current by Renovate, with actions
+  and images pinned to digests.
+- Releases are cut from `main` only. The Docker Hub token is a secret of
+  the `release` environment, which only `main` may use.
 - The image runs as an unprivileged user (uid 10001) with `tini` as PID 1.

@@ -22,6 +22,9 @@ pub enum MotionOutcome {
     /// Event arrived while the user watches the camera in the Arlo app;
     /// Arlo would refuse our session, so none is started (ADR 0005).
     SuppressedUserView,
+    /// Event arrived within the hold after a session cut by the
+    /// continuous-live cap or lost right after the attach.
+    SuppressedCooldown,
 }
 
 impl MotionOutcome {
@@ -36,6 +39,7 @@ impl MotionOutcome {
             Self::Absorbed => "absorbed",
             Self::SuppressedFailed => "suppressed-failed",
             Self::SuppressedUserView => "suppressed-user-view",
+            Self::SuppressedCooldown => "suppressed-cooldown",
         }
     }
 }
@@ -106,6 +110,10 @@ mod tests {
         assert_eq!(
             MotionOutcome::SuppressedUserView.as_label(),
             "suppressed-user-view"
+        );
+        assert_eq!(
+            MotionOutcome::SuppressedCooldown.as_label(),
+            "suppressed-cooldown"
         );
     }
 

@@ -84,6 +84,9 @@ pub trait PipelineRegistry: Send + Sync {
     /// Replace the idle still frame for the camera (best-effort).
     async fn refresh_thumbnail(&self, camera: &CameraId, jpeg: Bytes) -> Result<(), MediaError>;
 
+    /// The idle frame's thumbnail, as last refreshed.
+    async fn current_thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, MediaError>;
+
     /// Replace the caption of the camera's idle frame, now and for any
     /// media built later.
     async fn set_idle_caption(&self, camera: &CameraId, caption: String) -> Result<(), MediaError>;
@@ -232,8 +235,7 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         }
         let outputs = build_output_branches(&stream_name, &self.output);
         let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        // Initial idle source: synthetic until first thumbnail arrives.
-        let idle = select_idle_source(None, &stream_name, &timestamp);
+        let idle = select_idle_source(&stream_name, &timestamp);
         match self.registry.register(camera, idle, outputs).await {
             Ok(()) => {
                 info!("camera registered with idle pipeline");
@@ -325,6 +327,19 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         }
         self.registry
             .refresh_thumbnail(camera, jpeg)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn current_thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, DomainError> {
+        self.stream_name(camera)?;
+        // Configured but not built yet: nothing shown, and a read never
+        // builds a pipeline.
+        if !self.registered.read().await.contains(camera) {
+            return Ok(None);
+        }
+        self.registry
+            .current_thumbnail(camera)
             .await
             .map_err(Into::into)
     }
@@ -436,6 +451,15 @@ mod tests {
             Ok(())
         }
 
+        async fn current_thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, MediaError> {
+            let thumbs = self.thumbs.lock().unwrap();
+            Ok(thumbs
+                .iter()
+                .rev()
+                .find(|(c, _)| c == camera)
+                .map(|(_, jpeg)| jpeg.clone()))
+        }
+
         async fn set_idle_caption(
             &self,
             camera: &CameraId,
@@ -465,6 +489,7 @@ mod tests {
             hls: None,
             dash: None,
             video_encoder: VideoEncoder::X264,
+            bitrate_kbps: streamer_domain::config::DEFAULT_VIDEO_BITRATE_KBPS,
             metrics_bind: "127.0.0.1:9090".to_string(),
             admin_bind: "127.0.0.1:9091".to_string(),
         }
@@ -477,12 +502,16 @@ mod tests {
                 stream_name: name("front_door"),
                 codec_hint: Some(Codec::H265),
                 cooldown: CooldownConfig::default(),
+                video_encoder: None,
+                bitrate_kbps: None,
             },
             CameraConfig {
                 arlo_device_id: cam("CAM_B"),
                 stream_name: name("back_yard"),
                 codec_hint: None,
                 cooldown: CooldownConfig::default(),
+                video_encoder: None,
+                bitrate_kbps: None,
             },
         ]
     }
@@ -634,6 +663,31 @@ mod tests {
             "{:?}",
             captions[1]
         );
+    }
+
+    #[tokio::test]
+    async fn current_thumbnail_reads_the_registry_without_building_a_pipeline() {
+        let reg = Arc::new(FakeRegistry::default());
+        let m = mux(reg.clone());
+        let jpeg = Bytes::from_static(b"\xff\xd8a");
+
+        assert_eq!(m.current_thumbnail(&cam("CAM_A")).await.unwrap(), None);
+        assert!(
+            reg.registered.lock().unwrap().is_empty(),
+            "a read never registers"
+        );
+        m.register(&cam("CAM_A")).await.unwrap();
+        m.refresh_thumbnail(&cam("CAM_A"), jpeg.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            m.current_thumbnail(&cam("CAM_A")).await.unwrap(),
+            Some(jpeg)
+        );
+        assert!(matches!(
+            m.current_thumbnail(&cam("GHOST")).await,
+            Err(DomainError::UnknownCamera(_))
+        ));
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ description: GStreamer patterns for streamer-infra-media — webrtcbin against A
 ---
 # Media Specialist Skill
 
-Target: GStreamer 1.26 (Debian trixie, the `rust-build` distrobox and the image); keep
+Target: GStreamer 1.26 (Debian trixie, the `rust` distrobox and the image); keep
 1.22 working (Debian 12). `webrtc_pipeline.rs`, `gst_pipeline.rs` and `rtsp.rs` are
 exercised by `tests/live_session.rs` (a local `webrtcbin` gateway + an RTSP client) —
 put every decision that can be pure into `live_watch.rs`, `pipeline_desc.rs` or

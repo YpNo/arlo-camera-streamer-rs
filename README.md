@@ -10,7 +10,7 @@
 [![Docker Hub](https://img.shields.io/docker/v/ypno/arlo-camera-streamer-rs?sort=semver&logo=docker&logoColor=white&label=docker.io)](https://hub.docker.com/r/ypno/arlo-camera-streamer-rs)
 [![codecov](https://codecov.io/gh/YpNo/arlo-camera-streamer-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/YpNo/arlo-camera-streamer-rs)
 [![Quality gate](https://sonarcloud.io/api/project_badges/measure?project=YpNo_arlo-camera-streamer-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=YpNo_arlo-camera-streamer-rs)
-[![MSRV](https://img.shields.io/badge/MSRV-1.99.0-blue.svg)](https://github.com/YpNo/arlo-camera-streamer-rs)
+[![MSRV](https://img.shields.io/badge/MSRV-1.99.1-blue.svg)](https://github.com/YpNo/arlo-camera-streamer-rs)
 [![GStreamer](https://img.shields.io/badge/GStreamer-1.22%2B-brightgreen.svg)](https://gstreamer.freedesktop.org/)
 [![arlo-rs](https://img.shields.io/crates/v/arlo-rs.svg?label=arlo-rs)](https://crates.io/crates/arlo-rs)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -37,7 +37,8 @@ Frigate's pull from Arlo's push**:
 | Viewed in app | You watch the camera in the Arlo app: the daemon relays the app's own stream, picture and sound (ADR 0007); if Arlo hands out none, the idle frame reads `LIVE IN ARLO APP`. Motion resumes when you close the app | Awake (because of you) |
 
 The transition is driven by Arlo's **MQTT event bus**: when the camera
-fires a motion event, the daemon negotiates a WebRTC session with Arlo's
+fires a motion event (or someone rings a video doorbell), the daemon
+negotiates a WebRTC session with Arlo's
 gateway, splices the live H.264 into the persistent GStreamer pipeline,
 and reverts to idle once the camera goes quiet, or as soon as the live
 source itself dies (ADR 0004).
@@ -59,6 +60,7 @@ Read [`crates/streamer-domain/src/port.rs`](./crates/streamer-domain/src/port.rs
 to see the contracts. The ADRs document the load-bearing decisions:
 
 - [ADR index](./docs/adr/README.md) and the [validation record](./docs/VALIDATION.md) of what has run against a real camera.
+- [Arlo protocol notes](./docs/arlo-protocol-notes.md): what was learned about Arlo's undocumented cloud (login, event bus, WebRTC, the app's watch-along stream).
 - [ADR 0001 — Factory-restart splice](./docs/adr/0001-factory-restart-splice.md): *superseded by 0003*.
 - [ADR 0002 — RTSP-only output for v1](./docs/adr/0002-rtsp-only-output-v1.md): *superseded by 0006 for HLS*; DASH stays out.
 - [ADR 0003 — Seamless input-selector splice](./docs/adr/0003-seamless-input-selector-splice.md): one persistent pipeline per camera, idle and live swapped at a frame boundary, clients never disconnect.
@@ -67,10 +69,12 @@ to see the contracts. The ADRs document the load-bearing decisions:
 - [ADR 0006 — HLS output](./docs/adr/0006-hls-output-via-loopback-segmenter.md): HLS is written by a loopback RTSP client of each camera, no re-encode.
 - [ADR 0007 — Relay the user's app view](./docs/adr/0007-relay-the-users-app-view.md): a live view started in the Arlo app is relayed, picture and sound, from the RTSPS stream Arlo hands the app identity; no cooldown, no budget charge; the relay lets go of the stream every `user_view_probe_secs` so the camera can report whether the app still views.
 - [ADR 0008 — Choosing the H.264 encoder per host](./docs/adr/0008-video-encoder-selection.md): `video_encoder = "auto"` dry-runs NVIDIA, Intel/AMD, V4L2 and x264 at boot and keeps the first that works.
+- [ADR 0009 — Camera state over MQTT for Home Assistant](./docs/adr/0009-mqtt-home-assistant.md): publish-only, discovery, no new dependency (a small client on the codec already in the tree).
+- [ADR 0010 — The idle picture drawn once a second](./docs/adr/0010-idle-picture-drawn-once-a-second.md): `imagefreeze` repeats it to 15 fps; a third of a core less per connected camera.
 
 ## Prerequisites
 
-- **Rust** ≥ 1.99.0 (`rustup toolchain install 1.99.0`; the MSRV follows arlo-rs).
+- **Rust** ≥ 1.99.1 (`rustup toolchain install 1.99.1`; the MSRV follows arlo-rs).
 - **GStreamer 1.22+** with the plugin set below.
   - `gstreamer1.0-plugins-base`
   - `gstreamer1.0-plugins-good` (also provides `gdkpixbufoverlay` for the idle thumbnail)
@@ -79,8 +83,10 @@ to see the contracts. The ADRs document the load-bearing decisions:
   - `gstreamer1.0-libav` (`avdec_h264`, `avenc_aac`)
   - **`gstreamer1.0-nice`** — libnice ICE for `webrtcbin`. **Required for live streaming.** Without it, live fails at motion with `pipeline error: webrtcbin has no sink request pad` (the idle stream still works, which makes it easy to miss).
   - the `gst-rtsp-server` library (Debian: `libgstrtspserver-1.0-0`).
-  - *Optional* GPU encoding plugins — Intel/AMD: `gstreamer1.0-vaapi` plus the VA drivers (`intel-media-va-driver` / `mesa-va-drivers`; the newer `va` plugin ships in `gstreamer1.0-plugins-bad`); Raspberry Pi 4 family: `v4l2h264enc` from `gstreamer1.0-plugins-good`; NVIDIA: `nvh264enc` from `gstreamer1.0-plugins-bad` with the driver libraries. `video_encoder = "auto"` picks whatever works (see [Performance](#performance), [ADR 0008](./docs/adr/0008-video-encoder-selection.md)).
-- An Arlo cloud account with at least one camera.
+  - *Optional* GPU encoding plugins — Intel/AMD: `gstreamer1.0-vaapi` plus the VA drivers (`intel-media-va-driver` / `mesa-va-drivers`; the newer `va` plugin ships in `gstreamer1.0-plugins-bad`); Raspberry Pi 4 family: `v4l2h264enc` from `gstreamer1.0-plugins-good`; NVIDIA: `nvh264enc` from `gstreamer1.0-plugins-bad` with the driver libraries. `video_encoder = "auto"` picks whatever works (see [GPU encoding](#gpu-encoding)).
+- An Arlo cloud account with at least one camera: a separate account
+  the cameras are shared with, or the owner account for a video
+  doorbell's motion ([Which Arlo account](#which-arlo-account)).
 - An IMAP mailbox you can poll for the Arlo MFA OTP, or be ready to
   type the OTP on stdin (cold-start only).
 
@@ -141,11 +147,11 @@ repo root (Debian 13 with GStreamer 1.26, non-root, no setuid binaries,
 Trivy before it is tagged), to GitHub's registry and to Docker Hub:
 
 ```bash
-docker pull ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.1
+docker pull ghcr.io/ypno/arlo-camera-streamer-rs:v0.3.0
 ```
 
 ```bash
-docker pull docker.io/ypno/arlo-camera-streamer-rs:v0.2.1
+docker pull docker.io/ypno/arlo-camera-streamer-rs:v0.3.0
 ```
 
 Tags: `v<version>` (pin this one), `latest` (the newest release), and
@@ -180,18 +186,20 @@ budget and probe 0 to 86400 s).
 | `arlo.mfa.poll_interval_secs` / `.timeout_secs` | u64  | `3` / `120`          | Approval polling for `kind = "push"`.                    |
 | `webrtc.ice_address_family`         | `dual`/`ipv4`  | `dual`               | ICE candidate gathering; `ipv4` when IPv6 to Arlo is broken. |
 | `webrtc.live_stall_timeout_secs`    | u64            | `10` (floor 4)       | Seconds without inbound video before the live source is declared lost and the output returns to idle (ADR 0004). |
-| `output.video_encoder`              | `auto`/`x264`/`va`/`vaapi`/`v4l2`/`nvenc` | `auto` | `auto` probes the host at boot (NVIDIA, Intel/AMD, V4L2, then x264); an explicit name fails the boot when it does not work (see Performance, ADR 0008). |
-| `output.rtsp.bind`                  | `host:port`    | `0.0.0.0:8554`       | Embedded RTSP server.                                    |
+| `output.video_encoder`              | `auto`/`x264`/`va`/`vaapi`/`v4l2`/`nvenc` | `auto` | `auto` probes the host at boot (NVIDIA, Intel/AMD, V4L2, then x264); an explicit name fails the boot when it does not work (see [GPU encoding](#gpu-encoding)). |
+| `output.bitrate_kbps`               | u32 (256..=20000) | `2048`           | Bitrate of each camera's stream; a constant-quality encoder (Intel low power without HuC) ignores it. |
+| `output.rtsp.bind`                  | `host:port`    | `0.0.0.0:8554`       | Embedded RTSP server (TCP; RTP is interleaved on it).    |
 | `output.metrics_bind`               | `host:port`    | `127.0.0.1:9090`     | Prometheus + healthchecks.                               |
 | `output.admin_bind`                 | `host:port`    | `127.0.0.1:9091`     | `/admin/*` write API.                                    |
-| `output.hls.dir`                    | path           | (off)                | Enables HLS: `<dir>/<stream_name>/index.m3u8` + segments (ADR 0006). Serve it with any web server. Keeps each camera's encoder running. |
+| `output.hls.dir`                    | path           | (off)                | Enables HLS: `<dir>/<stream_name>/index.m3u8` + segments (ADR 0006). Serve it with any web server, or the Compose `hls` profile ([Serving HLS](#serving-hls)). Keeps each camera's encoder running. |
 | `output.hls.segment_secs`           | u32            | `2` (floor 1)        | Target segment length; segments cut at keyframes (every 2 s). |
 | `output.hls.playlist_length`        | u32            | `10` (floor 3)       | Segments in the playlist; two more are kept on disk.      |
-| `output.dash`                       | table          | (ignored)            | Parsed for compatibility, not supported: see ADR 0006.    |
-| `[[cameras]]`                       | array          | `[]`                 | One block per camera — see example.                      |
+| `output.dash`                       | —              | removed in 0.3.0     | A config that still has the table is refused at boot; delete it (ADR 0006). |
+| `[[cameras]]`                       | array          | `[]`                 | One block per camera — see example. With none, every camera on the account is served, named as `list-devices` suggests (the log lists them). |
+| `cameras[].video_encoder` / `cameras[].bitrate_kbps` | as `output.*` | (the output's) | One camera's own encoder or bitrate. Each setting in use is probed once at boot; the log names each camera that differs (`camera encoding`). |
 | `cameras.codec_hint`                | `h264`/`h265`  | (auto)               | Skip first-stream codec detection.                       |
-| `cameras.cooldown.debounce_secs`    | u64            | `60`                 | Hold-live debounce after last motion.                    |
-| `cameras.cooldown.max_continuous_live` | u64         | `300`                | Hard cap on continuous live (battery protection); also caps a relayed app view when probing is off. |
+| `cameras.cooldown.debounce_secs`    | u64            | `60`                 | Hold-live debounce after last motion; also how long motion is held off after a session cut by the cap or lost within 15 s of its start. |
+| `cameras.cooldown.max_continuous_live` | u64         | `300`                | Hard cap on continuous live (battery protection): the camera then stays idle for `debounce_secs` even under motion. Also caps a relayed app view when probing is off. |
 | `cameras.cooldown.user_view_probe_secs` | u64        | `60`                 | How often a relayed app view is released for a few seconds to learn whether the app still views (our session keeps the camera streaming). `0` = never, cap only. |
 | `cameras.cooldown.daily_live_budget` | u64           | `0`                  | `0` = unlimited; otherwise total live secs/day.          |
 | `cameras.cooldown.budget_reset`     | `HH:MM`        | `00:00`              | Local-clock reset.                                       |
@@ -204,7 +212,10 @@ budget and probe 0 to 86400 s).
 | `ARLO_IMAP_PASSWORD` (or whatever you put in `arlo.mfa.password_env`) | IMAP password, when `arlo.mfa.kind = "email"` uses a mailbox. |
 | `STREAMER_ADMIN_TOKEN` | **Required** by `run`. Bearer token for `/admin/*`, at least 16 bytes (`openssl rand -hex 32`). |
 | `RUST_LOG` | Optional. Log filter, default `info,arlo_camera_streamer=debug`; see [Logging and debugging](#logging-and-debugging). |
+| `STREAMER_MQTT_PASSWORD` (or whatever you put in `mqtt.password_env`) | The MQTT broker's password, with `[mqtt]` and a `username`. |
+| `STREAMER_LOG_FORMAT` | Optional. `text` (default) or `json`, one object per line for a log pipeline; same as `--log-format`. See [Logging and debugging](#logging-and-debugging). |
 | `GST_DEBUG` | Optional. GStreamer's own debug output, off by default; see [GStreamer debugging](#gstreamer-debugging). |
+| `HLS_PUBLISH` | Optional, Compose only. Where the `hls` profile's web server is published, default `8080` (all interfaces); `192.168.1.10:8080` binds one address. See [Serving HLS](#serving-hls). |
 
 ## Usage
 
@@ -219,6 +230,29 @@ budget and probe 0 to 86400 s).
 7. Point Frigate (or any NVR) at the same URL ([Frigate integration](#frigate-integration)).
 
 Something not as described? [Logging and debugging](#logging-and-debugging) says which lines to look for.
+
+### Which Arlo account
+
+Give the daemon **its own Arlo account, with the cameras shared to it**
+(shared from the Arlo app). The daemon's session then never
+competes with yours, and whoever controls the host controls only what
+was shared, not your Arlo account.
+
+One exception: **a video doorbell's motion never reaches a shared
+account.** Arlo's event broker grants a shared account the doorbell's
+ring (`doorbells/<id>`) but refuses it the doorbell's camera topic,
+where its motion is published, whatever the access rights. The doorbell
+then goes live when someone **rings**, not on motion. Cameras are not
+affected. (Seen on an Essential Video Doorbell, 2026-10; the same
+behaviour is reported for pyaarlo in hass-aarlo issues #542 and #1169.)
+
+For motion on a video doorbell, run the daemon with the **owner
+account**. Its motion, snapshots and ring then all arrive. Know what
+that means first: the daemon then holds your main Arlo credentials, so
+anyone who controls the host or reads its configuration and session
+file can view, change or delete your whole Arlo account, its other
+devices and its subscription. Keep the `.env` and the state directory
+readable by the daemon only, and the admin endpoints on loopback.
 
 ### First run: find your device ids
 
@@ -242,11 +276,15 @@ the OTP is typed on stdin:
 docker run --rm -it -e ARLO_PASSWORD -e ARLO_IMAP_PASSWORD \
   -v /etc/arlo-streamer:/etc/arlo-streamer:ro \
   -v /var/lib/arlo-streamer:/var/lib/arlo-streamer \
-  ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.1 list-devices --config /etc/arlo-streamer/streamer.toml
+  ghcr.io/ypno/arlo-camera-streamer-rs:v0.3.0 list-devices --config /etc/arlo-streamer/streamer.toml
 ```
 
 It also warns about configured `arlo_device_id` values the account does
-not have, which is how typos show up. Logs go to stderr, the report to
+not have, which is how typos show up. To try the daemon before choosing,
+leave `[[cameras]]` out altogether: it then serves every camera on the
+account under those suggested names, and logs each one (`camera from the
+account`). Listing the cameras is still the way to leave some out, or
+give one its own settings. Logs go to stderr, the report to
 stdout. The factor choice, the log lines that prove the pairing and what
 to do when a restart asks for a code again are in the login runbook,
 [`.agents/skills/arlo-mfa-login/SKILL.md`](./.agents/skills/arlo-mfa-login/SKILL.md).
@@ -285,7 +323,7 @@ docker run -d \
   -e ARLO_PASSWORD \
   -e ARLO_IMAP_PASSWORD \
   -e STREAMER_ADMIN_TOKEN \
-  ghcr.io/ypno/arlo-camera-streamer-rs:v0.2.1
+  ghcr.io/ypno/arlo-camera-streamer-rs:v0.3.0
 ```
 
 Two things the image cannot do for you:
@@ -306,14 +344,8 @@ Two things the image cannot do for you:
   ids and when each one saw motion or went live; keep the admin port off
   any untrusted network.
 
-Add the encoder device your box has, and `video_encoder = "auto"` will
-use it: `--device /dev/dri` for an Intel/AMD GPU, `--device /dev/video11`
-on a Raspberry Pi 4 / Zero 2 / CM4, `--gpus all` with the NVIDIA
-container toolkit for NVENC. uid 10001 must be allowed to open the
-device: add the group that owns it on the host by number,
-`--group-add "$(getent group render | cut -d: -f3)"` (`video` on a Pi);
-without it the encoder fails its dry run and `auto` falls back to x264. A Raspberry Pi 5 has no H.264 hardware
-encoder; it runs x264 in software. The image sets
+To encode on a GPU, pass its device and a group that can open it: see
+[GPU encoding](#gpu-encoding). The image sets
 `RUST_LOG=info,arlo_camera_streamer=info` on purpose, quieter than the
 binary's own default, because a container runs unattended for months; pass
 `-e RUST_LOG=…` to change it. The container `HEALTHCHECK` runs the binary's own `healthcheck`
@@ -325,10 +357,11 @@ subcommand against `metrics_bind`.
 settings above built in: the 30 s stop grace period, a restart policy,
 the state in `./data` beside the file (owned by uid 10001: `sudo chown -R
 10001:10001 data`, or `podman unshare chown -R 10001:10001 data`), a
-read-only root filesystem, no capabilities, rotated logs, a VA-API device
-with its render group (adjust the gid to `getent group render`, or remove
-both lines on a box without a GPU), and commented blocks for the other
-encoders and the ops ports. Its header lists the three files to prepare —
+read-only root filesystem, no capabilities, rotated logs, and commented
+blocks for the GPU encoders and the ops ports. Machine-specific settings
+such as the GPU device belong in a `docker-compose.override.yml` beside
+it (gitignored), which `docker compose` and `podman compose` merge in
+([GPU encoding](#gpu-encoding) has the snippets). Its header lists the three files to prepare —
 `config/streamer.toml`, a `.env` with the secrets (gitignored), and the one
 interactive `list-devices` login:
 
@@ -358,6 +391,9 @@ differences:
 - **On an SELinux host** (Fedora, RHEL, Alma), add `,Z` to the bind
   mounts (`./config:/etc/arlo-streamer:ro,Z`, `./state:/var/lib/arlo-streamer:Z`);
   "Permission denied" with correct ownership is the sign.
+- **A GPU needs `--group-add keep-groups`**, not the render group's
+  number, and your user in the render group: see
+  [GPU encoding](#gpu-encoding).
 
 A boot that keeps failing does not keep logging in: each failed Arlo login
 is recorded in the state directory, and the next attempt waits 1, 5, 15,
@@ -365,6 +401,87 @@ then 60 minutes (at least 15 after Arlo answers "too many requests"),
 however often the container restarts. The log says how long it waits.
 Arlo's Cloudflare edge blocks an address that logs in too often (HTTP 429,
 error 1015); the block lifts by itself after a while without attempts.
+
+### Serving HLS
+
+With `[output.hls] dir = "/var/lib/arlo-streamer/hls"`, the daemon writes
+`<stream_name>/index.m3u8` and its segments into `./data/hls` on the host.
+The Compose file has an opt-in web server for them (nginx, unprivileged,
+read-only, no capabilities, running as the daemon's uid so it can read its
+files):
+
+```bash
+docker compose --profile hls up -d
+```
+
+Playlists are then at `http://<host>:8080/hls/<stream_name>/index.m3u8`,
+for VLC, Home Assistant's camera card or a page with hls.js. It serves
+playlists (never cached) and segments only; everything else is a 404
+([`deploy/nginx-hls.conf`](./deploy/nginx-hls.conf)). Like the RTSP port,
+it is meant for a trusted LAN, but any web page a LAN browser opens can
+reach it too, so it guards against such pages:
+
+- **Host names**: it answers a request addressed to an IP address, a bare
+  host name (`nas`), `localhost`, or a `.local`, `.lan`, `.home.arpa` or
+  `.internal` name, and closes the connection for any other name (a
+  public name pointed at your LAN, DNS rebinding). Reach it through a name
+  of your own? Add it to `server_name` in the file.
+- **CORS**: no other origin may read the files. Players that fetch them
+  themselves (VLC, Home Assistant's camera integration, Frigate) need
+  nothing; a page on another origin playing them with hls.js needs its
+  origin in the file's `map $http_origin` list.
+- **Port**: `HLS_PUBLISH=192.168.1.10:8080` in `.env` binds it to one
+  address instead of all of them.
+
+### Home Assistant (MQTT)
+
+With an `[mqtt]` table (see the example config), the daemon publishes
+each camera's state to your MQTT broker, the one Home Assistant's MQTT
+integration already uses (the image ships no broker, and the compose
+file adds none). It announces each camera to Home Assistant through MQTT
+discovery: each camera appears as a device with
+its **State** (`idle`, `activating`, `live`, `battery-protect`,
+`failed`), **Live** and **Viewed in the Arlo app** flags and **Live time
+today**, plus a bridge device with the **Arlo connection**; no YAML.
+With `thumbnails = true`, its idle picture appears as a camera entity.
+
+```toml
+[mqtt]
+url          = "mqtts://broker.lan:8883"
+username     = "arlo"
+password_env = "STREAMER_MQTT_PASSWORD"
+```
+
+- **Publish only.** The daemon subscribes to nothing: no message on the
+  broker can wake or stop a camera. Waking stays on the admin API.
+- **Topics**, keyed by the Arlo device id: `<base>/status` (`online`, and
+  `offline` as the last will), `<base>/bridge`, `<base>/<device_id>/state`
+  (one JSON document), `<base>/<device_id>/thumbnail`; all retained.
+- **State** is read every second and published when it changes; after
+  every (re)connection everything is published again. A broker that is
+  down is retried after 1, 2, 4 … 60 s and never stops the daemon.
+- **A camera removed** from the configuration is removed from Home
+  Assistant on the next connection (the ids published are recorded in
+  the state directory, `mqtt-published.json`).
+- **TLS** with `mqtts://`, verified against the system roots or
+  `ca_file`. A password over plain `mqtt://` to another host is allowed
+  (many LAN brokers have no TLS) with a warning at boot.
+- **Two daemons on one broker** need different `base_topic`s (the client
+  id derives from it).
+- **Broker access**: give the daemon its own broker user, allowed to
+  write its base topic and the discovery prefix and nothing else. With
+  Mosquitto's `acl_file`:
+
+  ```text
+  user arlo
+  topic write arlo-camera-streamer/#
+  topic write homeassistant/#
+  ```
+
+  Check it: a broker drops a publish its ACL denies without telling the
+  client (MQTT 3.1.1), so a wrong ACL only shows as entities that never
+  appear or stay unavailable in Home Assistant. Bad credentials, on the
+  other hand, are logged (`refused by the broker`) and retried.
 
 ### Frigate integration
 
@@ -398,12 +515,15 @@ Stream URL pattern: `rtsp://<host>:<rtsp.bind>/<cameras.stream_name>`.
 | `GET /readyz`  (port 9090)            | None     | Ready iff started **and** Arlo bus connected. |
 | `GET /admin/state` (port 9091)        | Bearer   | System snapshot (JSON); per-camera state as the camera task last published it, so a camera mid-negotiation still answers (`activating`). |
 | `GET /admin/cameras/{id}` (port 9091) | Bearer   | Per-camera snapshot.                   |
+| `GET /admin/cameras/{id}/thumbnail.jpg` (port 9091) | Bearer | The JPEG the camera's idle frame shows (`no-store`); `404` before Arlo provided one. Read from the daemon's copy: reaches neither Arlo nor the camera. |
 | `POST /admin/cameras/{id}/wake` (port 9091) | Bearer | Inject a synthetic motion event; `429` within 30 s of the previous session's end (or failed attempt). Each activation also costs 15 s of the daily budget, and needs 30 s of it left. |
 | `POST /admin/cameras/{id}/idle` (port 9091) | Bearer | Force the camera back to `Idle`. |
 
 ```bash
 curl -H "Authorization: Bearer $STREAMER_ADMIN_TOKEN" \
      http://localhost:9091/admin/state | jq
+curl -H "Authorization: Bearer $STREAMER_ADMIN_TOKEN" -o front_door.jpg \
+     http://localhost:9091/admin/cameras/<arlo_device_id>/thumbnail.jpg
 ```
 
 ### Selected metrics
@@ -413,11 +533,173 @@ curl -H "Authorization: Bearer $STREAMER_ADMIN_TOKEN" \
 | `streamer_arlo_connected`           | gauge      | —                               |
 | `streamer_camera_state`             | gauge      | `camera`, `state`               |
 | `streamer_state_transitions_total`  | counter    | `camera`, `from`, `to`, `signal`|
-| `streamer_motion_events_total`      | counter    | `camera`, `outcome`             |
+| `streamer_motion_events_total`      | counter    | `camera`, `trigger` (`motion`, `audio`, `ring`, `admin-wake`), `outcome` |
 | `streamer_budget_decisions_total`   | counter    | `camera`, `decision`            |
 | `streamer_splice_attempts_total`    | counter    | `camera`, `outcome`             |
 | `streamer_splice_latency_ms`        | histogram  | `camera`, `outcome`             |
 | `streamer_retries_total`            | counter    | `camera`                        |
+
+## GPU encoding
+
+The daemon runs one H.264 encoder for every camera that has a client,
+and Frigate keeps one connected around the clock. With the default
+`[output] video_encoder = "auto"` it probes the host at boot and uses the
+first encoder that works:
+
+| `video_encoder` | Hardware | Element | Needs |
+|---|---|---|---|
+| `nvenc` | NVIDIA | `nvh264enc` | NVIDIA driver and container toolkit |
+| `va` | Intel (5th generation and later), AMD | `vah264enc`; on Intel also the low-power `vah264lpenc` | a render node (`/dev/dri/renderD128`) the daemon can open |
+| `vaapi` | the same, older GStreamer plugin | `vaapih264enc` | as `va` |
+| `v4l2` | Raspberry Pi 4 / Zero 2 / CM4 | `v4l2h264enc` | `/dev/video11` |
+| `x264` | any CPU | `x264enc` | nothing |
+
+The image ships the VA drivers: Intel's `intel-media-va-driver`
+(Broadwell and later, amd64 only) and Mesa's `mesa-va-drivers` (AMD).
+Older Intel GPUs need the `i965` driver, which the image does not ship.
+The Raspberry Pi 5 has no H.264 hardware encoder and runs x264. A Google
+Coral accelerates Frigate's detection, not this daemon's encoding.
+
+Each probe is a short dry run, so a plugin whose device is missing or
+unreadable is skipped rather than chosen. Naming a backend pins it: the
+boot then fails when it does not work (`va` accepts its three variants,
+below). A camera can name its own in its `[[cameras]]` block
+(`video_encoder`, `bitrate_kbps`), for instance x264 for the one camera
+whose picture the GPU encoder handles poorly. Details: [ADR 0008](./docs/adr/0008-video-encoder-selection.md).
+
+### Giving the container the GPU
+
+The container needs the device **and** a group that lets its user (uid
+10001) open it. Nothing more: no `--privileged`, no capability.
+
+**Docker, rootful podman.** Pass the device and the number of the group
+that owns it on the host (`render` for a VA render node, `video` on a
+Raspberry Pi):
+
+```bash
+docker run … --device /dev/dri/renderD128 \
+  --group-add "$(getent group render | cut -d: -f3)" …
+```
+
+With Compose, put it in a `docker-compose.override.yml` beside
+`docker-compose.yml` (gitignored; `docker compose` and `podman compose`
+merge it in), so the shared file stays machine-independent:
+
+```yaml
+services:
+  arlo-camera-streamer:
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    group_add:
+      - "992"            # getent group render | cut -d: -f3
+```
+
+**Rootless podman.** The host's render group cannot be mapped into the
+container: there the device shows as owned by `65534`, and
+`group_add: "<gid>"` grants nothing. Instead, let the container keep
+your own groups:
+
+1. Put your user in the render group, then **log in again** (a new SSH
+   session or desktop login; a terminal opened before keeps the old
+   groups, and so does every container it starts):
+
+   ```bash
+   sudo usermod -aG render "$USER"
+   ```
+
+2. Use `keep-groups` (crun, the default runtime on Debian and Fedora,
+   supports it; Docker rejects it):
+
+   ```yaml
+   services:
+     arlo-camera-streamer:
+       devices:
+         - /dev/dri/renderD128:/dev/dri/renderD128
+       group_add:
+         - keep-groups
+   ```
+
+3. Start the stack from that new login: `podman compose up -d`.
+
+**Raspberry Pi 4 / Zero 2 / CM4.** `--device /dev/video11` and the `video`
+group's number.
+
+**NVIDIA.** Install the NVIDIA container toolkit, then `--gpus all`, or
+in Compose:
+
+```yaml
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video]
+```
+
+### Checking which encoder runs
+
+The boot log names the backend, the element and, for Intel's low-power
+encoder, the rate control:
+
+```text
+INFO video encoder (auto) encoder="va" element=vah264lpenc rate-control=cqp
+```
+
+When a render node is present but every hardware encoder failed, it
+warns, with each reason:
+
+```text
+WARN a GPU render node is present but no hardware H.264 encoder works; encoding on the CPU. … skipped=…
+```
+
+`RUST_LOG=info,streamer_infra_media::encoder=debug` logs each skipped
+backend as it is probed. To see what the container's user gets:
+
+```bash
+podman exec arlo-camera-streamer sh -c 'id; ls -ln /dev/dri'
+```
+
+The device's group must be among the user's groups, by number. A device
+owned by `65534` under rootless podman means the `keep-groups` setup
+above.
+
+### Intel: the low-power encoder and HuC
+
+From Skylake (6th generation) on, Debian's free Intel driver offers only
+the GPU's fixed-function encoder, `vah264lpenc`, and no `vah264enc` or
+`vapostproc`. `va` therefore tries, in order: `vah264enc` at 2 Mbit/s,
+`vah264lpenc` at 2 Mbit/s, and `vah264lpenc` at constant quality (QP 26).
+Bitrate control on the low-power encoder needs the GPU's HuC firmware,
+which the kernel loads by default only from 12th-generation chips on;
+without it the driver refuses `rate-control=cbr` and the daemon settles
+on constant quality, where the bitrate follows the scene. The boot log
+says so. On 6th- to 11th-generation chips the `i915.enable_guc=2` kernel
+parameter loads HuC; once the driver offers bitrate control, the daemon
+picks that mode by itself (not yet tried on a real box).
+
+Verified on an Intel HD Graphics 530 (i5-6500T, Debian 13, rootless
+podman with `keep-groups`): `vah264lpenc` at constant quality, three
+cameras streaming to Frigate.
+
+### What the GPU saves
+
+On that box, the GPU encoder costs about 9% of a core per connected
+camera. On the idle picture x264 costs little more (about 8% in a bench
+of the same chain): the idle frame is nearly static, and since 0.3.0 it
+is drawn only once a second. The GPU's saving grows with motion: live
+video is where x264 works hardest. See [Performance](#performance).
+
+### GPU troubleshooting
+
+| Symptom | Log | Cause and fix |
+|---|---|---|
+| x264 although the box has a GPU | `a GPU render node is present but no hardware H.264 encoder works` | See [GPU troubleshooting](#gpu-troubleshooting). |
+| The device shows owner `65534` in the container | `ls -ln /dev/dri` | Rootless podman: use `keep-groups`, not the gid. |
+| Nothing changed after `usermod -aG render` | `id` lacks `render` | The session predates the change: log in again and recreate the container from the new login. |
+| `could not set property "rate-control" … to "cbr"` | debug, while probing | Expected on an Intel GPU without HuC: the next variant uses constant quality. |
+| Boot stops with `video encoder 'va' is not usable on this host` | that line, with each variant's reason | `video_encoder = "va"` pinned on a host where no variant works; fix the device access or use `auto`. |
+| `docker: … keep-groups …` | Docker's error | `keep-groups` is podman-only; with Docker pass the render group's number. |
 
 ## Logging and debugging
 
@@ -434,6 +716,16 @@ a default level, then `target=level` overrides, comma-separated. Levels
 are `error`, `warn`, `info`, `debug`, `trace`. Unset, the daemon uses
 `info,arlo_camera_streamer=debug`; the Docker image sets
 `info,arlo_camera_streamer=info`.
+
+Lines go to stderr. Text lines carry colours only on a terminal. For a
+log pipeline (Loki, Elasticsearch, `jq`), `--log-format json` or
+`STREAMER_LOG_FORMAT=json` writes one JSON object per line: `timestamp`,
+`level`, `target`, `message` and the event's fields at the top level, and
+the enclosing spans (`camera` among them) in `spans`:
+
+```json
+{"timestamp":"2026-10-10T07:52:51.393Z","level":"INFO","message":"state transition","from":"Activating","to":"Live","signal":"LiveAttached","target":"streamer_app::orchestrator","spans":[{"camera":"ABC1234567890","name":"run"}]}
+```
 
 | Target | What it logs | Turn up for |
 |---|---|---|
@@ -514,7 +806,7 @@ each pipeline at every state change; `dot -Tpng` turns it into a picture
 of what was actually built. Two warnings are known to be harmless:
 `gupnp … 1900: Address already in use` at live start (libnice's UPnP
 probe) and `Sticky event misordering, got 'segment' before 'caps'` when a
-UDP client joins a media that already plays for another client.
+client joins a media that already plays for another client.
 
 ### Checking the RTSP output from outside
 
@@ -529,12 +821,10 @@ GST_DEBUG=rtspsrc:4 gst-launch-1.0 rtspsrc location=rtsp://<host>:8554/<stream_n
   ! decodebin ! autovideosink
 ```
 
-```bash
-# VLC over TCP (the GUI equivalent is Preferences → Input / Codecs → RTP over RTSP (TCP))
-vlc --rtsp-tcp rtsp://<host>:8554/<stream_name>
-```
-
-Use TCP when UDP is filtered between you and the host.
+RTP goes over TCP only, interleaved on the RTSP connection: published
+from a container over TCP, the port could never carry RTP over UDP back
+to a client. A client that asks for UDP first (VLC, GStreamer, ffmpeg)
+is refused and switches to TCP at once; Frigate's go2rtc uses TCP anyway.
 While a client is connected, `GET /admin/state` is the quickest view of
 what the daemon thinks each camera is doing, and `streamer_camera_state`
 on `/metrics` the same for a dashboard.
@@ -548,7 +838,8 @@ on `/metrics` the same for a dashboard.
 | Boot stops with `session_cache_path directory … is not writable` | that line | The state directory is not owned by uid 10001: `sudo chown -R 10001:10001 <dir>`, or `podman unshare chown -R 10001:10001 <dir>` with rootless podman ([Podman](#podman)). |
 | `429 Too Many Requests` / `rate_limited` (Cloudflare error 1015) at login | `Arlo login failed rate_limited=true next_login_in_secs=…` | Too many logins from your address, usually a crash loop before the session cache could be written. Stop the container, fix the first error, wait an hour, start once. The daemon waits by itself between failed logins. |
 | `an earlier Arlo login failed; waiting before the next one` | `wait_secs=…` | The pause after a failed login (`login-backoff.json` in the state directory). It ends on its own; delete that file to log in at once, if you are sure the cause is fixed. |
-| Boot stops on the encoder | `is not usable on this host` | An explicit `video_encoder` whose device or plugin is missing; use `auto` or install the plugin. |
+| Boot stops on the encoder | `is not usable on this host` | An explicit `video_encoder` that does not work here; see [GPU troubleshooting](#gpu-troubleshooting). |
+| x264 although the box has a GPU | `a GPU render node is present but no hardware H.264 encoder works` | See [GPU troubleshooting](#gpu-troubleshooting). |
 | VLC connects, idle frame shows, never goes live | `to=Activating` then `attach_live failed …` | Read the reason: `webrtcbin has no sink request pad` is the missing `gstreamer1.0-nice`; `camera busy` is the Arlo app viewing; `splice timeout` is no RTP from Arlo (firewall on UDP, try `ice_address_family = "ipv4"`). |
 | Live starts and drops after ~10 s | `live source stalled` | UDP to Arlo's TURN blocked after the handshake, or the camera's own network. |
 | Motion in front of the camera, nothing in the log | `camera trigger pulse` at `streamer_infra_arlo::events=debug`; `event for unconfigured camera` at `streamer_app::router=trace` | Motion detection or the armed mode is off in the Arlo app, or the camera's `arlo_device_id` is not in `[[cameras]]`. |
@@ -580,42 +871,25 @@ on `/metrics` the same for a dashboard.
 
 ## Performance
 
-Measured on an Intel i5-6500T (4 cores, Skylake) with **software**
-`x264enc` at 720p15, one camera:
+Measured on an Intel i5-6500T (4 cores, Skylake, HD 530), 720p15:
 
-| State                            | CPU (share of one core) |
-|----------------------------------|-------------------------|
-| No RTSP client connected         | ~0%                     |
-| Idle stream, client connected    | ~0.6 core               |
-| Live stream                      | ~0.85 core              |
+| Setup | CPU (share of one core) |
+|---|---|
+| No RTSP client connected | ~0 |
+| 3 idle cameras, Frigate attached to each, GPU encoder (`va` low power), 0.3.0 | **~0.22 core in all** (2026-10-24, 15 min) |
+| One idle camera with a client, `x264`, 0.3.0 (bench of the idle chain) | ~0.14 core |
+| One idle camera with a client, `x264`, 0.2 | ~0.6 core |
+| One live camera, `x264`, 0.2 | ~0.85 core |
 
-The dominant cost is the **always-on H.264 encoder**: it runs whenever a
-client is connected (Frigate stays connected 24/7), so idle and live
-cost almost the same — live only adds the decode (~0.25 core). CPU
-therefore scales with the number of **connected** cameras, not with how
-many are live. On a 4-core box that is a ceiling of roughly **6 idle /
-4–5 concurrently live** cameras.
-
-For more cameras, let the GPU encode. With the default
-`[output] video_encoder = "auto"` the daemon probes the host at boot and
-takes the first encoder that works, in this order:
-
-| Backend | Hardware | Element | Needs |
-|---|---|---|---|
-| `nvenc` | NVIDIA | `nvh264enc` | NVIDIA driver, container toolkit (`--gpus all`) |
-| `va` | Intel / AMD | `vah264enc` | `/dev/dri`, VA drivers (in the image) |
-| `vaapi` | Intel / AMD, older stacks | `vaapih264enc` | same as `va` |
-| `v4l2` | Raspberry Pi 4 / Zero 2 / CM4 | `v4l2h264enc` | `/dev/video11` |
-| `x264` | any CPU | `x264enc` | nothing; ~0.6 core per camera |
-
-A probe is a short dry run, so a plugin whose device is missing (VA
-without a render node) is skipped rather than chosen. The log says which
-one won: `video encoder (auto) encoder=va`. Name a backend explicitly to
-pin it; then the boot fails if it does not work on that host. The
-Raspberry Pi 5 has no H.264 hardware encoder and runs x264 (one or two
-cameras at 720p15 are fine). A Google Coral accelerates Frigate's
-detection, not this daemon's encoding. Details and the measured paths:
-[ADR 0008](./docs/adr/0008-video-encoder-selection.md).
+The stream runs whenever a client is connected, and Frigate stays
+connected around the clock, so CPU scales with the number of
+**connected** cameras. Since 0.3.0 the idle picture is drawn once a
+second and repeated ([ADR 0010](./docs/adr/0010-idle-picture-drawn-once-a-second.md)),
+which made an idle camera cheap; with a GPU encoder (see
+[GPU encoding](#gpu-encoding)) three of them cost less than a quarter of
+a core. Three idle cameras cost about 2 cores in 0.2. A live camera adds
+the decode of Arlo's stream (~0.25 core with `x264` in 0.2; not
+measured again since). Memory settles near 250 MiB for three cameras.
 
 > The `gupnp … 1900: Address already in use` warnings at live start are
 > harmless — libnice's UPnP probe colliding with local bridge
@@ -664,34 +938,50 @@ CI does.
 ## CI/CD
 
 GitHub Actions workflows live in [`.github/workflows/`](./.github/workflows/).
-The `ci.yml` pipeline is staged: format → clippy → tests (with the GStreamer
-integration tests) → coverage gate (86 %; raised deliberately, never above
-what is held) and SonarCloud, with the rustdoc check beside the tests and
-cargo-deny (a checksum-pinned binary) in parallel. A failed stage skips
-the costlier ones, docs-only changes do not run it, the weekly schedule
-runs cargo-deny only, and Renovate's PRs skip coverage and SonarCloud.
-`secret-scan.yml` runs gitleaks (checksum-pinned, rules in
-`.gitleaks.toml`) on every push and PR, docs included, over every commit
-the push brings (merged side branches too), and weekly over the whole
-history.
+A change is gated once, on its own pull request: a small `plan` job
+reads what triggered the run (and, for a pull request, which files it
+changes) and every job runs only if the plan says so. The summary of
+each run shows the plan.
 
-After every gate, a push to `main` whose `Cargo.toml` version has no
+| Trigger | Runs |
+|---|---|
+| PR changing Rust code (`crates/`, `config/`, `Cargo.*`, toolchain and lint settings) | format → clippy → tests (with the GStreamer integration tests) → rustdoc, coverage gate (88 %), SonarCloud; cargo-deny |
+| … from Renovate or Dependabot | the same without coverage and SonarCloud |
+| PR changing a workflow only | format → clippy → tests, to exercise the actions; cargo-deny |
+| PR changing the `Dockerfile` | the image built and scanned with Trivy (amd64), pushed nowhere |
+| Any other PR (Compose, `deploy/`, `scripts/`) | cargo-deny |
+| Push to `main` with a version that has no release yet | format → clippy → tests and cargo-deny, then the release and the image (no coverage: it ran on the PR) |
+| Any other push to `main` | the image check only (below) |
+| Weekly schedule | cargo-deny, a coverage and SonarCloud baseline on `main` for PRs to compare against, and a Trivy scan of the published `latest` image |
+| Manual run | the gates, then the release job |
+
+A failed stage skips the costlier ones after it, and docs-only changes
+do not run the workflow. `secret-scan.yml` runs gitleaks (checksum-pinned,
+rules in `.gitleaks.toml`) on every push and PR, docs included, over
+every commit the push brings (merged side branches too), and weekly over
+the whole history.
+
+Once its gates pass, a push to `main` whose `Cargo.toml` version has no
 release yet gets a GitHub release tagged `v<version>`, then the container
 image for that version, built from the tag's commit: per platform on
 native runners, into a local OCI layout scanned with Trivy before any
 registry login (a fixable CRITICAL or HIGH finding stops the release;
-reviewed exceptions go in `.trivyignore`), then pushed by digest and
+reviewed exceptions go in `.trivyignore`; Trivy is a pinned,
+checksum-verified binary, never handed a token), then pushed by digest and
 tagged `v<version>`, `latest` and `sha-<commit>` on
 `ghcr.io/ypno/arlo-camera-streamer-rs` and on
 `docker.io/ypno/arlo-camera-streamer-rs` (Docker Hub needs the repository
-variable `DOCKERHUB_USERNAME` and the secret `DOCKERHUB_TOKEN`; without
-them GHCR alone is published). The image build keeps its layers in the
+variable `DOCKERHUB_USERNAME` and the secret `DOCKERHUB_TOKEN` of the
+`release` environment, which only `main` may use; without them GHCR alone
+is published). A tag left on another commit without a release (a release
+deleted without its tag) stops the release job. The image build keeps its layers in the
 Actions cache per platform, so the dependency layer (only changed by
 `Cargo.lock`) is not recompiled at every release. A version whose image
 is missing a platform in any registry is rebuilt from its tag on the next
 push to `main`; a registry error fails the run instead of being read as "absent".
 A fix to the image itself (the `Dockerfile`) therefore ships with a new
-version. A push without a version bump publishes nothing, and no crate is
+version, and so do base-image and Debian fixes: when the weekly scan of
+the published image fails on a fixable finding, cut a patch release. A push without a version bump publishes nothing, and no crate is
 ever published: the workspace is `publish = false`.
 
 Releasing is therefore: bump `version` in `Cargo.toml`, move the
@@ -700,6 +990,10 @@ Releasing is therefore: bump `version` in `Cargo.toml`, move the
 ## Security
 
 - Secrets are read from env vars at boot (`fail fast` on missing).
+- The MQTT adapter publishes only: nothing on the broker can act on a
+  camera. Its idle pictures (`thumbnails = true`, off by default) leave
+  the admin token's protection: any client of the broker can read them,
+  in clear over `mqtt://`.
 - The `/admin/*` surface refuses to start without a non-empty
   `STREAMER_ADMIN_TOKEN`. Rotate it by rotating the env var and
   restarting. Rejected requests are logged with their route, never the
@@ -715,8 +1009,14 @@ Releasing is therefore: bump `version` in `Cargo.toml`, move the
   bad `/admin/cameras/{id}` is answered `400`. The ops and admin
   listeners close a connection that sends no request head within 10 s
   and hold at most 64 connections each; the RTSP server keeps at most 64
-  sessions. Both HTTP listeners bind loopback by default — keep them
-  there or put a reverse proxy in front.
+  sessions, and removes a session 30 s after its client's last request or
+  RTCP report (every common client keeps it alive sooner: go2rtc every
+  25 s). The HLS segmenters connect to a second RTSP server bound to
+  `127.0.0.1` with its own session pool, so LAN clients cannot use up
+  their sessions; a LAN host can still hold all 64 public ones, which
+  shuts the NVR out until it stops: the RTSP port is meant for a trusted
+  LAN. Both HTTP listeners bind loopback by default — keep them there or
+  put a reverse proxy in front.
 - The image runs as uid/gid `10001`, ships no shell tools beyond `tini`,
   and every published digest carries SLSA provenance and an SPDX SBOM
   (`docker buildx imagetools inspect <ref> --format '{{json .Provenance}}'`).

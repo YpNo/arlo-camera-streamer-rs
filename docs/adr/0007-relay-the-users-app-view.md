@@ -145,3 +145,34 @@ clients and HLS as a motion session, with a `LiveSource::UserView` tag.
 - **Transcoding the AAC to Opus inside the relay** to reuse the Opus
   input: a decode and an encode per relay for nothing; a third mixer
   input decodes once.
+
+## Update — 2026-10-11: the waiver narrowed
+
+The hostname check was waived on any name mismatch, whatever the host.
+It is now waived only when the host is an IP address, as in every
+watch-along URL seen so far; a DNS host must match the certificate. On
+2026-10-10 the relay's certificate chained to a public root (the waiver
+logged). What stays open: on an IP host any certificate from a public
+CA passes, whoever it names. Binding the relay to Arlo's identity (an
+expected Arlo name, or a default SPKI pin) needs the certificate's
+names, which the relay now logs at `debug` (the DER, public data) with
+its SHA-256 at `info`; the next live run records them.
+
+## Update — 2026-10-24: bound to Arlo's domain
+
+The live run of 2026-10-12 recorded the certificate: it names only
+`*.wowza.arlo.com` (subject Arlo Technologies, Inc.), issued by DigiCert
+Global G2 TLS RSA SHA256 2020 CA1, valid to 2027-01-03. On an IP host
+the relay now accepts a trusted chain only if the certificate is valid
+for a host under `wowza.arlo.com` (narrowed from any `arlo.com` host by
+the third security sweep, 2026-10-25: another Arlo host, or a third
+party's host under arlo.com, is not the watch-along server): the names
+it presents choose the host, and
+rustls checks the certificate against it like any server name (a
+wildcard through one host it covers). Any other certificate is refused
+and logged with the names it presented.
+
+A name rather than a key pin: the certificate is renewed within three
+months, and a pin of its key would break the relay at Arlo's next
+renewal. The operator pin (`arlo.watch_along_cert_sha256`) stays for a
+chain the system does not trust.

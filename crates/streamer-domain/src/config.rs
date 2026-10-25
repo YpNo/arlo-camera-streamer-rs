@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::camera::{CameraId, StreamName};
+use crate::camera::{CameraId, DiscoveredDevice, StreamName};
 use crate::error::DomainError;
 use crate::stream::{Codec, IceAddressFamily};
 
@@ -25,10 +25,170 @@ pub struct StreamerConfig {
     /// TOML means `WebrtcConfig::default()` — dual-stack ICE.
     #[serde(default)]
     pub webrtc: WebrtcConfig,
-    /// Cameras to expose. Empty list is a configuration error caught
-    /// at boot in `streamer-bin`.
+    /// Cameras to expose. An empty list serves every camera on the
+    /// account (filled after the login, in `streamer-bin`).
     #[serde(default)]
     pub cameras: Vec<CameraConfig>,
+    /// Camera state published to an MQTT broker for Home Assistant
+    /// (ADR 0009); off when absent.
+    #[serde(default)]
+    pub mqtt: Option<MqttConfig>,
+}
+
+/// The MQTT adapter's settings (ADR 0009).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MqttConfig {
+    /// `mqtt://host[:port]` (1883) or `mqtts://host[:port]` (8883); no
+    /// credentials, path or query.
+    pub url: String,
+    /// Login name, when the broker wants one.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Name of the env var holding the password (never the password).
+    #[serde(default)]
+    pub password_env: Option<String>,
+    /// PEM file of the CA that signed the broker's certificate, for a
+    /// private CA; the system roots otherwise.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// Prefix of every topic the daemon publishes.
+    #[serde(default = "default_mqtt_base_topic")]
+    pub base_topic: String,
+    /// Home Assistant's discovery prefix; empty turns discovery off.
+    #[serde(default = "default_mqtt_discovery_prefix")]
+    pub discovery_prefix: String,
+    /// Publish each camera's idle JPEG (readable by every client of the
+    /// broker): off by default.
+    #[serde(default)]
+    pub thumbnails: bool,
+}
+
+/// Where the broker is, from [`MqttConfig::url`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MqttEndpoint {
+    /// `mqtts://`: TLS to the broker.
+    pub tls: bool,
+    /// Host name or IP literal (no brackets).
+    pub host: String,
+    /// TCP port.
+    pub port: u16,
+}
+
+/// Default MQTT port, plain and over TLS.
+const MQTT_PORT: u16 = 1883;
+const MQTTS_PORT: u16 = 8883;
+
+impl MqttConfig {
+    /// The broker's address.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::InvalidConfig`] for another scheme, a missing host,
+    /// a bad port, or credentials, a path or a query in the URL.
+    pub fn endpoint(&self) -> Result<MqttEndpoint, DomainError> {
+        let bad = |why: &str| DomainError::InvalidConfig(format!("mqtt.url: {why}"));
+        let (tls, rest) = if let Some(rest) = self.url.strip_prefix("mqtts://") {
+            (true, rest)
+        } else if let Some(rest) = self.url.strip_prefix("mqtt://") {
+            (false, rest)
+        } else {
+            return Err(bad("must start with mqtt:// or mqtts://"));
+        };
+        let authority = rest.strip_suffix('/').unwrap_or(rest);
+        if authority.contains('@') {
+            return Err(bad("no user:password@ (use username and password_env)"));
+        }
+        if authority.contains(['/', '?', '#']) {
+            return Err(bad("no path or query"));
+        }
+        let (host, port) = split_host_port(authority).ok_or_else(|| bad("bad host or port"))?;
+        if host.is_empty() {
+            return Err(bad("missing host"));
+        }
+        Ok(MqttEndpoint {
+            tls,
+            host: host.to_string(),
+            port: port.unwrap_or(if tls { MQTTS_PORT } else { MQTT_PORT }),
+        })
+    }
+
+    fn validate(&self) -> Result<(), DomainError> {
+        self.endpoint()?;
+        if self.password_env.is_some() && self.username.is_none() {
+            return Err(DomainError::InvalidConfig(
+                "mqtt.password_env needs mqtt.username (MQTT sends no password alone)".to_string(),
+            ));
+        }
+        validate_topic_prefix("mqtt.base_topic", &self.base_topic, false)?;
+        validate_topic_prefix("mqtt.discovery_prefix", &self.discovery_prefix, true)
+    }
+}
+
+/// `host[:port]`, `[v6]` or `[v6]:port`; `None` when the port is not a
+/// number or the brackets do not close.
+fn split_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        return match after {
+            "" => Some((host, None)),
+            port => Some((host, Some(port.strip_prefix(':')?.parse().ok()?))),
+        };
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => Some((host, Some(port.parse().ok()?))),
+        None => Some((authority, None)),
+    }
+}
+
+/// Topic levels of `[A-Za-z0-9_-]`, `/`-separated, none empty: never a
+/// wildcard (`+`, `#`) or a `$` system topic. Empty only if `may_be_empty`.
+/// An environment variable name: letters, digits and `_`, not starting
+/// with a digit, at most 128 bytes. The value of a `*password_env` that is
+/// not one is never echoed: it is likely the password itself, pasted in
+/// the wrong place (third sweep, S3-L8).
+fn validate_env_name(key: &str, value: &str) -> Result<(), DomainError> {
+    let mut chars = value.chars();
+    let ok = value.len() <= 128
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(DomainError::InvalidConfig(format!(
+            "{key} is not an environment variable name (letters, digits and _, not starting \
+             with a digit): put the variable's name there and the secret in the environment"
+        )))
+    }
+}
+
+fn validate_topic_prefix(name: &str, value: &str, may_be_empty: bool) -> Result<(), DomainError> {
+    if value.is_empty() && may_be_empty {
+        return Ok(());
+    }
+    let ok = !value.is_empty()
+        && value.split('/').all(|level| {
+            !level.is_empty()
+                && level
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(DomainError::InvalidConfig(format!(
+            "{name} = '{value}': topic levels of letters, digits, '-' and '_', separated by '/'"
+        )))
+    }
+}
+
+fn default_mqtt_base_topic() -> String {
+    "arlo-camera-streamer".to_string()
+}
+fn default_mqtt_discovery_prefix() -> String {
+    "homeassistant".to_string()
 }
 
 /// Default for [`WebrtcConfig::live_stall_timeout_secs`]: about three
@@ -235,12 +395,18 @@ pub struct OutputConfig {
     /// HLS sink — optional secondary output.
     #[serde(default)]
     pub hls: Option<HlsOutput>,
-    /// MPEG-DASH sink — optional secondary output.
-    #[serde(default)]
-    pub dash: Option<DashOutput>,
+    /// The removed `[output.dash]` table, read only so that
+    /// [`StreamerConfig::validate`] can say what to do about it.
+    #[serde(default, skip_serializing)]
+    pub dash: Option<serde::de::IgnoredAny>,
     /// H.264 encoder for the live/idle pipeline (software or GPU).
     #[serde(default)]
     pub video_encoder: VideoEncoder,
+    /// Bitrate of the output stream, in kbit/s ([`DEFAULT_VIDEO_BITRATE_KBPS`]).
+    /// A constant-quality encoder (Intel low power without `HuC`) has no
+    /// bitrate to set and ignores it.
+    #[serde(default = "default_video_bitrate_kbps")]
+    pub bitrate_kbps: u32,
     /// Bind address for the Prometheus `/metrics` endpoint.
     #[serde(default = "default_metrics_bind")]
     pub metrics_bind: String,
@@ -272,6 +438,14 @@ pub struct HlsOutput {
     #[serde(default = "default_playlist_length")]
     pub playlist_length: u32,
 }
+
+/// Bitrate of the output stream when nothing else is set, in kbit/s.
+pub const DEFAULT_VIDEO_BITRATE_KBPS: u32 = 2048;
+/// Lowest bitrate accepted: below it 720p H.264 is a smear.
+pub const MIN_VIDEO_BITRATE_KBPS: u32 = 256;
+/// Highest bitrate accepted: above it a typo (an extra zero) floods the
+/// LAN and the NVR's disk.
+pub const MAX_VIDEO_BITRATE_KBPS: u32 = 20_000;
 
 /// Shortest HLS segment accepted; `0` would disable splitting.
 pub const MIN_HLS_SEGMENT_SECS: u32 = 1;
@@ -325,22 +499,14 @@ impl HlsOutput {
     }
 }
 
-/// DASH sink configuration. Files are written to `dir/<stream_name>/…`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DashOutput {
-    /// Filesystem directory for DASH segments and manifests.
-    pub dir: PathBuf,
-    /// Target segment duration in seconds.
-    #[serde(default = "default_segment_secs")]
-    pub segment_secs: u32,
-}
-
 fn default_app_version() -> String {
     "6.46.0".to_string()
 }
 fn default_rtsp_bind() -> String {
     "0.0.0.0:8554".to_string()
+}
+const fn default_video_bitrate_kbps() -> u32 {
+    DEFAULT_VIDEO_BITRATE_KBPS
 }
 fn default_metrics_bind() -> String {
     "127.0.0.1:9090".to_string()
@@ -370,6 +536,46 @@ pub struct CameraConfig {
     /// Cooldown / battery-protection knobs.
     #[serde(default)]
     pub cooldown: CooldownConfig,
+    /// This camera's H.264 encoder, in place of `output.video_encoder`.
+    #[serde(default)]
+    pub video_encoder: Option<VideoEncoder>,
+    /// This camera's bitrate in kbit/s, in place of `output.bitrate_kbps`.
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
+}
+
+impl CameraConfig {
+    /// One entry per discovered device, as `[[cameras]]` would list them:
+    /// a stream name from the device's name (unique among them), default
+    /// cooldown, the output's encoder and bitrate. What an empty
+    /// `[[cameras]]` serves.
+    #[must_use]
+    pub fn for_devices(devices: &[DiscoveredDevice]) -> Vec<Self> {
+        let mut taken = std::collections::HashSet::new();
+        devices
+            .iter()
+            .map(|device| Self {
+                arlo_device_id: device.id.clone(),
+                stream_name: StreamName::suggest_unique(&device.name, &device.id, &mut taken),
+                codec_hint: None,
+                cooldown: CooldownConfig::default(),
+                video_encoder: None,
+                bitrate_kbps: None,
+            })
+            .collect()
+    }
+
+    /// The encoder this camera uses: its own, else the output's.
+    #[must_use]
+    pub fn video_encoder_or(&self, output: &OutputConfig) -> VideoEncoder {
+        self.video_encoder.unwrap_or(output.video_encoder)
+    }
+
+    /// The bitrate this camera uses: its own, else the output's.
+    #[must_use]
+    pub fn bitrate_kbps_or(&self, output: &OutputConfig) -> u32 {
+        self.bitrate_kbps.unwrap_or(output.bitrate_kbps)
+    }
 }
 
 /// Cooldown and battery-protection knobs per camera.
@@ -449,6 +655,22 @@ impl CooldownConfig {
 }
 
 impl StreamerConfig {
+    /// Every `*password_env` names an environment variable.
+    fn validate_password_envs(&self) -> Result<(), DomainError> {
+        validate_env_name("arlo.password_env", &self.arlo.password_env)?;
+        if let MfaConfig::Email(EmailMfaConfig {
+            password_env: Some(name),
+            ..
+        }) = &self.arlo.mfa
+        {
+            validate_env_name("arlo.mfa.password_env", name)?;
+        }
+        if let Some(name) = self.mqtt.as_ref().and_then(|m| m.password_env.as_deref()) {
+            validate_env_name("mqtt.password_env", name)?;
+        }
+        Ok(())
+    }
+
     /// Cross-field checks the parser cannot express: no two cameras may
     /// share an `arlo_device_id` (the second would replace the first's
     /// routes) or a `stream_name` (the second would replace the first's
@@ -478,9 +700,28 @@ impl StreamerConfig {
                 )));
             }
             camera.cooldown.validate(&camera.arlo_device_id)?;
+            if let Some(kbps) = camera.bitrate_kbps {
+                validate_bitrate(
+                    &format!("cameras.{}.bitrate_kbps", camera.arlo_device_id),
+                    kbps,
+                )?;
+            }
+        }
+        validate_bitrate("output.bitrate_kbps", self.output.bitrate_kbps)?;
+        self.validate_password_envs()?;
+        if let Some(mqtt) = &self.mqtt {
+            mqtt.validate()?;
         }
         if let Some(hls) = &self.output.hls {
             hls.validate()?;
+        }
+        if self.output.dash.is_some() {
+            return Err(DomainError::InvalidConfig(
+                "[output.dash] was removed in 0.3.0: GStreamer cannot write DASH that \
+                 browsers play without gst-plugins-rs (ADR 0006). Delete the table; \
+                 [output.hls] serves browsers and Home Assistant"
+                    .to_string(),
+            ));
         }
         for (name, bind) in [
             ("output.rtsp.bind", &self.output.rtsp.bind),
@@ -495,6 +736,16 @@ impl StreamerConfig {
         }
         Ok(())
     }
+}
+
+/// A bitrate inside [`MIN_VIDEO_BITRATE_KBPS`]..=[`MAX_VIDEO_BITRATE_KBPS`].
+fn validate_bitrate(name: &str, kbps: u32) -> Result<(), DomainError> {
+    if (MIN_VIDEO_BITRATE_KBPS..=MAX_VIDEO_BITRATE_KBPS).contains(&kbps) {
+        return Ok(());
+    }
+    Err(DomainError::InvalidConfig(format!(
+        "{name} = {kbps} is outside {MIN_VIDEO_BITRATE_KBPS}..={MAX_VIDEO_BITRATE_KBPS} kbit/s"
+    )))
 }
 
 const fn default_debounce() -> u64 {
@@ -516,6 +767,36 @@ mod tests {
 
     /// The shipped example must always parse: it is the first thing a new
     /// user runs, and a stale key there is a boot failure in production.
+    /// A password pasted where its variable's name goes was echoed in the
+    /// boot error (third sweep, S3-L8): refused without the value.
+    #[test]
+    fn a_password_env_that_is_no_variable_name_is_refused_without_its_value() {
+        let raw = include_str!("../../../config/streamer.example.toml");
+        let mut cfg: StreamerConfig = toml::from_str(raw).expect("parses");
+        cfg.validate().expect("the example validates");
+        for bad in ["hunter2 pass!", "9STARTS_WITH_DIGIT", ""] {
+            cfg.arlo.password_env = bad.to_string();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("arlo.password_env"), "{err}");
+            assert!(
+                bad.is_empty() || !err.contains(bad),
+                "the value is not echoed: {err}"
+            );
+        }
+        cfg.arlo.password_env = "ARLO_PASSWORD".to_string();
+        cfg.mqtt = Some(
+            toml::from_str(
+                "url = \"mqtt://broker\"\nusername = \"arlo\"\npassword_env = \"s3cret value\"",
+            )
+            .expect("mqtt"),
+        );
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("mqtt.password_env") && !err.contains("s3cret"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn example_config_file_parses_matching_documented_defaults() {
         let raw = include_str!("../../../config/streamer.example.toml");
@@ -994,6 +1275,193 @@ mod tests {
         assert_eq!(
             hls(u32::MAX, 6).effective_segment_secs(),
             MAX_HLS_SEGMENT_SECS
+        );
+    }
+
+    /// What an empty `[[cameras]]` serves: every device, unique names,
+    /// defaults everywhere else, and a config that validates.
+    #[test]
+    fn cameras_for_devices_name_each_device_uniquely_with_defaults() {
+        let device = |id: &str, name: &str| DiscoveredDevice {
+            id: CameraId::new(id),
+            name: name.to_string(),
+            kind: "camera".to_string(),
+            model: None,
+        };
+        let devices = [
+            device("CAM1", "Living Room"),
+            device("CAM2", "Living room"),
+            device("DB1", "🔔"),
+        ];
+
+        let cameras = CameraConfig::for_devices(&devices);
+
+        let names: Vec<&str> = cameras.iter().map(|c| c.stream_name.as_str()).collect();
+        assert_eq!(names, ["living-room", "living-room-2", "camera-db1"]);
+        assert_eq!(cameras[2].arlo_device_id.as_str(), "DB1");
+        assert!(
+            cameras
+                .iter()
+                .all(|c| c.video_encoder.is_none() && c.bitrate_kbps.is_none())
+        );
+
+        let raw = include_str!("../../../config/streamer.example.toml");
+        let mut cfg: StreamerConfig = toml::from_str(raw).expect("parses");
+        cfg.cameras = cameras;
+        cfg.validate().expect("an auto-filled config validates");
+    }
+
+    #[test]
+    fn a_cameras_own_encoder_and_bitrate_override_the_outputs() {
+        let raw = include_str!("../../../config/streamer.example.toml").to_string();
+        let mut cfg: StreamerConfig = toml::from_str(&raw).expect("parses");
+        assert_eq!(cfg.output.bitrate_kbps, DEFAULT_VIDEO_BITRATE_KBPS);
+        let camera = cfg.cameras[0].clone();
+        assert_eq!(
+            camera.video_encoder_or(&cfg.output),
+            cfg.output.video_encoder
+        );
+        assert_eq!(
+            camera.bitrate_kbps_or(&cfg.output),
+            DEFAULT_VIDEO_BITRATE_KBPS
+        );
+
+        let own: CameraConfig = toml::from_str(
+            "arlo_device_id = \"CAM2\"\nstream_name = \"yard\"\n\
+             video_encoder = \"va\"\nbitrate_kbps = 1000\n",
+        )
+        .expect("parses");
+        assert_eq!(own.video_encoder_or(&cfg.output), VideoEncoder::Va);
+        assert_eq!(own.bitrate_kbps_or(&cfg.output), 1000);
+        cfg.cameras.push(own);
+        cfg.validate().expect("in range");
+    }
+
+    #[test]
+    fn a_bitrate_outside_the_range_is_refused_with_its_name() {
+        let raw = include_str!("../../../config/streamer.example.toml");
+        let cfg: StreamerConfig = toml::from_str(raw).expect("parses");
+        for kbps in [MIN_VIDEO_BITRATE_KBPS - 1, MAX_VIDEO_BITRATE_KBPS + 1] {
+            let mut bad = cfg.clone();
+            bad.output.bitrate_kbps = kbps;
+            let err = bad.validate().unwrap_err().to_string();
+            assert!(err.contains("output.bitrate_kbps"), "{err}");
+
+            let mut bad = cfg.clone();
+            bad.cameras[0].bitrate_kbps = Some(kbps);
+            let err = bad.validate().unwrap_err().to_string();
+            assert!(err.contains(".bitrate_kbps"), "{err}");
+            assert!(
+                err.contains(bad.cameras[0].arlo_device_id.as_str()),
+                "{err}"
+            );
+        }
+        for kbps in [MIN_VIDEO_BITRATE_KBPS, MAX_VIDEO_BITRATE_KBPS] {
+            let mut ok = cfg.clone();
+            ok.output.bitrate_kbps = kbps;
+            ok.cameras[0].bitrate_kbps = Some(kbps);
+            ok.validate().expect("bounds are inclusive");
+        }
+    }
+
+    fn mqtt(url: &str) -> MqttConfig {
+        toml::from_str(&format!("url = \"{url}\"")).expect("parses")
+    }
+
+    #[test]
+    fn mqtt_endpoint_reads_scheme_host_and_port_with_defaults() {
+        let cases = [
+            ("mqtt://broker.lan", false, "broker.lan", 1883),
+            ("mqtts://broker.lan", true, "broker.lan", 8883),
+            ("mqtt://10.0.0.5:1884/", false, "10.0.0.5", 1884),
+            ("mqtts://[fd00::5]:9000", true, "fd00::5", 9000),
+            ("mqtt://[::1]", false, "::1", 1883),
+        ];
+        for (url, tls, host, port) in cases {
+            let endpoint = mqtt(url).endpoint().unwrap();
+            assert_eq!(
+                (endpoint.tls, endpoint.host.as_str(), endpoint.port),
+                (tls, host, port),
+                "{url}"
+            );
+        }
+    }
+
+    /// Credentials belong in `username` / `password_env`, never in the URL.
+    #[test]
+    fn mqtt_endpoint_refuses_other_schemes_credentials_paths_and_bad_ports() {
+        for url in [
+            "http://broker",
+            "tcp://broker:1883",
+            "mqtt://user:secret@broker",
+            "mqtt://broker/topic",
+            "mqtt://broker?x=1",
+            "mqtt://broker:notaport",
+            "mqtt://broker:70000",
+            "mqtt://",
+            "mqtt://[fd00::5",
+        ] {
+            let err = mqtt(url).endpoint().unwrap_err().to_string();
+            assert!(err.contains("mqtt.url"), "{url}: {err}");
+            assert!(!err.contains("secret"), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn mqtt_defaults_and_topic_rules() {
+        let config = mqtt("mqtt://broker");
+        assert_eq!(config.base_topic, "arlo-camera-streamer");
+        assert_eq!(config.discovery_prefix, "homeassistant");
+        assert!(!config.thumbnails, "thumbnails are opt-in");
+        config.validate().expect("defaults validate");
+
+        let off = MqttConfig {
+            discovery_prefix: String::new(),
+            ..config.clone()
+        };
+        off.validate().expect("an empty prefix turns discovery off");
+        for (field, bad) in [
+            ("base", "a/#"),
+            ("base", "a/+/b"),
+            ("base", "/a"),
+            ("base", ""),
+            ("disc", "ha/"),
+        ] {
+            let candidate = if field == "base" {
+                MqttConfig {
+                    base_topic: bad.to_string(),
+                    ..config.clone()
+                }
+            } else {
+                MqttConfig {
+                    discovery_prefix: bad.to_string(),
+                    ..config.clone()
+                }
+            };
+            assert!(candidate.validate().is_err(), "{field} = {bad:?}");
+        }
+        let password_alone = MqttConfig {
+            password_env: Some("PW".to_string()),
+            ..config
+        };
+        assert!(password_alone.validate().is_err());
+    }
+
+    /// 0.3.0 removed DASH: a config that still has the table is told what
+    /// to do, instead of serde's bare "unknown field".
+    #[test]
+    fn a_config_with_the_removed_dash_table_is_refused_with_the_way_out() {
+        let raw = include_str!("../../../config/streamer.example.toml").to_string()
+            + "\n[output.dash]\ndir = \"/var/dash\"\nsegment_secs = 2\n";
+        let cfg: StreamerConfig = toml::from_str(&raw).expect("still parses");
+
+        let err = cfg.validate().unwrap_err().to_string();
+
+        assert!(err.contains("[output.dash] was removed"), "{err}");
+        assert!(err.contains("Delete the table"), "{err}");
+        assert!(
+            !toml::to_string(&cfg).expect("serializes").contains("dash"),
+            "never written back"
         );
     }
 

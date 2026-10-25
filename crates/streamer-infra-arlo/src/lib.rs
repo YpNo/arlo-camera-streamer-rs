@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+mod arlo_api;
 pub mod boot;
 pub mod device_registry;
 pub mod discovery;

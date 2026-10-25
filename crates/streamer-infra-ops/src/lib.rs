@@ -33,6 +33,7 @@ pub mod admin_server;
 pub mod error;
 pub mod health;
 pub mod metrics;
+pub mod mqtt;
 pub mod serve;
 pub mod server;
 

@@ -24,7 +24,7 @@ pub const ALWAYS: &[&str] = &[
     "videotestsrc",
     "textoverlay",
     "gdkpixbufoverlay",
-    "jpegdec",
+    "imagefreeze",
     // Shared video path.
     "appsrc",
     "capsfilter",
@@ -164,18 +164,13 @@ mod tests {
     #[test]
     fn always_lists_every_element_of_the_rtsp_launch_string() {
         let stream_name = StreamName::parse("front_door").unwrap();
-        let idles = [
-            IdleKind::Synthetic {
-                stream_name,
-                overlay: "STANDBY".into(),
-            },
-            IdleKind::JpegStill {
-                jpeg: bytes::Bytes::from_static(b"\xff\xd8"),
-            },
-        ];
+        let idles = [IdleKind::Synthetic {
+            stream_name,
+            overlay: "STANDBY".into(),
+        }];
         for idle in &idles {
-            let Some(factories) = factories_of(&combined_launch_string(idle, EncoderBackend::X264))
-            else {
+            let encoding = crate::encoder::VideoEncoding::at_default_bitrate(EncoderBackend::X264);
+            let Some(factories) = factories_of(&combined_launch_string(idle, encoding)) else {
                 return;
             };
             assert_listed(&factories, ALWAYS);

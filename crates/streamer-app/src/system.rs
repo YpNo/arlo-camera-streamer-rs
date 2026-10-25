@@ -174,7 +174,8 @@ impl StreamerSystem {
         )));
 
         let arlo_connected = Arc::new(AtomicBool::new(false));
-        let admin = AdminControlActor::new(admin_routes, version, arlo_connected.clone());
+        let admin =
+            AdminControlActor::new(admin_routes, version, arlo_connected.clone(), media.clone());
 
         info!(cameras = config.cameras.len(), "streamer system spawned");
         Ok(Self {
@@ -469,6 +470,13 @@ mod tests {
         ) -> Result<(), DomainError> {
             Ok(())
         }
+
+        async fn current_thumbnail(
+            &self,
+            _camera: &CameraId,
+        ) -> Result<Option<Bytes>, DomainError> {
+            Ok(None)
+        }
     }
 
     fn one_camera_config() -> StreamerConfig {
@@ -494,6 +502,7 @@ mod tests {
                 hls: None,
                 dash: None,
                 video_encoder: streamer_domain::config::VideoEncoder::X264,
+                bitrate_kbps: streamer_domain::config::DEFAULT_VIDEO_BITRATE_KBPS,
                 metrics_bind: "127.0.0.1:9090".to_string(),
                 admin_bind: "127.0.0.1:9091".to_string(),
             },
@@ -503,7 +512,10 @@ mod tests {
                 stream_name: StreamName::parse("cam").unwrap(),
                 codec_hint: None,
                 cooldown: CooldownConfig::default(),
+                video_encoder: None,
+                bitrate_kbps: None,
             }],
+            mqtt: None,
         }
     }
 

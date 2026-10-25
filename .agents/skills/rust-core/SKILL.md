@@ -6,11 +6,11 @@ description: Rust workspace conventions for arlo-camera-streamer-rs — build en
 
 ## Build environment
 
-Every cargo command runs in the `rust-build` distrobox (libclang for BoringSSL,
-GStreamer 1.26 dev headers) through mise for the pinned toolchain (1.99.0):
+Every cargo command runs in the `rust` distrobox (libclang for BoringSSL,
+GStreamer 1.26 dev headers) through mise for the pinned toolchain (1.99.1):
 
 ```bash
-distrobox enter rust-build -- bash -lc 'cd ~/workspace/arlo-camera-streamer/arlo-camera-streamer-rs && LIBCLANG_PATH=/usr/lib/llvm-19/lib mise exec -- cargo test --workspace --all-features'
+distrobox enter rust -- bash -lc 'cd ~/workspace/arlo-camera-streamer/arlo-camera-streamer-rs && LIBCLANG_PATH=/usr/lib/llvm-19/lib mise exec -- cargo test --workspace --all-features'
 ```
 
 The first media-crate build is slow; run long builds in the background and wait for

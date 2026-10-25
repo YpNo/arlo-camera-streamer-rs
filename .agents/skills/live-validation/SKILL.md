@@ -1,6 +1,6 @@
 ---
 name: live-validation
-description: Manual live gate against a real Arlo camera — build the release binary in the rust-build distrobox, run it, watch with VLC, and read the log lines that prove each path (motion session, stall, user view, reconnect, idle snapshot). Use after any change to the GStreamer-bound files or to the event/orchestration paths, and when asking the owner for a live check.
+description: Manual live gate against a real Arlo camera — build the release binary in the rust distrobox, run it, watch with VLC, and read the log lines that prove each path (motion session, stall, user view, reconnect, idle snapshot). Use after any change to the GStreamer-bound files or to the event/orchestration paths, and when asking the owner for a live check.
 ---
 # Live Validation Skill
 
@@ -13,7 +13,7 @@ prepares the exact commands and says which log lines to look for.
 The tool shell cannot run the camera session; hand these to the owner.
 
 ```bash
-distrobox enter rust-build -- bash -lc 'cd ~/workspace/arlo-camera-streamer/arlo-camera-streamer-rs && LIBCLANG_PATH=/usr/lib/llvm-19/lib mise exec -- cargo build --release -p arlo-camera-streamer'
+distrobox enter rust -- bash -lc 'cd ~/workspace/arlo-camera-streamer/arlo-camera-streamer-rs && LIBCLANG_PATH=/usr/lib/llvm-19/lib mise exec -- cargo build --release -p arlo-camera-streamer'
 ```
 
 ```bash

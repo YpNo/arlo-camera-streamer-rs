@@ -227,6 +227,16 @@ pub trait MediaMultiplexer: Send + Sync {
     /// be decoded or pushed to the idle source.
     async fn refresh_thumbnail(&self, camera: &CameraId, jpeg: Bytes) -> Result<(), DomainError>;
 
+    /// The JPEG the camera's idle frame shows, as last refreshed; `None`
+    /// before the first one (or before the camera is registered). Reads
+    /// what the adapter holds: no cloud request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::UnknownCamera`] for a camera that is not
+    /// configured.
+    async fn current_thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, DomainError>;
+
     /// Show (`true`) or clear (`false`) the notice that the user is
     /// watching the camera in the Arlo app, on the idle frame: that view
     /// cannot be relayed (ADR 0005), so viewers are told where the live
@@ -265,8 +275,9 @@ pub trait MetricsRecorder: Send + Sync {
         signal: &str,
     );
 
-    /// A motion / audio event arrived from the bus.
-    fn record_motion(&self, camera: &CameraId, outcome: MotionOutcome);
+    /// A trigger pulse arrived: `trigger` names it (`motion`, `audio`,
+    /// `ring`, `admin-wake`), `outcome` says what it did.
+    fn record_motion(&self, camera: &CameraId, trigger: &str, outcome: MotionOutcome);
 
     /// The orchestrator made a budget decision (live granted / denied
     /// because exhausted / reset).
@@ -323,6 +334,15 @@ pub trait AdminControl: Send + Sync {
     /// configured, or [`AdminError::Unavailable`] on a control-plane
     /// transport failure.
     async fn force_idle(&self, camera: &CameraId) -> Result<(), AdminError>;
+
+    /// The JPEG the camera's idle frame shows; `None` before Arlo provided
+    /// one. Read-only: no request reaches Arlo or the camera.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::UnknownCamera`] when `camera` is not
+    /// configured.
+    async fn thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, AdminError>;
 
     /// Manually wake the camera (synthetic motion event), respecting
     /// the daily budget. Useful for healthcheck dashboards.

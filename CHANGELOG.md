@@ -7,6 +7,211 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-24
+
+The GPU encoder on Intel's free driver, an idle stream cheap enough to
+leave Frigate attached to every camera (three of them: about 0.22 core
+on the GPU encoder, against about 2 cores in 0.2), Home Assistant over
+MQTT, a video doorbell's ring as a trigger, and the watch-along relay
+bound to Arlo's domain.
+
+**Upgrading:** remove any `[output.dash]` table from the configuration;
+the daemon now refuses to start with one (it never wrote DASH). Clients
+that ask for RTP over UDP are refused and switch to TCP on their own.
+
+### Removed
+- `[output.dash]`, parsed and ignored since 0.1 (GStreamer cannot write
+  DASH that browsers play without gst-plugins-rs, ADR 0006). A config that
+  still has the table is refused at boot with a message saying to delete
+  it.
+
+### Added
+- A video doorbell's ring starts the live stream like motion (same
+  cooldown and budget): `buttonPressed` under `doorbells/<id>`. On an
+  account the doorbell is shared with, the ring is the only trigger:
+  Arlo never sends a shared account the doorbell's motion (README,
+  "Which Arlo account").
+- `[mqtt]`: each camera's state published to an MQTT broker with Home
+  Assistant discovery (ADR 0009): state, live, app view and live time
+  per camera, the Arlo connection, and the idle picture when
+  `thumbnails = true`. Publish only: nothing on the broker can act on a
+  camera. TLS with the system roots or a `ca_file`; a broker that is down
+  is retried with a growing pause and never stops the daemon; a camera
+  removed from the configuration is removed from Home Assistant.
+- `docs/arlo-protocol-notes.md`: what this project learned about Arlo's
+  undocumented cloud, in one place (login, devices, the MQTT bus, the
+  WebRTC leg, the app's watch-along stream, snapshots).
+- With no `[[cameras]]` block, the daemon serves every camera on the
+  account, each named as `list-devices` suggests (unique, `-2` on a
+  collision), and logs them; the configured-cameras gauge follows.
+- `output.bitrate_kbps` (default 2048, as before) and, per camera,
+  `video_encoder` and `bitrate_kbps` overriding the output's. Each encoder
+  setting in use is probed once at boot; the log names each camera that
+  differs.
+- `--log-format json` (or `STREAMER_LOG_FORMAT=json`): one JSON object per
+  log line, the event's fields at the top level and the enclosing spans
+  (the camera among them) in `spans`, for log pipelines.
+- `GET /admin/cameras/{id}/thumbnail.jpg`: the JPEG the camera's idle
+  frame shows, behind the admin bearer token; `404` before Arlo provided
+  one. It reads the daemon's copy and reaches neither Arlo nor the camera.
+- An opt-in web server for the HLS output in the Compose file:
+  `docker compose --profile hls up -d` serves
+  `http://<host>:8080/hls/<stream_name>/index.m3u8` (unprivileged nginx,
+  read-only, playlists and segments only). Any page a LAN browser opens
+  can reach that port, so it answers local host names only (IP literals,
+  bare names, `.local`, `.lan`, `.home.arpa`, `.internal`: no DNS
+  rebinding), lets no other origin read the files unless listed, and
+  `HLS_PUBLISH` binds it to one address.
+- `va` falls back to Intel's low-power encoder (`vah264lpenc`), the only
+  H.264 encoder Debian's free driver offers from Skylake on: with bitrate
+  control when the GPU's HuC firmware is loaded, at constant quality
+  (QP 26) otherwise. Before, such a box always encoded on the CPU.
+
+### Security
+- Release CI: Trivy is a pinned, checksum-verified binary run as plain
+  steps, so the scanner is never handed the image job's package-push
+  token (trivy-action fetched Trivy at run time with it in reach); the
+  Docker Hub token moves to a `release` environment only `main` may use;
+  a leftover tag on another commit stops the release instead of getting
+  a release whose image is built from `main`; and the published image is
+  scanned weekly, since its Debian packages change only with a release.
+- The watch-along relay dials a raw IP, so it waived the certificate's
+  name and any publicly trusted certificate passed, whatever it named.
+  The certificate must now be valid for a host of Arlo's watch-along
+  tier (`*.wowza.arlo.com`, the name Arlo's certificate carries);
+  anything else is refused and logged with the names it presented (ADR
+  0007).
+- A query string on an RTSP URL (`/front_door?x`) built a second media
+  for the camera on a bare DESCRIBE: it took the camera's live wiring,
+  left the viewers' media without live video once it went, and each
+  distinct query built another encoder pipeline. A mount has one media
+  now, whatever the query.
+- The admin API turns a peer away (429, connection closed, token not
+  compared) after 10 wrong tokens in a minute; wrong tokens used to be
+  limited in the log only. Connection slots count an IPv6 peer per /64
+  and treat `::ffff:127.0.0.1` as loopback.
+- The MQTT adapter encodes and decodes its few packets itself instead of
+  through mqttbytes (unmaintained since 2021; now test-only), and builds
+  the CONNECT carrying the password in a buffer zeroed on drop.
+- Snapshot fetches ignore HTTPS_PROXY / ALL_PROXY (a proxy would resolve
+  the host past the private-address check), and NAT64 addresses of a
+  private host, the local-use NAT64 prefix and the benchmarking, IETF
+  and reserved IPv4 ranges count as private.
+- The HLS directory and its root must belong to the daemon and not be
+  writable by others (a planted symlink would otherwise be followed by
+  the segment writer); the daemon creates them with mode 0750.
+- rustls-webpki 0.103.16 (RUSTSEC-2026-0382: certificate verification
+  could accept distrusted intermediates) and webpki-roots 1.0.10
+  (RUSTSEC-2026-0381: distrusted emSign intermediates were still
+  trusted), for every TLS connection: Arlo, the watch-along relay, the
+  MQTT broker. rustls 0.23.46 (RUSTSEC-2026-0346: `Debug` of a client
+  session value printed TLS secrets; nothing here formats one).
+- tokio 1.54.1 (RUSTSEC-2026-0386: `AsyncFd::new` and related
+  constructors violate I/O safety; the streamer does not call them).
+
+### Fixed
+- The RTSP port and the relay's TLS policy are set up before the Arlo
+  login: a taken port 8554 (or a bad certificate pin) failed the boot
+  only after a successful login, so a restart policy logged in to Arlo
+  at every restart.
+- A `*password_env` that is no environment variable name (a password
+  pasted in the wrong place) is refused at load, naming the key only; it
+  used to be printed in the "not set" error.
+- The continuous-live cap did not hold the camera idle: the next motion
+  pulse, about 10 s later, woke it again, and a source lost right after
+  the attach was renegotiated at every pulse. Motion now waits
+  `debounce_secs` after a session cut by the cap or lost within 15 s of
+  its start (`motion_events_total{outcome="suppressed-cooldown"}`).
+- A camera that failed to attach and then reported itself available
+  skipped its failure backoff; only a camera that went offline ends the
+  backoff early when it comes back.
+- The MQTT published record forgets a removed camera only once the broker
+  answered a ping after the removals: a connection lost before it read
+  them left the camera's topics for good.
+- A login back-off file holding a timestamp past what the clock can
+  hold crashed every boot; it reads as a full pause.
+- A failure to create the WebRTC bus-watch thread failed the live attach
+  with an error instead of panicking in the middle of it.
+- A video doorbell's snapshot after a motion (`fullFrameSnapshotAvailable`,
+  owner account) refreshes its idle picture: it carries
+  `presignedFullFrameSnapshotUrl`, not `presignedLastImageUrl`.
+- Changing `mqtt.base_topic` or `mqtt.discovery_prefix` left what the
+  previous one published on the broker, and the old bridge device in Home
+  Assistant: the record now keeps the layout, and the next connection
+  clears everything published under the old one first.
+- The MQTT bridge gives up on a write after 30 s: a broker whose host
+  vanished without closing the connection blocked it until the kernel
+  dropped the connection, about 15 minutes with no keep-alive and nothing
+  published.
+- `streamer_camera_state` reported a camera in no state at all until its
+  first state change: every row started at 0. A camera's `idle` row
+  starts at 1 now (every camera starts idle).
+- In the container, VLC showed the stream 10 s late (GStreamer clients
+  5 s): it asked for RTP over UDP first, which the TCP-only port mapping
+  never carried back, and waited for it before retrying over TCP. The
+  RTSP server offers TCP only now, so a client asking for UDP is refused
+  and switches at once. The first frame arrives in under 0.4 s.
+- The idle picture's caption (STANDBY, LIVE IN ARLO APP) was hidden under
+  the snapshot, which is scaled to the whole frame and was drawn after
+  it: it is drawn over the snapshot now.
+- The watch-along relay waives the TLS hostname check only for an IP
+  host, as Arlo's URLs use; a DNS host must match its certificate. The
+  certificate's SHA-256 is logged when the waiver applies, and the
+  certificate itself at `debug`, to bind the relay to Arlo's names next.
+- RTSP sessions of clients that disconnected without a TEARDOWN (a crash,
+  a network cut, an NVR restart) were never removed, so the 64-session
+  pool slowly filled up until every new client was refused. Sessions now
+  expire 30 s after their client's last keep-alive; the timeout is
+  announced in the `Session` header (go2rtc, ffmpeg and VLC keep alive
+  within it).
+- The HLS segmenters connect to a second RTSP server on `127.0.0.1` with
+  its own session pool, so LAN clients cannot use up their sessions. A
+  camera still runs one pipeline whichever server a client uses.
+
+### Changed
+- `streamer_motion_events_total` gains a `trigger` label (`motion`,
+  `audio`, `ring`, `admin-wake`), and the `state transition` log line
+  names the trigger: a ring read as motion in both. Queries summed by
+  `outcome` are unchanged.
+- arlo-rs 0.3.1: the MQTT subscription log states the device counts and
+  names the devices without an xCloudId, instead of always ending in
+  "no xCloud ⇒ legacy get_devices, no camera events".
+- arlo-rs 0.3.4 (mailparse 0.18 for the mailbox second factor;
+  stealthscraper-rs 1.0.1, whose brotli 9 removes the duplicate brotli 8
+  chain), which requires Rust 1.99.1: the toolchain, the image's builder
+  and CI move from 1.99.0 to 1.99.1.
+- CI gates a change once, on its pull request: a `plan` job decides what
+  each run deserves from the trigger and the files changed. A merge to
+  `main` no longer re-runs the gates (coverage included); a new version's
+  merge runs format, clippy, tests and cargo-deny before the release; a
+  pull request changing the `Dockerfile` builds and scans the image. A
+  manual run releases only from `main`; a renamed file counts by both of
+  its paths. Codecov gates on the pull request's own lines (patch) and
+  only reports the project total, whose base is now the weekly run.
+- Dependencies refreshed within their versions (29 crates, among them
+  tokio 1.53.2, hyper 1.12.0, aws-lc-rs 1.18.2, serde_json 1.0.154);
+  every direct dependency is on its latest major.
+- The idle picture is drawn once a second and repeated up to 15 fps
+  (`imagefreeze`, ADR 0010) instead of being drawn 15 times a second:
+  its branch costs about 3 % of a core instead of 37–56 % per connected
+  camera on the reference box (14 % instead of 45 % with x264). A new
+  caption shows within a second. The unused JPEG-still idle kind is gone.
+- The `fatal error` log line carries the whole cause chain
+  (`GStreamer plugins: missing GStreamer element(s): textoverlay`), not
+  only the outer context.
+- Text log lines carry colour escape codes only on a terminal; container
+  logs and files showed them as `\x1b[2m…`.
+- The boot log names the encoder element and its rate control
+  (`element=vah264lpenc rate-control=cqp`), and warns when a GPU render
+  node is present but `auto` falls back to x264, with each reason.
+- A hardware plugin that is installed but registered no encoder is
+  reported as a device or driver problem, not as a missing element.
+- The encoder probe runs off the async runtime's worker threads.
+- The Compose file no longer enables a VA-API device with a fixed group
+  id: machine-specific settings go in a gitignored
+  `docker-compose.override.yml`. The README explains `keep-groups` for a
+  GPU under rootless podman.
+
 ## [0.2.1] - 2026-10-09
 
 The first published 0.2 image: 0.2.0 was tagged but its image never
@@ -432,7 +637,8 @@ First release: the daemon as validated on the owner's camera and box.
 - Documentation still described the retired SSE bus and a Chromium
   requirement; both are gone since the move to `arlo-rs` 0.2.0.
 
-[Unreleased]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/YpNo/arlo-camera-streamer-rs/compare/v0.1.0...v0.1.1

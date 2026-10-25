@@ -7,7 +7,7 @@
 - **Domain**: Media Streaming & Home Automation
 - **Primary adapters (inbound)**: RTSP Server, Metrics/Health API
 - **Driven adapters (outbound)**: `arlo-rs` client, GStreamer Pipelines
-- **MSRV**: 1.99.0 (follows arlo-rs 0.3.0)
+- **MSRV**: 1.99.1 (follows arlo-rs 0.3.4)
 - **Async runtime**: tokio
 
 ---
@@ -56,7 +56,7 @@
 
 ```bash
 
-# Run all tests (stable 1.99.0)
+# Run all tests (stable 1.99.1)
 cargo test --workspace --all-features
 
 # Run coverage (requires cargo-tarpaulin)

@@ -33,6 +33,8 @@ const ELEMENTS: &[&str] = &[
     "input-selector",
     "textoverlay",
     "gdkpixbufoverlay",
+    "imagefreeze",
+    "jpegenc",
     "rtspsrc",
     "valve",
 ];
@@ -66,7 +68,19 @@ pub struct Stack {
     pub media: GstMediaMultiplexer<GstPipelineRegistry>,
     pub camera: CameraId,
     server: Arc<RtspServer>,
+    /// This stack's own: a thumbnail one test stores must not become the
+    /// next test's idle picture (a media loads the stored one when built).
+    thumbnails: std::path::PathBuf,
 }
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.thumbnails);
+    }
+}
+
+/// Numbers the stacks of one test process.
+static STACKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl Stack {
     pub fn new(webrtc: WebrtcConfig) -> Self {
@@ -80,13 +94,18 @@ impl Stack {
 
     fn with_outputs(webrtc: WebrtcConfig, hls: Option<HlsOutput>) -> Self {
         let server = RtspServer::start("127.0.0.1:0").expect("rtsp server");
+        let stack = STACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let thumbnails =
-            std::env::temp_dir().join(format!("streamer-it-thumbs-{}", std::process::id()));
+            std::env::temp_dir().join(format!("streamer-it-thumbs-{}-{stack}", std::process::id()));
         streamer_infra_media::prepare_thumbnail_dir(&thumbnails).expect("thumbnail dir");
         let registry = Arc::new(GstPipelineRegistry::new(
             server.clone(),
-            streamer_infra_media::encoder::EncoderBackend::X264,
-            thumbnails,
+            streamer_infra_media::encoder::EncoderPlan::uniform(
+                streamer_infra_media::encoder::VideoEncoding::at_default_bitrate(
+                    streamer_infra_media::encoder::EncoderBackend::X264,
+                ),
+            ),
+            thumbnails.clone(),
         ));
         let camera = CameraId::new(CAMERA);
         let cameras = [CameraConfig {
@@ -94,6 +113,8 @@ impl Stack {
             stream_name: StreamName::parse(STREAM).expect("stream name"),
             codec_hint: None,
             cooldown: CooldownConfig::default(),
+            video_encoder: None,
+            bitrate_kbps: None,
         }];
         let output = OutputConfig {
             rtsp: RtspOutput {
@@ -102,6 +123,7 @@ impl Stack {
             hls,
             dash: None,
             video_encoder: VideoEncoder::X264,
+            bitrate_kbps: streamer_domain::config::DEFAULT_VIDEO_BITRATE_KBPS,
             metrics_bind: "127.0.0.1:0".to_string(),
             admin_bind: "127.0.0.1:0".to_string(),
         };
@@ -119,6 +141,7 @@ impl Stack {
             media,
             camera,
             server,
+            thumbnails,
         }
     }
 
