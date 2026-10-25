@@ -1,0 +1,17 @@
+# Coverage is measured on pull requests that change Rust code and weekly
+# on main (ci.yml's plan job), not on every merge, so a pull request's
+# base report can be a few days old. The patch status (the pull
+# request's own changed lines) needs no base; the project status compares
+# with whatever base exists, so it only informs. The 88 % floor is
+# enforced by cargo-tarpaulin in CI, not here.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        target: auto
+comment:
+  # Comment even when no base report is found.
+  require_base: false

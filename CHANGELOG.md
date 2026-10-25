@@ -116,7 +116,10 @@ that ask for RTP over UDP are refused and switch to TCP on their own.
   each run deserves from the trigger and the files changed. A merge to
   `main` no longer re-runs the gates (coverage included); a new version's
   merge runs format, clippy, tests and cargo-deny before the release; a
-  pull request changing the `Dockerfile` builds and scans the image.
+  pull request changing the `Dockerfile` builds and scans the image. A
+  manual run releases only from `main`; a renamed file counts by both of
+  its paths. Codecov gates on the pull request's own lines (patch) and
+  only reports the project total, whose base is now the weekly run.
 - Dependencies refreshed within their versions (29 crates, among them
   tokio 1.53.2, hyper 1.12.0, aws-lc-rs 1.18.2, serde_json 1.0.154);
   every direct dependency is on its latest major.

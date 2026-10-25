@@ -18,7 +18,7 @@ name: Rust CI
 #     on its pull request.
 #   - weekly schedule: the audit, plus one coverage and SonarQube baseline
 #     on main for the pull requests to compare against.
-#   - workflow_dispatch: the gates, then the release job.
+#   - workflow_dispatch: the gates; on main, then the release job.
 # A stage that fails skips the costlier ones after it. Docs-only changes
 # never trigger the workflow (paths-ignore); the secret scan has its own.
 on:
@@ -92,11 +92,13 @@ jobs:
           set -euo pipefail
           is() { [ "$1" = true ]; }
           is_pr=false; [ "$EVENT" = pull_request ] && is_pr=true
-          main_push=false
-          if [ "$EVENT" = push ]; then
-            case "$REF" in refs/heads/main|refs/heads/master) main_push=true;; esac
-          fi
+          on_main=false
+          case "$REF" in refs/heads/main|refs/heads/master) on_main=true;; esac
+          main_push=false; { [ "$EVENT" = push ] && is $on_main; } && main_push=true
           dispatch=false; [ "$EVENT" = workflow_dispatch ] && dispatch=true
+          # Only a manual run on main may release: on another branch it
+          # would tag and publish unmerged code.
+          main_dispatch=false; { is $dispatch && is $on_main; } && main_dispatch=true
           schedule=false; [ "$EVENT" = schedule ] && schedule=true
           bot_pr=false
           if is $is_pr; then
@@ -107,7 +109,10 @@ jobs:
           # What a pull request changes. An API error runs everything.
           code=false; ci=false; image=false
           if is $is_pr; then
-            if files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename'); then
+            # A rename counts by both paths: moving a file out of crates/
+            # changes the code too.
+            if files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" \
+                --jq '.[] | .filename, (.previous_filename // empty)'); then
               has() { printf '%s\n' "$files" | grep -Eq "$1"; }
               has '^(crates/|config/|\.cargo/|Cargo\.(toml|lock)$|(clippy|rustfmt|rust-toolchain)\.toml$|sonar-project\.properties$)' && code=true
               has '^\.github/workflows/' && ci=true
@@ -121,7 +126,7 @@ jobs:
           # Whether main now holds a version with no release yet. An API
           # error counts as new: the gates run, and the release job decides.
           new_version=false
-          if is $main_push || is $dispatch; then
+          if is $main_push || is $main_dispatch; then
             version=v$(gh api "repos/$REPO/contents/Cargo.toml?ref=$SHA" --jq .content \
               | base64 -d | grep -m1 '^version' | cut -d'"' -f2)
             if out=$(gh release view "$version" -R "$REPO" --json tagName 2>&1); then
@@ -141,7 +146,7 @@ jobs:
           sonar=false; { is $coverage && ! is $fork_pr; } && sonar=true
           audits=false; { is $is_pr || is $new_version || is $dispatch || is $schedule; } && audits=true
           image_pr=false; { is $is_pr && is $image; } && image_pr=true
-          release_check=false; { is $main_push || is $dispatch; } && release_check=true
+          release_check=false; { is $main_push || is $main_dispatch; } && release_check=true
 
           {
             echo "### Plan for \`$EVENT\` (code=$code, workflows=$ci, image=$image)"
