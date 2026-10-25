@@ -79,6 +79,9 @@ that ask for RTP over UDP are refused and switch to TCP on their own.
   constructors violate I/O safety; the streamer does not call them).
 
 ### Fixed
+- A video doorbell's snapshot after a motion (`fullFrameSnapshotAvailable`,
+  owner account) refreshes its idle picture: it carries
+  `presignedFullFrameSnapshotUrl`, not `presignedLastImageUrl`.
 - Changing `mqtt.base_topic` or `mqtt.discovery_prefix` left what the
   previous one published on the broker, and the old bridge device in Home
   Assistant: the record now keeps the layout, and the next connection

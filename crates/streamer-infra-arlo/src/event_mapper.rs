@@ -18,7 +18,7 @@
 //! | [`CameraEvent::ManualStreamEnded`] | `{class}/{device_id}` | `activityState == "idle"`            |
 //! | [`CameraEvent::Online`] | `{class}/{device_id}`   | `connectionState == "available"`              |
 //! | [`CameraEvent::Offline`]| `{class}/{device_id}`   | `connectionState == "unavailable"`            |
-//! | [`CameraEvent::SnapshotAvailable`] | `{class}/{device_id}` | `presignedLastImageUrl` is a non-empty string |
+//! | [`CameraEvent::SnapshotAvailable`] | `{class}/{device_id}` | `presignedLastImageUrl` (or a doorbell's `presignedFullFrameSnapshotUrl`) is a non-empty string |
 //!
 //! Precedence is the table order: a payload carrying both a motion
 //! flag and an activity state is the motion recording starting, and the
@@ -48,6 +48,9 @@ const ACTIVITY_STATE: &str = "activityState";
 const USER_STREAM_ACTIVE: &str = "userStreamActive";
 const ACTIVITY_IDLE: &str = "idle";
 const PRESIGNED_LAST_IMAGE_URL: &str = "presignedLastImageUrl";
+/// A video doorbell's snapshot (`fullFrameSnapshotAvailable`) carries
+/// this one instead.
+const PRESIGNED_FULL_FRAME_URL: &str = "presignedFullFrameSnapshotUrl";
 
 /// Translate an [`ArloEvent`] to a domain [`CameraEvent`], returning
 /// [`None`] when the event is uninteresting or malformed.
@@ -95,12 +98,15 @@ pub fn map_event(event: &ArloEvent) -> Option<CameraEvent> {
 #[must_use]
 pub fn snapshot_url(event: &ArloEvent) -> Option<(&str, &str)> {
     let device_id = device_resource_id(&event.resource)?;
-    let url = event
-        .properties
-        .as_ref()?
-        .get(PRESIGNED_LAST_IMAGE_URL)
-        .and_then(Value::as_str)
-        .filter(|u| !u.is_empty())?;
+    let props = event.properties.as_ref()?;
+    let url = [PRESIGNED_LAST_IMAGE_URL, PRESIGNED_FULL_FRAME_URL]
+        .into_iter()
+        .find_map(|key| {
+            props
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|u| !u.is_empty())
+        })?;
     Some((device_id, url))
 }
 
@@ -196,6 +202,45 @@ mod tests {
         // The doorbell's own SIP call state accompanies a live session.
         let sip = ev("doorbells/DB1", Some(json!({ "sipCallActive": true })));
         assert!(map_event(&sip).is_none());
+    }
+
+    /// The doorbell's snapshot after a motion (owner account,
+    /// 2026-10-21): `fullFrameSnapshotAvailable` with a full-frame URL and
+    /// no `presignedLastImageUrl`; its idle picture never refreshed.
+    #[test]
+    fn a_full_frame_snapshot_refreshes_the_idle_picture() {
+        let event = ArloEvent {
+            action: "fullFrameSnapshotAvailable".to_string(),
+            ..ev(
+                "cameras/DB1",
+                Some(json!({
+                    "disablePrivacyZones": false,
+                    "presignedFullFrameSnapshotUrl": "https://s3.example/full.jpg"
+                })),
+            )
+        };
+        assert_eq!(
+            map_event(&event),
+            Some(CameraEvent::SnapshotAvailable {
+                device_id: CameraId::new("DB1")
+            })
+        );
+        assert_eq!(
+            snapshot_url(&event),
+            Some(("DB1", "https://s3.example/full.jpg"))
+        );
+        // The last image wins when both come.
+        let both = ev(
+            "cameras/DB1",
+            Some(json!({
+                "presignedFullFrameSnapshotUrl": "https://s3.example/full.jpg",
+                "presignedLastImageUrl": "https://s3.example/last.jpg"
+            })),
+        );
+        assert_eq!(
+            snapshot_url(&both),
+            Some(("DB1", "https://s3.example/last.jpg"))
+        );
     }
 
     /// The doorbell's motion comes under its camera resource (owner
