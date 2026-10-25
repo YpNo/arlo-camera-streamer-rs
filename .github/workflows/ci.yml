@@ -16,8 +16,10 @@ name: Rust CI
 #   - any other push to main: the release job's image check only (a
 #     released version missing a platform is rebuilt); the code was gated
 #     on its pull request.
-#   - weekly schedule: the audit, plus one coverage and SonarQube baseline
-#     on main for the pull requests to compare against.
+#   - weekly schedule: the audit, one coverage and SonarQube baseline on
+#     main for the pull requests to compare against, and a scan of the
+#     published image (base-image and Debian fixes ship only with a
+#     release, so a fixable finding calls for a patch release).
 #   - workflow_dispatch: the gates; on main, then the release job.
 # A stage that fails skips the costlier ones after it. Docs-only changes
 # never trigger the workflow (paths-ignore); the secret scan has its own.
@@ -75,6 +77,7 @@ jobs:
       sonar: ${{ steps.plan.outputs.sonar }}
       audits: ${{ steps.plan.outputs.audits }}
       image_pr: ${{ steps.plan.outputs.image_pr }}
+      image_scan: ${{ steps.plan.outputs.image_scan }}
       release_check: ${{ steps.plan.outputs.release_check }}
       new_version: ${{ steps.plan.outputs.new_version }}
     steps:
@@ -146,6 +149,7 @@ jobs:
           sonar=false; { is $coverage && ! is $fork_pr; } && sonar=true
           audits=false; { is $is_pr || is $new_version || is $dispatch || is $schedule; } && audits=true
           image_pr=false; { is $is_pr && is $image; } && image_pr=true
+          image_scan=$schedule
           release_check=false; { is $main_push || is $main_dispatch; } && release_check=true
 
           {
@@ -163,6 +167,7 @@ jobs:
           out sonar "$sonar"
           out audits "$audits"
           out image_pr "$image_pr"
+          out image_scan "$image_scan"
           out release_check "$release_check"
           out new_version "$new_version"
 
@@ -406,17 +411,70 @@ jobs:
           # Reads the release builds' cache; writes nothing, so a pull
           # request never changes what a release starts from.
           cache-from: type=gha,scope=image-linux/amd64
+      # Trivy is a pinned, checksum-verified binary run as plain steps,
+      # which are handed none of the job's tokens. trivy-action downloaded
+      # Trivy at run time with the job token in reach (its tags were
+      # hijacked in 2026-03). The image jobs reuse this step by its anchor:
+      # a composite action in the repository would be missing from an
+      # older tag's checkout.
+      - &install-trivy
+        name: Install Trivy (pinned binary release, checksum-verified)
+        # Bump the version and both digests together; the digests are the
+        # ones GitHub publishes for the (immutable) release assets.
+        env:
+          TRIVY_VERSION: "0.76.1"
+          TRIVY_SHA256_AMD64: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+          TRIVY_SHA256_ARM64: e174dff2a6dba5e3ae41f8d0537a6324405bd08132497340304c6b20e0f16a1f
+        run: |
+          case "$RUNNER_ARCH" in
+            X64) asset=Linux-64bit; digest=$TRIVY_SHA256_AMD64 ;;
+            ARM64) asset=Linux-ARM64; digest=$TRIVY_SHA256_ARM64 ;;
+            *) echo "::error::no Trivy digest for $RUNNER_ARCH"; exit 1 ;;
+          esac
+          curl -sSfL -o /tmp/trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_${asset}.tar.gz"
+          echo "${digest}  /tmp/trivy.tar.gz" | sha256sum --check --strict
+          sudo tar xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy
+          rm /tmp/trivy.tar.gz
+          trivy --version
       - name: Vulnerability gate
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
           TRIVY_PLATFORM: linux/amd64
+        run: |
+          trivy image --input /tmp/image --severity CRITICAL,HIGH \
+            --ignore-unfixed --ignorefile .trivyignore --exit-code 1
+
+  # The published image, scanned weekly: it changes only with a release,
+  # while advisories keep arriving for its Debian packages. A fixable
+  # CRITICAL or HIGH fails the run, which calls for a patch release.
+  image-scan:
+    name: Published image scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [plan]
+    if: needs.plan.outputs.image_scan == 'true'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(vars.IMAGE_PLATFORMS || '["linux/amd64"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          input: /tmp/image
-          format: table
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          trivyignores: .trivyignore
-          exit-code: '1'
+          persist-credentials: false
+          sparse-checkout: .trivyignore
+          sparse-checkout-cone-mode: false
+      - *install-trivy
+      - name: Vulnerability gate
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:latest
+          TRIVY_PLATFORM: ${{ matrix.platform }}
+        run: |
+          # Lowercase: github.repository keeps the owner's case. The image
+          # is public, so it is pulled anonymously.
+          trivy image --severity CRITICAL,HIGH --ignore-unfixed \
+            --ignorefile .trivyignore --exit-code 1 "${IMAGE,,}"
 
   # The GitHub release: a push to main whose Cargo.toml version has no
   # release yet gets tagged `v<version>` with generated notes, once the
@@ -475,6 +533,32 @@ jobs:
             echo "::error::cannot tell whether $VERSION is released: $out"
             exit 1
           fi
+
+      - name: Commit the version is built from
+        id: commit
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CREATED: ${{ steps.exists.outputs.created }}
+        run: |
+          # A new release tags this commit; an existing one keeps its tag.
+          # A tag left without a release (a release deleted without its
+          # tag, a hand-pushed tag) on another commit would get the release
+          # while the image is built from this one: stop instead.
+          tagged=$(git rev-parse -q --verify "refs/tags/$VERSION^{commit}" || true)
+          if [ "$CREATED" = "true" ]; then
+            if [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
+              echo "::error::tag $VERSION points at $tagged, not $GITHUB_SHA, and has no release; delete the tag or bump the version"
+              exit 1
+            fi
+            sha="$GITHUB_SHA"
+          elif [ -n "$tagged" ]; then
+            sha="$tagged"
+          else
+            echo "::error::release $VERSION exists but its tag does not"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "$VERSION is built from $sha"
 
       # The image jobs key on this, not on `created`: a run cancelled or
       # failed after the tag can be re-run and still publish the image.
@@ -535,28 +619,14 @@ jobs:
           tag_name: ${{ steps.version.outputs.version }}
           name: Release ${{ steps.version.outputs.version }}
           generate_release_notes: true
-          target_commitish: ${{ github.sha }}
-
-      - name: Commit the version is built from
-        id: commit
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          CREATED: ${{ steps.exists.outputs.created }}
-        run: |
-          # A new release tags this commit; an existing one keeps its tag.
-          if [ "$CREATED" = "true" ]; then
-            sha="$GITHUB_SHA"
-          else
-            sha=$(git rev-list -n 1 "refs/tags/$VERSION")
-          fi
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "$VERSION is built from $sha"
+          target_commitish: ${{ steps.commit.outputs.sha }}
 
   # The container image, one per released version, to GHCR as
   # ghcr.io/<owner>/<repo>:<version>, :latest and :sha-<commit>, and to
   # Docker Hub as docker.io/<DOCKERHUB_USERNAME>/<repo> with the same tags
   # when the repository variable DOCKERHUB_USERNAME and the secret
-  # DOCKERHUB_TOKEN are set (GHCR alone otherwise). Built per platform on a
+  # DOCKERHUB_TOKEN (of the `release` environment) are set (GHCR alone
+  # otherwise). Built per platform on a
   # native runner and pushed by digest to every registry at once, scanned,
   # then tagged as one manifest list per registry. The platforms come from
   # the repository variable IMAGE_PLATFORMS (set to
@@ -579,6 +649,9 @@ jobs:
     # always(): the release job's own gates may have been skipped by the
     # plan, and a skipped ancestor would skip this job too.
     if: always() && needs.release.result == 'success' && needs.release.outputs.image_missing == 'true'
+    # DOCKERHUB_TOKEN is an environment secret of `release`, which only
+    # main may deploy to: a workflow pushed to another branch cannot read it.
+    environment: release
     strategy:
       fail-fast: true
       matrix:
@@ -643,31 +716,19 @@ jobs:
           cache-from: type=gha,scope=image-${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=image-${{ matrix.platform }}
       # Report HIGH and CRITICAL; stop on any fixable one (.trivyignore
-      # holds the reviewed exceptions, none so far).
-      - name: Vulnerability report
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      # holds the reviewed exceptions, none so far). Trivy is never handed
+      # this job's token (packages: write): see the install step.
+      - *install-trivy
+      - name: Vulnerability report and gate
         env:
           # The layout is a one-platform index (the image plus its
           # attestations); without this Trivy looks for linux/amd64 in it
-          # and fails on the arm64 leg. The action has no platform input,
-          # Trivy reads TRIVY_PLATFORM for --platform.
+          # and fails on the arm64 leg.
           TRIVY_PLATFORM: ${{ matrix.platform }}
-        with:
-          input: /tmp/image
-          format: table
-          severity: CRITICAL,HIGH
-          exit-code: '0'
-      - name: Vulnerability gate
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        env:
-          TRIVY_PLATFORM: ${{ matrix.platform }}
-        with:
-          input: /tmp/image
-          format: table
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          trivyignores: .trivyignore
-          exit-code: '1'
+        run: |
+          trivy image --input /tmp/image --severity CRITICAL,HIGH --exit-code 0
+          trivy image --input /tmp/image --severity CRITICAL,HIGH \
+            --ignore-unfixed --ignorefile .trivyignore --exit-code 1 --skip-db-update
       - run: rm -rf /tmp/image
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -715,6 +776,7 @@ jobs:
     timeout-minutes: 20
     needs: [release, image]
     if: always() && needs.release.result == 'success' && needs.image.result == 'success'
+    environment: release # DOCKERHUB_TOKEN, see the image job
     permissions:
       contents: read
       packages: write

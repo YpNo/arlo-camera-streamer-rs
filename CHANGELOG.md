@@ -57,13 +57,24 @@ that ask for RTP over UDP are refused and switch to TCP on their own.
 - An opt-in web server for the HLS output in the Compose file:
   `docker compose --profile hls up -d` serves
   `http://<host>:8080/hls/<stream_name>/index.m3u8` (unprivileged nginx,
-  read-only, playlists and segments only, CORS open).
+  read-only, playlists and segments only). Any page a LAN browser opens
+  can reach that port, so it answers local host names only (IP literals,
+  bare names, `.local`, `.lan`, `.home.arpa`, `.internal`: no DNS
+  rebinding), lets no other origin read the files unless listed, and
+  `HLS_PUBLISH` binds it to one address.
 - `va` falls back to Intel's low-power encoder (`vah264lpenc`), the only
   H.264 encoder Debian's free driver offers from Skylake on: with bitrate
   control when the GPU's HuC firmware is loaded, at constant quality
   (QP 26) otherwise. Before, such a box always encoded on the CPU.
 
 ### Security
+- Release CI: Trivy is a pinned, checksum-verified binary run as plain
+  steps, so the scanner is never handed the image job's package-push
+  token (trivy-action fetched Trivy at run time with it in reach); the
+  Docker Hub token moves to a `release` environment only `main` may use;
+  a leftover tag on another commit stops the release instead of getting
+  a release whose image is built from `main`; and the published image is
+  scanned weekly, since its Debian packages change only with a release.
 - The watch-along relay dials a raw IP, so it waived the certificate's
   name and any publicly trusted certificate passed, whatever it named.
   The certificate must now be valid for a host of Arlo's watch-along

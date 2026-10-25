@@ -99,6 +99,10 @@ services:
   #   docker compose --profile hls up -d
   # Needs [output.hls] dir = "/var/lib/arlo-streamer/hls" in the config.
   # Playlists: http://<host>:8080/hls/<stream_name>/index.m3u8
+  # Web pages a LAN browser opens can reach this port, unlike the RTSP one:
+  # deploy/nginx-hls.conf answers only local host names and no other
+  # origin. HLS_PUBLISH in .env binds it to one address, e.g.
+  # HLS_PUBLISH=192.168.1.10:8080 (all interfaces by default).
   hls:
     profiles: [hls]
     image: docker.io/nginxinc/nginx-unprivileged:1.30.5-alpine@sha256:15c994d10d6d78658721c3bcafff14cb281fba2a4bdf9d5ba92c416a472516e3
@@ -110,7 +114,7 @@ services:
       - ./data/hls:/usr/share/nginx/html/hls:ro
       - ./deploy/nginx-hls.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
-      - "8080:8080"
+      - "${HLS_PUBLISH:-8080}:8080"
     read_only: true
     tmpfs:
       - /tmp

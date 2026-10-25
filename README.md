@@ -215,6 +215,7 @@ budget and probe 0 to 86400 s).
 | `STREAMER_MQTT_PASSWORD` (or whatever you put in `mqtt.password_env`) | The MQTT broker's password, with `[mqtt]` and a `username`. |
 | `STREAMER_LOG_FORMAT` | Optional. `text` (default) or `json`, one object per line for a log pipeline; same as `--log-format`. See [Logging and debugging](#logging-and-debugging). |
 | `GST_DEBUG` | Optional. GStreamer's own debug output, off by default; see [GStreamer debugging](#gstreamer-debugging). |
+| `HLS_PUBLISH` | Optional, Compose only. Where the `hls` profile's web server is published, default `8080` (all interfaces); `192.168.1.10:8080` binds one address. See [Serving HLS](#serving-hls). |
 
 ## Usage
 
@@ -415,9 +416,22 @@ docker compose --profile hls up -d
 
 Playlists are then at `http://<host>:8080/hls/<stream_name>/index.m3u8`,
 for VLC, Home Assistant's camera card or a page with hls.js. It serves
-playlists (never cached) and segments only, with CORS open to any origin;
-everything else is a 404 ([`deploy/nginx-hls.conf`](./deploy/nginx-hls.conf)).
-Like the RTSP port, it is meant for a trusted LAN.
+playlists (never cached) and segments only; everything else is a 404
+([`deploy/nginx-hls.conf`](./deploy/nginx-hls.conf)). Like the RTSP port,
+it is meant for a trusted LAN, but any web page a LAN browser opens can
+reach it too, so it guards against such pages:
+
+- **Host names**: it answers a request addressed to an IP address, a bare
+  host name (`nas`), `localhost`, or a `.local`, `.lan`, `.home.arpa` or
+  `.internal` name, and closes the connection for any other name (a
+  public name pointed at your LAN, DNS rebinding). Reach it through a name
+  of your own? Add it to `server_name` in the file.
+- **CORS**: no other origin may read the files. Players that fetch them
+  themselves (VLC, Home Assistant's camera integration, Frigate) need
+  nothing; a page on another origin playing them with hls.js needs its
+  origin in the file's `map $http_origin` list.
+- **Port**: `HLS_PUBLISH=192.168.1.10:8080` in `.env` binds it to one
+  address instead of all of them.
 
 ### Home Assistant (MQTT)
 
@@ -938,7 +952,7 @@ each run shows the plan.
 | Any other PR (Compose, `deploy/`, `scripts/`) | cargo-deny |
 | Push to `main` with a version that has no release yet | format → clippy → tests and cargo-deny, then the release and the image (no coverage: it ran on the PR) |
 | Any other push to `main` | the image check only (below) |
-| Weekly schedule | cargo-deny, plus a coverage and SonarCloud baseline on `main` for PRs to compare against |
+| Weekly schedule | cargo-deny, a coverage and SonarCloud baseline on `main` for PRs to compare against, and a Trivy scan of the published `latest` image |
 | Manual run | the gates, then the release job |
 
 A failed stage skips the costlier ones after it, and docs-only changes
@@ -952,18 +966,22 @@ release yet gets a GitHub release tagged `v<version>`, then the container
 image for that version, built from the tag's commit: per platform on
 native runners, into a local OCI layout scanned with Trivy before any
 registry login (a fixable CRITICAL or HIGH finding stops the release;
-reviewed exceptions go in `.trivyignore`), then pushed by digest and
+reviewed exceptions go in `.trivyignore`; Trivy is a pinned,
+checksum-verified binary, never handed a token), then pushed by digest and
 tagged `v<version>`, `latest` and `sha-<commit>` on
 `ghcr.io/ypno/arlo-camera-streamer-rs` and on
 `docker.io/ypno/arlo-camera-streamer-rs` (Docker Hub needs the repository
-variable `DOCKERHUB_USERNAME` and the secret `DOCKERHUB_TOKEN`; without
-them GHCR alone is published). The image build keeps its layers in the
+variable `DOCKERHUB_USERNAME` and the secret `DOCKERHUB_TOKEN` of the
+`release` environment, which only `main` may use; without them GHCR alone
+is published). A tag left on another commit without a release (a release
+deleted without its tag) stops the release job. The image build keeps its layers in the
 Actions cache per platform, so the dependency layer (only changed by
 `Cargo.lock`) is not recompiled at every release. A version whose image
 is missing a platform in any registry is rebuilt from its tag on the next
 push to `main`; a registry error fails the run instead of being read as "absent".
 A fix to the image itself (the `Dockerfile`) therefore ships with a new
-version. A push without a version bump publishes nothing, and no crate is
+version, and so do base-image and Debian fixes: when the weekly scan of
+the published image fails on a fixable finding, cut a patch release. A push without a version bump publishes nothing, and no crate is
 ever published: the workspace is `publish = false`.
 
 Releasing is therefore: bump `version` in `Cargo.toml`, move the
