@@ -99,6 +99,14 @@ that ask for RTP over UDP are refused and switch to TCP on their own.
   constructors violate I/O safety; the streamer does not call them).
 
 ### Fixed
+- The continuous-live cap did not hold the camera idle: the next motion
+  pulse, about 10 s later, woke it again, and a source lost right after
+  the attach was renegotiated at every pulse. Motion now waits
+  `debounce_secs` after a session cut by the cap or lost within 15 s of
+  its start (`motion_events_total{outcome="suppressed-cooldown"}`).
+- A camera that failed to attach and then reported itself available
+  skipped its failure backoff; only a camera that went offline ends the
+  backoff early when it comes back.
 - The MQTT published record forgets a removed camera only once the broker
   answered a ping after the removals: a connection lost before it read
   them left the camera's topics for good.

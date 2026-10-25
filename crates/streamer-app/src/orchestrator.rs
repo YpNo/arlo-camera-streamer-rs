@@ -126,6 +126,10 @@ const ACTIVATION_SURCHARGE_SECS: i64 = 15;
 /// and negotiated only to be cut at once.
 const MIN_USEFUL_SESSION_SECS: i64 = 15;
 
+/// The trigger label of an admin wake: an operator's explicit request,
+/// not held after a capped session (it has its own interval).
+const ADMIN_WAKE_TRIGGER: &str = "admin-wake";
+
 /// Per-camera state-machine task.
 pub struct CameraOrchestrator {
     camera_id: CameraId,
@@ -183,6 +187,18 @@ pub struct CameraOrchestrator {
     /// When the last live session or activation attempt ended; a manual
     /// wake within [`ADMIN_WAKE_MIN_INTERVAL`] of it is refused.
     last_session_end: Option<Instant>,
+    /// Motion may not start a session before this: set when a motion
+    /// session is cut by the continuous-live cap or lost within
+    /// [`MIN_USEFUL_SESSION_SECS`] of its attach, or the next pulse (~10 s
+    /// later) woke the camera again at once (third sweep, S3-Z2).
+    motion_rearm_after: Option<Instant>,
+    /// How long that hold lasts: the camera's `debounce_secs`.
+    rearm_hold: Duration,
+    /// When the running motion session attached.
+    live_attached_at: Option<Instant>,
+    /// The camera last reported itself unavailable: only then does an
+    /// `available` report end the failure backoff early (S3-Z3).
+    offline_reported: bool,
     /// Until when, after a probe, the camera's `idle` report is awaited
     /// in `Idle`; `None` outside a probe.
     probe_until: Option<Instant>,
@@ -270,6 +286,10 @@ impl CameraOrchestrator {
                 .then(|| Duration::from_secs(config.cooldown.user_view_probe_secs)),
             probe_until: None,
             last_session_end: None,
+            motion_rearm_after: None,
+            rearm_hold: Duration::from_secs(config.cooldown.debounce_secs),
+            live_attached_at: None,
+            offline_reported: false,
             signaler,
             thumbnails,
             media,
@@ -454,7 +474,7 @@ impl CameraOrchestrator {
                 // Same guards as a real pulse: absorbed during a manual
                 // session, no stale debouncer priming in BatteryProtect /
                 // Failed, budget checked.
-                let Some(signal) = self.motion_signal("admin-wake") else {
+                let Some(signal) = self.motion_signal(ADMIN_WAKE_TRIGGER) else {
                     return;
                 };
                 if let Err(e) = self.process_signals(VecDeque::from([signal])).await {
@@ -572,10 +592,13 @@ impl CameraOrchestrator {
                 self.on_snapshot_available().await;
                 return Ok(());
             }
-            // A camera back online while in `Failed` ends the backoff
-            // early; otherwise the report changes nothing.
+            // A camera back online after it went offline ends the backoff
+            // early. A failed attach keeps its backoff: a camera reporting
+            // itself online after each failed wake would otherwise be
+            // retried at every pulse.
             CameraEvent::Online { .. } => {
-                if matches!(self.state, CameraState::Failed { .. }) {
+                let was_offline = std::mem::replace(&mut self.offline_reported, false);
+                if was_offline && matches!(self.state, CameraState::Failed { .. }) {
                     info!("camera back online; leaving the failure backoff early");
                     StateTransition::BackoffElapsed
                 } else {
@@ -584,6 +607,7 @@ impl CameraOrchestrator {
                 }
             }
             CameraEvent::Offline { .. } => {
+                self.offline_reported = true;
                 StateTransition::Failure("camera went offline".to_string())
             }
         };
@@ -614,6 +638,18 @@ impl CameraOrchestrator {
         // debouncer (the cooldown would end the relay) nor reach the
         // budget check (an exhausted quota would cut the viewers' picture
         // until the reset).
+        if trigger != ADMIN_WAKE_TRIGGER
+            && self.state == CameraState::Idle
+            && self.motion_rearm_after.is_some_and(|at| now() < at)
+        {
+            debug!(
+                trigger,
+                "pulse within the hold after a capped or lost session; not activating"
+            );
+            self.metrics
+                .record_motion(&self.camera_id, trigger, MotionOutcome::SuppressedCooldown);
+            return None;
+        }
         if self.session_source == Some(LiveSource::UserView) {
             debug!(trigger, "pulse during a relayed user view; absorbed");
             self.metrics
@@ -876,6 +912,31 @@ impl CameraOrchestrator {
         self.process_signals(VecDeque::from([signal])).await
     }
 
+    /// After a motion session cut by the continuous-live cap, or lost
+    /// within [`MIN_USEFUL_SESSION_SECS`] of its attach, hold motion off
+    /// for [`Self::rearm_hold`].
+    fn arm_motion_hold(&mut self, from: &CameraState, to: &CameraState, signal: &StateTransition) {
+        if *from != CameraState::Live
+            || *to != CameraState::Idle
+            || self.session_source != Some(LiveSource::Motion)
+        {
+            return;
+        }
+        let attached_for = self
+            .live_attached_at
+            .take()
+            .map(|at| now().saturating_duration_since(at));
+        let early_loss = matches!(signal, StateTransition::LiveLost(_))
+            && attached_for.is_some_and(|d| d.as_secs() < MIN_USEFUL_SESSION_SECS.unsigned_abs());
+        if matches!(signal, StateTransition::MaxLiveExceeded) || early_loss {
+            info!(
+                hold_secs = self.rearm_hold.as_secs(),
+                "motion held off after a capped or short session"
+            );
+            self.motion_rearm_after = Some(now() + self.rearm_hold);
+        }
+    }
+
     async fn process_signals(
         &mut self,
         mut signals: VecDeque<StateTransition>,
@@ -900,6 +961,7 @@ impl CameraOrchestrator {
             } else {
                 info!(?from, ?to, ?signal, "state transition");
             }
+            self.arm_motion_hold(&from, &to, &signal);
             self.state = to.clone();
             // ADR 0004 invariant: the session handle lives exactly as
             // long as the camera is live. Dropping it here, before any
@@ -1003,6 +1065,7 @@ impl CameraOrchestrator {
                     let segment = self.probe_interval.unwrap_or(self.relay_cap);
                     self.relay_deadline = Some(now() + segment);
                 } else {
+                    self.live_attached_at = Some(now());
                     self.debouncer.on_live_attached(now());
                     self.budget.on_live_started(moment());
                 }
@@ -2833,6 +2896,88 @@ mod tests {
 
         let calls = media.calls().await;
         assert!(calls.contains(&MediaCall::DetachLive));
+    }
+
+    /// The cap is battery protection, but the next pulse (~10 s later)
+    /// woke the camera again at once (third sweep, S3-Z2): motion waits
+    /// `debounce_secs` after a session cut by the cap.
+    #[tokio::test(start_paused = true)]
+    async fn motion_waits_the_debounce_after_the_max_live_cap() {
+        let cfg = camera_cfg(10, 2);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer()), Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            media.calls().await.contains(&MediaCall::DetachLive),
+            "capped"
+        );
+
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 1, "held after the cap");
+        tokio::time::advance(Duration::from_secs(11)).await;
+        send(&tx, motion()).await;
+        assert_eq!(
+            sr.call_count().await,
+            2,
+            "motion wakes it again after the hold"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    /// A source that dies right after the attach made every pulse a new
+    /// negotiation (third sweep, S3-Z2).
+    #[tokio::test(start_paused = true)]
+    async fn motion_waits_the_debounce_after_an_early_live_loss() {
+        let cfg = camera_cfg(30, 300);
+        let sr = StubSignaler::with_responses(vec![Ok(ok_answer()), Ok(ok_answer())]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        drive_to_live(&tx).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(media.fail_live(0, LiveLossReason::RtpStalled).await);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 1, "held after an early loss");
+        tokio::time::advance(Duration::from_secs(31)).await;
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 2);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    /// Any `available` report ended the backoff, whatever failed, so a
+    /// camera reporting itself online after each failed wake was retried
+    /// at every pulse (third sweep, S3-Z3). Only an offline camera coming
+    /// back ends it early.
+    #[tokio::test(start_paused = true)]
+    async fn online_after_a_failed_attach_keeps_the_backoff() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![Err(DomainError::AdapterTransport(
+            "gateway down".into(),
+        ))]);
+        let media = RecordingMedia::new();
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 1, "the attach failed");
+        send(&tx, online()).await;
+        send(&tx, motion()).await;
+        assert_eq!(sr.call_count().await, 1, "still in the backoff");
+
+        token.cancel();
+        handle.await.unwrap();
     }
 
     // ---------- Shutdown ----------

@@ -198,8 +198,8 @@ budget and probe 0 to 86400 s).
 | `[[cameras]]`                       | array          | `[]`                 | One block per camera — see example. With none, every camera on the account is served, named as `list-devices` suggests (the log lists them). |
 | `cameras[].video_encoder` / `cameras[].bitrate_kbps` | as `output.*` | (the output's) | One camera's own encoder or bitrate. Each setting in use is probed once at boot; the log names each camera that differs (`camera encoding`). |
 | `cameras.codec_hint`                | `h264`/`h265`  | (auto)               | Skip first-stream codec detection.                       |
-| `cameras.cooldown.debounce_secs`    | u64            | `60`                 | Hold-live debounce after last motion.                    |
-| `cameras.cooldown.max_continuous_live` | u64         | `300`                | Hard cap on continuous live (battery protection); also caps a relayed app view when probing is off. |
+| `cameras.cooldown.debounce_secs`    | u64            | `60`                 | Hold-live debounce after last motion; also how long motion is held off after a session cut by the cap or lost within 15 s of its start. |
+| `cameras.cooldown.max_continuous_live` | u64         | `300`                | Hard cap on continuous live (battery protection): the camera then stays idle for `debounce_secs` even under motion. Also caps a relayed app view when probing is off. |
 | `cameras.cooldown.user_view_probe_secs` | u64        | `60`                 | How often a relayed app view is released for a few seconds to learn whether the app still views (our session keeps the camera streaming). `0` = never, cap only. |
 | `cameras.cooldown.daily_live_budget` | u64           | `0`                  | `0` = unlimited; otherwise total live secs/day.          |
 | `cameras.cooldown.budget_reset`     | `HH:MM`        | `00:00`              | Local-clock reset.                                       |
