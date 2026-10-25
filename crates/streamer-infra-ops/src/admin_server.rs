@@ -60,6 +60,18 @@ const REJECTION_WARN_INTERVAL: Duration = Duration::from_mins(1);
 /// Peers remembered for the rejection rate limit; the map is cleared past
 /// it, so a scan from many addresses cannot grow it without bound.
 const MAX_TRACKED_PEERS: usize = 1024;
+/// Wrong tokens one peer may present per [`REJECTION_WARN_INTERVAL`];
+/// past it the peer gets 429 without a comparison until the interval
+/// ends (third sweep, S3-L2: guesses were limited only in the log).
+const MAX_FAILURES_PER_WINDOW: u32 = 10;
+
+/// One peer's recent rejections.
+#[derive(Debug, Clone, Copy)]
+struct PeerRejections {
+    window_start: Instant,
+    failures: u32,
+    warned_at: Option<Instant>,
+}
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -69,7 +81,7 @@ struct AppState {
     /// on drop, never printed) and exposed only for the comparison.
     token: Arc<SecretString>,
     /// When each peer's last rejection was logged at `warn`.
-    rejections: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    rejections: Arc<Mutex<HashMap<IpAddr, PeerRejections>>>,
 }
 
 /// Errors raised by [`AdminServer::new`].
@@ -188,6 +200,14 @@ impl AdminServer {
 /// The authentication layer over every admin route: a request without the
 /// right bearer token gets the 401 before any extractor or handler runs.
 async fn require_bearer(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr);
+    if peer.is_some_and(|p| is_locked_out(&state.rejections, p.ip())) {
+        debug!(peer = ?peer, "admin: too many wrong tokens; refused without a comparison");
+        return too_many_failures();
+    }
     if check_auth(req.headers(), &state.token).is_some() {
         return next.run(req).await;
     }
@@ -196,11 +216,28 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
         .get::<MatchedPath>()
         .map_or("?", MatchedPath::as_str)
         .to_owned();
-    let peer = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| *addr);
     unauthorized(&state, req.method().as_str(), &route, peer)
+}
+
+/// The 429 for a peer past [`MAX_FAILURES_PER_WINDOW`]; the connection
+/// is closed, so pipelined guesses on it stop too.
+fn too_many_failures() -> Response {
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, "too many failed attempts").into_response();
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::RETRY_AFTER,
+        HeaderValue::from(REJECTION_WARN_INTERVAL.as_secs()),
+    );
+    headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
+    resp
+}
+
+/// Whether `ip` presented too many wrong tokens in the current interval.
+fn is_locked_out(rejections: &Mutex<HashMap<IpAddr, PeerRejections>>, ip: IpAddr) -> bool {
+    let seen = rejections.lock().unwrap_or_else(PoisonError::into_inner);
+    seen.get(&ip).is_some_and(|r| {
+        r.window_start.elapsed() < REJECTION_WARN_INTERVAL && r.failures >= MAX_FAILURES_PER_WINDOW
+    })
 }
 
 /// Constant-time comparison of two byte slices (`subtle`). Returns
@@ -236,7 +273,7 @@ fn bad_camera_id(e: &streamer_domain::error::DomainError) -> Response {
 /// per peer, at `debug` in between.
 fn unauthorized(state: &AppState, method: &str, route: &str, peer: Option<SocketAddr>) -> Response {
     let ip = peer.map(|p| p.ip());
-    if should_warn(&state.rejections, ip) {
+    if record_rejection(&state.rejections, ip) {
         warn!(method, route, peer = ?peer, "admin: rejected unauthenticated request (next report for this peer in a minute at most)");
     } else {
         debug!(method, route, peer = ?peer, "admin: rejected unauthenticated request");
@@ -247,24 +284,38 @@ fn unauthorized(state: &AppState, method: &str, route: &str, peer: Option<Socket
     resp
 }
 
-/// Whether a rejection from `ip` gets a `warn` line now.
-fn should_warn(rejections: &Mutex<HashMap<IpAddr, Instant>>, ip: Option<IpAddr>) -> bool {
+/// Count a rejection from `ip`; whether it gets a `warn` line now (at
+/// most once per [`REJECTION_WARN_INTERVAL`] per peer). An unknown peer
+/// always warns and is not counted.
+fn record_rejection(
+    rejections: &Mutex<HashMap<IpAddr, PeerRejections>>,
+    ip: Option<IpAddr>,
+) -> bool {
     let Some(ip) = ip else {
         return true;
     };
     let now = Instant::now();
     let mut seen = rejections.lock().unwrap_or_else(PoisonError::into_inner);
-    if seen
-        .get(&ip)
-        .is_some_and(|at| now.duration_since(*at) < REJECTION_WARN_INTERVAL)
-    {
-        return false;
-    }
-    if seen.len() >= MAX_TRACKED_PEERS {
+    if seen.len() >= MAX_TRACKED_PEERS && !seen.contains_key(&ip) {
         seen.clear();
     }
-    seen.insert(ip, now);
-    true
+    let entry = seen.entry(ip).or_insert(PeerRejections {
+        window_start: now,
+        failures: 0,
+        warned_at: None,
+    });
+    if now.duration_since(entry.window_start) >= REJECTION_WARN_INTERVAL {
+        entry.window_start = now;
+        entry.failures = 0;
+    }
+    entry.failures = entry.failures.saturating_add(1);
+    let warn = entry
+        .warned_at
+        .is_none_or(|at| now.duration_since(at) >= REJECTION_WARN_INTERVAL);
+    if warn {
+        entry.warned_at = Some(now);
+    }
+    warn
 }
 
 fn admin_error_to_response(err: AdminError) -> Response {
@@ -807,9 +858,61 @@ mod tests {
         let seen = std::sync::Mutex::new(HashMap::new());
         let a: IpAddr = "192.0.2.1".parse().unwrap();
         let b: IpAddr = "192.0.2.2".parse().unwrap();
-        assert!(should_warn(&seen, Some(a)));
-        assert!(!should_warn(&seen, Some(a)), "same peer within the minute");
-        assert!(should_warn(&seen, Some(b)), "another peer");
-        assert!(should_warn(&seen, None), "an unknown peer always warns");
+        assert!(record_rejection(&seen, Some(a)));
+        assert!(
+            !record_rejection(&seen, Some(a)),
+            "same peer within the minute"
+        );
+        assert!(record_rejection(&seen, Some(b)), "another peer");
+        assert!(
+            record_rejection(&seen, None),
+            "an unknown peer always warns"
+        );
+    }
+
+    /// Wrong tokens were throttled in the log only: a peer could guess as
+    /// fast as it could pipeline requests (third sweep, S3-L2). Past the
+    /// limit it gets 429, and the token is not even compared.
+    #[tokio::test]
+    async fn a_peer_guessing_tokens_is_turned_away_and_others_are_not() {
+        let server = AdminServer::new(StubAdmin::arc(), SecretString::from(TOKEN)).unwrap();
+        let router = server.router();
+        let from = |peer: &str, token: &str| {
+            let mut req = Request::builder()
+                .uri("/admin/state")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(String::new())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+            req
+        };
+        for _ in 0..MAX_FAILURES_PER_WINDOW {
+            let response = router
+                .clone()
+                .oneshot(from("192.0.2.7:4000", "wrong-token-of-enough-bytes"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        for token in ["wrong-token-of-enough-bytes", TOKEN] {
+            let response = router
+                .clone()
+                .oneshot(from("192.0.2.7:4001", token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers().get(header::CONNECTION).unwrap(), "close");
+        }
+        let other = router
+            .clone()
+            .oneshot(from("192.0.2.8:4000", TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(
+            other.status(),
+            StatusCode::OK,
+            "another peer is not affected"
+        );
     }
 }

@@ -8,17 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::BytesMut;
-use mqttbytes::QoS;
-use mqttbytes::v4::{
-    Connect, ConnectReturnCode, Disconnect, LastWill, Login, Packet, PingReq, Publish,
-};
 use rustls::pki_types::ServerName;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+use super::codec::{self, ConnectFields, Incoming};
 use super::messages::Message;
 use super::{Broker, MqttError, Session};
 use streamer_domain::config::MqttEndpoint;
@@ -33,9 +29,9 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 /// the bridge until the kernel gives up on TCP, about 15 minutes with no
 /// keep-alive able to notice. Room for a 512 KiB picture on a slow link.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Largest packet read from the broker. It only sends CONNACK and
-/// PINGRESP; anything bigger is a misbehaving broker.
-const MAX_INCOMING_BYTES: usize = 64 * 1024;
+/// Largest packet body read from the broker. It only sends CONNACK (two
+/// bytes) and PINGRESP (none); anything bigger is a misbehaving broker.
+const MAX_INCOMING_BYTES: usize = 16;
 
 /// What the CONNECT carries.
 pub(crate) struct ConnectParams {
@@ -81,28 +77,17 @@ impl TcpBroker {
         })
     }
 
-    fn connect_packet(&self) -> Connect {
-        let mut connect = Connect::new(self.params.client_id.clone());
-        connect.keep_alive = KEEP_ALIVE_SECS;
-        connect.clean_session = true;
-        connect.last_will = Some(LastWill::new(
-            self.params.will_topic.clone(),
-            self.params.will_payload,
-            QoS::AtMostOnce,
-            true,
-        ));
-        // The packet types derive Debug with the password inside: this one
-        // is encoded and dropped, never logged.
-        connect.login = self.params.username.as_ref().map(|user| {
-            let password = self
-                .params
-                .password
-                .as_ref()
-                .map(|p| p.expose_secret().to_string())
-                .unwrap_or_default();
-            Login::new(user.clone(), password)
-        });
-        connect
+    /// The CONNECT, in a buffer zeroed on drop: it holds the password.
+    fn connect_packet(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, MqttError> {
+        codec::connect(&ConnectFields {
+            client_id: &self.params.client_id,
+            keep_alive_secs: KEEP_ALIVE_SECS,
+            will_topic: &self.params.will_topic,
+            will_payload: self.params.will_payload.as_bytes(),
+            username: self.params.username.as_deref(),
+            password: self.params.password.as_ref(),
+        })
+        .map_err(|e| MqttError::Protocol(e.to_string()))
     }
 }
 
@@ -115,20 +100,20 @@ impl Broker for TcpBroker {
             .map_err(|_| MqttError::Timeout("TCP connect"))?
             .map_err(|e| MqttError::Io(e.to_string()))?;
         match &self.tls {
-            None => open(tcp, self.connect_packet()).await,
+            None => open(tcp, &self.connect_packet()?).await,
             Some((connector, name)) => {
                 let stream = timeout(STEP_TIMEOUT, connector.connect(name.clone(), tcp))
                     .await
                     .map_err(|_| MqttError::Timeout("TLS handshake"))?
                     .map_err(|e| MqttError::Tls(e.to_string()))?;
-                open(stream, self.connect_packet()).await
+                open(stream, &self.connect_packet()?).await
             }
         }
     }
 }
 
 /// CONNECT on `stream`; the session once the broker accepted it.
-async fn open<S>(stream: S, connect: Connect) -> Result<Box<dyn Session>, MqttError>
+async fn open<S>(stream: S, connect: &[u8]) -> Result<Box<dyn Session>, MqttError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -137,87 +122,96 @@ where
     Ok(Box::new(session))
 }
 
-/// A connected stream and its read buffer.
+/// A connected stream.
 struct StreamSession<S> {
     stream: S,
-    buffer: BytesMut,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> StreamSession<S> {
-    fn new(stream: S) -> Self {
-        Self {
-            stream,
-            buffer: BytesMut::with_capacity(256),
-        }
+    const fn new(stream: S) -> Self {
+        Self { stream }
     }
 
-    async fn write(
-        &mut self,
-        encode: impl FnOnce(&mut BytesMut) -> Result<usize, mqttbytes::Error>,
-    ) -> Result<(), MqttError> {
-        let mut out = BytesMut::new();
-        encode(&mut out).map_err(|e| MqttError::Protocol(e.to_string()))?;
-        timeout(WRITE_TIMEOUT, self.stream.write_all(&out))
+    /// Write `bytes` within [`WRITE_TIMEOUT`].
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), MqttError> {
+        timeout(WRITE_TIMEOUT, self.stream.write_all(bytes))
             .await
             .map_err(|_| MqttError::Timeout("write"))?
             .map_err(|e| MqttError::Io(e.to_string()))
     }
 
-    /// The next packet from the broker, within [`STEP_TIMEOUT`].
-    async fn read_packet(&mut self, step: &'static str) -> Result<Packet, MqttError> {
+    /// The next packet from the broker, within [`STEP_TIMEOUT`]: a fixed
+    /// header, a remaining length of at most four bytes, and a body of
+    /// at most [`MAX_INCOMING_BYTES`].
+    async fn read_packet(&mut self, step: &'static str) -> Result<Incoming, MqttError> {
         timeout(STEP_TIMEOUT, async {
-            loop {
-                match mqttbytes::v4::read(&mut self.buffer, MAX_INCOMING_BYTES) {
-                    Ok(packet) => return Ok(packet),
-                    Err(mqttbytes::Error::InsufficientBytes(_)) => {}
+            let header = self.read_byte().await?;
+            let mut total = 0;
+            let mut index = 0;
+            let len = loop {
+                let byte = self.read_byte().await?;
+                match codec::remaining_step(&mut total, index, byte) {
+                    Ok(Some(len)) => break len,
+                    Ok(None) => index += 1,
                     Err(e) => return Err(MqttError::Protocol(e.to_string())),
                 }
-                let read = self
-                    .stream
-                    .read_buf(&mut self.buffer)
-                    .await
-                    .map_err(|e| MqttError::Io(e.to_string()))?;
-                if read == 0 {
-                    return Err(MqttError::Io("the broker closed the connection".into()));
-                }
+            };
+            if len > MAX_INCOMING_BYTES {
+                return Err(MqttError::Protocol(format!(
+                    "the broker sent a {len}-byte packet; only CONNACK and PINGRESP are expected"
+                )));
             }
+            let mut body = vec![0; len];
+            self.stream
+                .read_exact(&mut body)
+                .await
+                .map_err(|e| read_error(&e))?;
+            codec::incoming(header, &body).map_err(|e| MqttError::Protocol(e.to_string()))
         })
         .await
         .map_err(|_| MqttError::Timeout(step))?
     }
 
-    async fn handshake(&mut self, connect: Connect) -> Result<(), MqttError> {
-        self.write(|out| connect.write(out)).await?;
+    async fn read_byte(&mut self) -> Result<u8, MqttError> {
+        self.stream.read_u8().await.map_err(|e| read_error(&e))
+    }
+
+    async fn handshake(&mut self, connect: &[u8]) -> Result<(), MqttError> {
+        self.write(connect).await?;
         match self.read_packet("CONNACK").await? {
-            Packet::ConnAck(ack) if ack.code == ConnectReturnCode::Success => Ok(()),
-            Packet::ConnAck(ack) => Err(MqttError::Refused(format!("{:?}", ack.code))),
-            _ => Err(MqttError::Protocol("expected CONNACK".into())),
+            Incoming::ConnAck { code: 0 } => Ok(()),
+            Incoming::ConnAck { code } => Err(MqttError::Refused(codec::refusal_name(code).into())),
+            Incoming::PingResp => Err(MqttError::Protocol("expected CONNACK".into())),
         }
+    }
+}
+
+fn read_error(e: &std::io::Error) -> MqttError {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        MqttError::Io("the broker closed the connection".into())
+    } else {
+        MqttError::Io(e.to_string())
     }
 }
 
 #[async_trait]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session for StreamSession<S> {
     async fn publish(&mut self, message: &Message) -> Result<(), MqttError> {
-        let mut publish = Publish::new(
-            message.topic.as_str(),
-            QoS::AtMostOnce,
-            message.payload.to_vec(),
-        );
-        publish.retain = true;
-        self.write(|out| publish.write(out)).await
+        let packet = codec::publish_retained(&message.topic, &message.payload)
+            .map_err(|e| MqttError::Protocol(e.to_string()))?;
+        self.write(&packet).await
     }
 
     async fn keep_alive(&mut self) -> Result<(), MqttError> {
-        self.write(|out| PingReq.write(out)).await?;
+        self.write(&codec::PINGREQ).await?;
         match self.read_packet("PINGRESP").await? {
-            Packet::PingResp => Ok(()),
-            _ => Err(MqttError::Protocol("expected PINGRESP".into())),
+            Incoming::PingResp => Ok(()),
+            Incoming::ConnAck { .. } => Err(MqttError::Protocol("expected PINGRESP".into())),
         }
     }
 
     async fn disconnect(&mut self) {
-        let _ = self.write(|out| Disconnect.write(out)).await;
+        let _ = self.write(&codec::DISCONNECT).await;
         let _ = self.stream.shutdown().await;
     }
 }

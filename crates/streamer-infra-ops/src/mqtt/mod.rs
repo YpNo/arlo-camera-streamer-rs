@@ -11,6 +11,7 @@
 //! retried after 1, 2, 4 … 60 s. A broker that is down never stops or
 //! slows the daemon.
 
+mod codec;
 mod messages;
 mod record;
 mod session;
@@ -320,8 +321,15 @@ impl Bridge {
                 }
             }
         }
+        let removing = !stale.is_empty();
         for message in stale {
             self.send(session, message).await?;
+        }
+        // The removals are QoS 0: only a PINGRESP after them proves the
+        // broker read them. Until then the record keeps naming what they
+        // clear, so a connection lost in between clears it again next time.
+        if removing {
+            session.keep_alive().await?;
         }
         if let Err(e) = self.record.save(&self.layout, &current).await {
             warn!(error = %e, "MQTT published record not saved");

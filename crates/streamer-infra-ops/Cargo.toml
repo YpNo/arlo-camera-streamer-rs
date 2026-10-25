@@ -18,13 +18,13 @@ streamer-domain = { workspace = true }
 async-trait = { workspace = true }
 axum        = { workspace = true }
 bytes       = { workspace = true }
-mqttbytes   = { workspace = true }
 rustls      = { workspace = true }
 rustls-native-certs = { workspace = true }
 tokio-rustls = { workspace = true }
 hyper-util  = { workspace = true }
 prometheus  = { workspace = true }
 secrecy     = { workspace = true }
+zeroize     = { workspace = true }
 subtle      = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
@@ -35,5 +35,7 @@ tracing     = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+# An independent MQTT decoder: the tests read what our codec writes.
+mqttbytes   = { workspace = true }
 tower       = "0.5"
 tokio       = { workspace = true, features = ["test-util"] }

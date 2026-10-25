@@ -75,6 +75,13 @@ that ask for RTP over UDP are refused and switch to TCP on their own.
   left the viewers' media without live video once it went, and each
   distinct query built another encoder pipeline. A mount has one media
   now, whatever the query.
+- The admin API turns a peer away (429, connection closed, token not
+  compared) after 10 wrong tokens in a minute; wrong tokens used to be
+  limited in the log only. Connection slots count an IPv6 peer per /64
+  and treat `::ffff:127.0.0.1` as loopback.
+- The MQTT adapter encodes and decodes its few packets itself instead of
+  through mqttbytes (unmaintained since 2021; now test-only), and builds
+  the CONNECT carrying the password in a buffer zeroed on drop.
 - Snapshot fetches ignore HTTPS_PROXY / ALL_PROXY (a proxy would resolve
   the host past the private-address check), and NAT64 addresses of a
   private host, the local-use NAT64 prefix and the benchmarking, IETF
@@ -92,6 +99,9 @@ that ask for RTP over UDP are refused and switch to TCP on their own.
   constructors violate I/O safety; the streamer does not call them).
 
 ### Fixed
+- The MQTT published record forgets a removed camera only once the broker
+  answered a ping after the removals: a connection lost before it read
+  them left the camera's topics for good.
 - A login back-off file holding a timestamp past what the clock can
   hold crashed every boot; it reads as a full pause.
 - A failure to create the WebRTC bus-watch thread failed the live attach

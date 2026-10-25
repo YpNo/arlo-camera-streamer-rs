@@ -30,6 +30,9 @@ enum Plan {
     Refuse,
     /// Accepted; publishes fail after this many succeeded.
     Accept(usize),
+    /// Accepted; publishes go out, a ping is never answered (the
+    /// connection died with the packets unread).
+    Deaf,
 }
 
 #[derive(Default)]
@@ -90,6 +93,12 @@ impl Broker for FakeBroker {
             Plan::Refuse => Err(MqttError::Io("connection refused".into())),
             Plan::Accept(budget) => Ok(Box::new(FakeSession {
                 budget,
+                deaf: false,
+                log: self.log.clone(),
+            })),
+            Plan::Deaf => Ok(Box::new(FakeSession {
+                budget: usize::MAX,
+                deaf: true,
                 log: self.log.clone(),
             })),
         }
@@ -98,6 +107,7 @@ impl Broker for FakeBroker {
 
 struct FakeSession {
     budget: usize,
+    deaf: bool,
     log: Arc<Log>,
 }
 
@@ -117,6 +127,9 @@ impl Session for FakeSession {
 
     async fn keep_alive(&mut self) -> Result<(), MqttError> {
         self.log.push(Event::Ping);
+        if self.deaf {
+            return Err(MqttError::Timeout("PINGRESP"));
+        }
         Ok(())
     }
 
@@ -399,6 +412,39 @@ async fn a_camera_no_longer_served_is_cleared_and_the_record_updated() {
     assert!(cleared.iter().all(|t| !t.contains("CAM1")), "{cleared:?}");
     let after = record.load().await;
     assert_eq!(after.cameras, [CameraId::new("CAM1")].into());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The removals are `QoS` 0: the record forgot the departed camera as soon
+/// as they were written, so a connection lost before the broker read them
+/// left its topics for good (third sweep, S3-Z6). The record changes only
+/// once a ping came back after them.
+#[tokio::test(start_paused = true)]
+async fn the_record_keeps_a_departed_camera_until_the_broker_confirms_its_removal() {
+    let dir = scratch("removal-unconfirmed");
+    let record = PublishedRecord::in_dir(&dir);
+    let before: BTreeSet<CameraId> = [CameraId::new("CAM1"), CameraId::new("OLD")].into();
+    record
+        .save(&Layout::new(&config(false)), &before)
+        .await
+        .unwrap();
+    let plans = [Plan::Deaf, Plan::Refuse, Plan::Refuse, Plan::Refuse];
+    let (log, stop, task) = start(&plans, FakeAdmin::with(&["CAM1"]), false, &dir);
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    stop_and_join(&stop, task).await;
+
+    assert!(
+        log.published()
+            .iter()
+            .any(|(t, p)| t == "arlo/OLD/state" && p.is_empty()),
+        "the removal went out"
+    );
+    assert_eq!(
+        record.load().await.cameras,
+        before,
+        "but was never confirmed"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
