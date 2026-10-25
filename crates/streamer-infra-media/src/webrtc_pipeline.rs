@@ -355,7 +355,9 @@ impl OfferBuilder for OfferGathering<'_> {
             .set_state(gst::State::Playing)
             .map_err(|e| MediaError::Pipeline(format!("pipeline → Playing: {e}")))?;
         // Detached: the thread ends on the stop message `shutdown` posts.
-        let _ = spawn_bus_watch(self.pipeline, self.notifier.clone());
+        // A thread the system refuses fails the attach (the pipeline is
+        // stopped by the owner's `Drop`) instead of panicking mid-call.
+        spawn_bus_watch(self.pipeline, self.notifier.clone())?;
         let offer_sdp = tokio::time::timeout(OFFER_TIMEOUT, self.offer_rx.recv())
             .await
             .map_err(|_| MediaError::Pipeline("timed out gathering local offer".into()))?
@@ -724,38 +726,48 @@ fn spawn_keyframe_pump(
 /// Drain the pipeline bus; surface ERROR/EOS in the log and to the
 /// live-loss notifier. The thread ends at EOS or on the
 /// [`BUS_WATCH_STOP`] application message that `shutdown` posts.
+///
+/// # Errors
+///
+/// [`MediaError::Pipeline`] when the pipeline has no bus or the system
+/// refuses the thread (third sweep, S3-Z4: `std::thread::spawn` panicked).
 fn spawn_bus_watch(
     pipeline: &gst::Pipeline,
     notifier: LiveLossNotifier,
-) -> Option<std::thread::JoinHandle<()>> {
-    let bus = pipeline.bus()?;
-    Some(std::thread::spawn(move || {
-        for msg in bus.iter_timed(gst::ClockTime::NONE) {
-            use gst::MessageView as V;
-            match msg.view() {
-                V::Error(e) => {
-                    warn!(
-                        src = ?e.src().map(gst::prelude::GstObjectExt::path_string),
-                        error = %e.error(),
-                        "webrtcbin pipeline error"
-                    );
-                    report_loss(&notifier, LiveLossReason::PipelineError);
+) -> Result<std::thread::JoinHandle<()>, MediaError> {
+    let bus = pipeline
+        .bus()
+        .ok_or_else(|| MediaError::Pipeline("pipeline has no bus".into()))?;
+    let watch = std::thread::Builder::new().name("webrtc-bus".into());
+    watch
+        .spawn(move || {
+            for msg in bus.iter_timed(gst::ClockTime::NONE) {
+                use gst::MessageView as V;
+                match msg.view() {
+                    V::Error(e) => {
+                        warn!(
+                            src = ?e.src().map(gst::prelude::GstObjectExt::path_string),
+                            error = %e.error(),
+                            "webrtcbin pipeline error"
+                        );
+                        report_loss(&notifier, LiveLossReason::PipelineError);
+                    }
+                    V::Eos(_) => {
+                        debug!("webrtcbin pipeline EOS");
+                        report_loss(&notifier, LiveLossReason::EndOfStream);
+                        break;
+                    }
+                    V::Application(app)
+                        if app.structure().is_some_and(|s| s.name() == BUS_WATCH_STOP) =>
+                    {
+                        break;
+                    }
+                    _ => {}
                 }
-                V::Eos(_) => {
-                    debug!("webrtcbin pipeline EOS");
-                    report_loss(&notifier, LiveLossReason::EndOfStream);
-                    break;
-                }
-                V::Application(app)
-                    if app.structure().is_some_and(|s| s.name() == BUS_WATCH_STOP) =>
-                {
-                    break;
-                }
-                _ => {}
             }
-        }
-        debug!("webrtcbin bus watch exited");
-    }))
+            debug!("webrtcbin bus watch exited");
+        })
+        .map_err(|e| MediaError::Pipeline(format!("bus watch thread: {e}")))
 }
 
 /// Watch `webrtcbin`'s peer-connection and ICE state; a terminal state

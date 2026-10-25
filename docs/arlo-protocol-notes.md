@@ -147,7 +147,7 @@ About that RTSPS server:
   (DigiCert Global G2 TLS RSA SHA256 2020 CA1) and names only
   `*.wowza.arlo.com` (subject Arlo Technologies, Inc.; seen 2026-10-12,
   valid to 2027-01-03), not the IP. The relay requires a name under
-  `arlo.com` instead.
+  `wowza.arlo.com` instead.
 - A plain RTSP client plays it (OPTIONS, DESCRIBE, SETUP over
   TCP-interleaved, PLAY). GStreamer's `rtspsrc` is refused at SETUP with
   403, for a reason not identified; the token is not it.

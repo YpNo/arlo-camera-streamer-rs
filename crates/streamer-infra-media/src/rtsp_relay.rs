@@ -23,8 +23,8 @@
 //!
 //! TLS: the certificate chain is verified against the system roots. The
 //! URL names a raw IP no certificate can match, so the certificate must
-//! instead be valid for a host of Arlo's domain (`arlo.com`; Arlo's is
-//! `*.wowza.arlo.com`). An operator can pin the end-entity certificate
+//! instead be valid for a host of Arlo's watch-along tier
+//! (`*.wowza.arlo.com`). An operator can pin the end-entity certificate
 //! instead (`arlo.watch_along_cert_sha256`) when Arlo's chain is not
 //! public; the relay then refuses anything else. See [`RelayTls`].
 //!
@@ -1120,11 +1120,11 @@ struct WatchAlongVerifier {
 /// The domain a watch-along certificate must name a host of, when the
 /// relay dials a raw IP (Arlo's certificate: `*.wowza.arlo.com`,
 /// 2026-10-12).
-const ARLO_DOMAIN: &str = "arlo.com";
+const WATCH_ALONG_DOMAIN: &str = "wowza.arlo.com";
 
 impl WatchAlongVerifier {
     /// The chain is trusted but cannot name the raw IP dialed: accept it
-    /// only if rustls finds it valid for a host of [`ARLO_DOMAIN`]. The
+    /// only if rustls finds it valid for a host of [`WATCH_ALONG_DOMAIN`]. The
     /// presented names only choose which host to check; the check itself
     /// is rustls's (a wildcard is checked through one host it covers).
     fn verify_arlo_name(
@@ -1154,7 +1154,7 @@ impl WatchAlongVerifier {
         warn!(
             sha256 = %fingerprint_hex(presented),
             ?names,
-            "watch-along certificate names no host of arlo.com; set arlo.watch_along_cert_sha256 to pin it"
+            "watch-along certificate names no host of wowza.arlo.com; set arlo.watch_along_cert_sha256 to pin it"
         );
         Err(name_error)
     }
@@ -1172,14 +1172,16 @@ fn presented_dns_names(end_entity: &CertificateDer<'_>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A host of [`ARLO_DOMAIN`] that `name` covers: the name itself, or for
+/// A host under [`WATCH_ALONG_DOMAIN`] that `name` covers: the name itself, or for
 /// a wildcard one host under it. `None` outside Arlo's domain.
 fn arlo_host_for(name: &str) -> Option<ServerName<'static>> {
     let host = name.strip_prefix("*.").map_or_else(
         || name.to_string(),
         |parent| format!("watch-along.{parent}"),
     );
-    let in_domain = host == ARLO_DOMAIN || host.ends_with(&format!(".{ARLO_DOMAIN}"));
+    // Under the tier only: any other Arlo host (or a third party's host
+    // under arlo.com) is not the watch-along server (third sweep, S3-L1).
+    let in_domain = host.ends_with(&format!(".{WATCH_ALONG_DOMAIN}"));
     in_domain.then(|| ServerName::try_from(host).ok()).flatten()
 }
 
@@ -2209,8 +2211,7 @@ mod tests {
         let v = verifier_trusting(ca.der(), None);
         for names in [
             &["*.wowza.arlo.com"][..],
-            &["relay.arlo.com"],
-            &["arlo.com"],
+            &["relay.wowza.arlo.com"],
             &["other.example", "*.wowza.arlo.com"],
         ] {
             assert!(
@@ -2231,6 +2232,11 @@ mod tests {
             &["arlo.com.evil.example"],
             &["evilarlo.com"],
             &["*.example"],
+            // Other Arlo hosts are not the watch-along tier (S3-L1).
+            &["status.arlo.com"],
+            &["arlo.com"],
+            &["*.arlo.com"],
+            &["wowza.arlo.com.evil.example"],
         ] {
             assert!(
                 matches!(

@@ -93,13 +93,67 @@ impl Drop for HlsSegmenter {
 /// [`MediaError::Pipeline`] when the directory cannot be created or
 /// read, is not a real directory (a symlink planted at the path would
 /// make `clear_dir` delete elsewhere), or does not sit directly under
-/// the configured HLS root. The root must be private to the daemon user.
+/// the configured HLS root, or when it or the root is not the daemon's
+/// own or is writable by others.
 pub(crate) fn prepare_dir(hls: &HlsBranchConfig) -> Result<(), MediaError> {
     let dir = Path::new(&hls.dir);
-    std::fs::create_dir_all(dir)
+    create_private_dir(dir)
         .map_err(|e| MediaError::Pipeline(format!("create HLS dir {}: {e}", hls.dir)))?;
     validate_dir(hls)?;
     clear_dir(dir)
+}
+
+/// Mode of the directories the daemon creates for HLS: the segments are
+/// read by a server sharing the daemon's group at most.
+#[cfg(unix)]
+const HLS_DIR_MODE: u32 = 0o750;
+
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(HLS_DIR_MODE)
+        .create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
+/// The directory is the daemon's own and nobody else can write in it: the
+/// segmenter opens predictable file names, which would follow a symlink
+/// someone else planted (third sweep, S3-L9).
+#[cfg(unix)]
+fn check_private(what: &str, path: &Path) -> Result<(), MediaError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| MediaError::Pipeline(format!("stat {what} {}: {e}", path.display())))?;
+    // The owner of /proc/self is the process's effective uid.
+    let ours = std::fs::metadata("/proc/self")
+        .map_err(|e| MediaError::Pipeline(format!("cannot tell the daemon's uid: {e}")))?
+        .uid();
+    if meta.uid() != ours {
+        return Err(MediaError::Pipeline(format!(
+            "{what} {} belongs to uid {}, not to the daemon (uid {ours})",
+            path.display(),
+            meta.uid()
+        )));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(MediaError::Pipeline(format!(
+            "{what} {} is writable by others (mode {:o}); make it the daemon's only",
+            path.display(),
+            meta.mode() & 0o777
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_private(_what: &str, _path: &Path) -> Result<(), MediaError> {
+    Ok(())
 }
 
 /// The HLS dir is a real directory (not a symlink) directly under the HLS
@@ -129,7 +183,8 @@ fn validate_dir(hls: &HlsBranchConfig) -> Result<(), MediaError> {
             hls.dir, hls.root
         )));
     }
-    Ok(())
+    check_private("HLS root", &root)?;
+    check_private("HLS dir", &real)
 }
 
 /// The stop-time clear, after the same checks as [`prepare_dir`].
@@ -348,6 +403,64 @@ mod tests {
         let err = prepare_dir(&hls(&elsewhere.join("deeper"))).unwrap_err();
         assert!(err.to_string().contains("not directly under"), "{err}");
         std::fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    /// A segment file opened by name follows a symlink planted in a
+    /// directory others can write: the stream dir and the root must be
+    /// writable by the daemon only (third sweep, S3-L9).
+    #[cfg(unix)]
+    #[test]
+    fn prepare_dir_refuses_a_dir_or_root_others_can_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("hls-perms-{}", std::process::id()));
+        let root = base.join("root");
+        let dir = root.join("front_door");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let hls = HlsBranchConfig {
+            root: root.to_string_lossy().into_owned(),
+            dir: dir.to_string_lossy().into_owned(),
+            playlist_location: String::new(),
+            segment_location: String::new(),
+            target_duration: 2,
+            playlist_length: 3,
+            max_files: 5,
+        };
+        let mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        mode(&dir, 0o770);
+        let err = prepare_dir(&hls).unwrap_err();
+        assert!(err.to_string().contains("writable by others"), "{err}");
+        mode(&dir, 0o750);
+        mode(&root, 0o777);
+        let err = prepare_dir(&hls).unwrap_err();
+        assert!(err.to_string().contains("writable by others"), "{err}");
+        mode(&root, 0o755);
+        prepare_dir(&hls).expect("private again");
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    /// A missing stream dir is created private.
+    #[cfg(unix)]
+    #[test]
+    fn prepare_dir_creates_the_dir_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("hls-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("root");
+        let dir = root.join("front_door");
+        let hls = HlsBranchConfig {
+            root: root.to_string_lossy().into_owned(),
+            dir: dir.to_string_lossy().into_owned(),
+            playlist_location: String::new(),
+            segment_location: String::new(),
+            target_duration: 2,
+            playlist_length: 3,
+            max_files: 5,
+        };
+        prepare_dir(&hls).expect("create");
+        let mode = std::fs::metadata(&dir).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o750, "{mode:o}");
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// The stop-time clear followed a symlink swapped in after the

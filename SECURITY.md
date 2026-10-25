@@ -30,8 +30,9 @@ newest release (`ghcr.io/ypno/arlo-camera-streamer-rs:v<version>`).
   front them with a proxy.
 - **TLS to Arlo's watch-along host** (ADR 0007) verifies the certificate
   chain against the system roots. Arlo hands out a raw IP no certificate
-  names, so the certificate must instead be valid for a host of
-  `arlo.com` (Arlo's names `*.wowza.arlo.com`). A certificate pin
+  names, so the certificate must instead be valid for a host of Arlo's
+  watch-along tier, `*.wowza.arlo.com`, the name Arlo's certificate
+  carries; any other Arlo host is refused. A certificate pin
   (`arlo.watch_along_cert_sha256`) replaces the chain check when needed.
   All other Arlo traffic is fully validated.
 

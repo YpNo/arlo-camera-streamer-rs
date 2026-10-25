@@ -66,9 +66,18 @@ that ask for RTP over UDP are refused and switch to TCP on their own.
 ### Security
 - The watch-along relay dials a raw IP, so it waived the certificate's
   name and any publicly trusted certificate passed, whatever it named.
-  The certificate must now be valid for a host of `arlo.com` (Arlo's
-  names `*.wowza.arlo.com`); anything else is refused and logged with
-  the names it presented (ADR 0007).
+  The certificate must now be valid for a host of Arlo's watch-along
+  tier (`*.wowza.arlo.com`, the name Arlo's certificate carries);
+  anything else is refused and logged with the names it presented (ADR
+  0007).
+- A query string on an RTSP URL (`/front_door?x`) built a second media
+  for the camera on a bare DESCRIBE: it took the camera's live wiring,
+  left the viewers' media without live video once it went, and each
+  distinct query built another encoder pipeline. A mount has one media
+  now, whatever the query.
+- The HLS directory and its root must belong to the daemon and not be
+  writable by others (a planted symlink would otherwise be followed by
+  the segment writer); the daemon creates them with mode 0750.
 - rustls-webpki 0.103.16 (RUSTSEC-2026-0382: certificate verification
   could accept distrusted intermediates) and webpki-roots 1.0.10
   (RUSTSEC-2026-0381: distrusted emSign intermediates were still
@@ -79,6 +88,8 @@ that ask for RTP over UDP are refused and switch to TCP on their own.
   constructors violate I/O safety; the streamer does not call them).
 
 ### Fixed
+- A failure to create the WebRTC bus-watch thread failed the live attach
+  with an error instead of panicking in the middle of it.
 - A video doorbell's snapshot after a motion (`fullFrameSnapshotAvailable`,
   owner account) refreshes its idle picture: it carries
   `presignedFullFrameSnapshotUrl`, not `presignedLastImageUrl`.

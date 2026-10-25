@@ -359,16 +359,20 @@ fn shared_factory(launch: &str) -> RTSPMediaFactory {
     factory
 }
 
-/// The shared-media key of a request URI: its path and query, without
-/// the scheme, host and port, so both servers' clients of one mount
-/// share its media.
+/// The shared-media key of a request URI: its path alone, without the
+/// scheme, host, port and query, so both servers' clients of one mount
+/// share its media. A query used to give a mount a second media, built
+/// on a bare DESCRIBE, which took the camera's live wiring from the
+/// viewers' media (third sweep, S3-M1).
 fn media_key(request_uri: &str) -> String {
     let after_scheme = request_uri
         .split_once("://")
         .map_or(request_uri, |(_, rest)| rest);
-    match after_scheme.find(['/', '?']) {
-        Some(at) if after_scheme[at..].starts_with('/') => after_scheme[at..].to_string(),
-        Some(at) => format!("/{}", &after_scheme[at..]),
+    let without_query = after_scheme
+        .split_once(['?', '#'])
+        .map_or(after_scheme, |(before, _)| before);
+    match without_query.find('/') {
+        Some(at) => without_query[at..].to_string(),
         None => "/".to_string(),
     }
 }
@@ -444,15 +448,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn media_key_keeps_the_path_and_query_only() {
+    fn media_key_keeps_the_path_only() {
         assert_eq!(media_key("rtsp://127.0.0.1:8554/front_door"), "/front_door");
         assert_eq!(
             media_key("rtsp://192.168.1.10:41234/front_door"),
             "/front_door"
         );
-        assert_eq!(media_key("rtsp://[::1]:8554/a/b?x=1"), "/a/b?x=1");
+        assert_eq!(media_key("rtsp://[::1]:8554/a/b?x=1"), "/a/b");
+        assert_eq!(
+            media_key("rtsp://host:8554/front_door?x=1#y"),
+            "/front_door"
+        );
         assert_eq!(media_key("rtsp://host:8554"), "/");
-        assert_eq!(media_key("rtsp://host:8554?x=1"), "/?x=1");
+        assert_eq!(media_key("rtsp://host:8554?x=1"), "/");
     }
 
     #[test]

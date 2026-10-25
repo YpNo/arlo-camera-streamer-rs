@@ -275,6 +275,47 @@ fn both_servers_share_one_media_per_mount() {
     assert_eq!(built.load(Ordering::SeqCst), 1, "one media for the mount");
 }
 
+/// A query on the mount's URL used to build a second media for
+/// the camera, which took its live wiring and, once gone, left the
+/// viewers' media without live video (third sweep, S3-M1).
+#[test]
+fn a_query_on_the_url_reuses_the_mount_s_media() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !gstreamer_ready() {
+        return;
+    }
+    let server = RtspServer::start_with("127.0.0.1:0", SHORT).expect("rtsp server");
+    let built = Arc::new(AtomicUsize::new(0));
+    let counter = built.clone();
+    server
+        .install_factory_with_media_hook(MOUNT, LAUNCH, move |_media| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        })
+        .expect("factory");
+    let port = server.bound_port().expect("bound");
+    let url = format!("rtsp://127.0.0.1:{port}{MOUNT}");
+
+    let mut viewer = RawClient::connect(&url);
+    assert_eq!(viewer.set_up(&url).status, 200);
+    for query in ["?x=1", "?x=2"] {
+        let mut other = RawClient::connect(&url);
+        let describe = other.request(
+            "DESCRIBE",
+            &format!("{url}{query}"),
+            "Accept: application/sdp\r\n",
+        );
+        assert_eq!(describe.status, 200, "{query}: {}", describe.headers);
+    }
+    // A path below the mount is not served at all.
+    let mut other = RawClient::connect(&url);
+    let suffix = other.request("DESCRIBE", &format!("{url}/extra"), "");
+    assert_eq!(suffix.status, 404);
+
+    assert_eq!(built.load(Ordering::SeqCst), 1, "one media for the mount");
+}
+
 /// RTP over UDP never reaches a client through a container that
 /// publishes the RTSP port over TCP only: a client trying UDP first (VLC,
 /// GStreamer) waited 5 to 10 s for nothing before retrying over TCP.
