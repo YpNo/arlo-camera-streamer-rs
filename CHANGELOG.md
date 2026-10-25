@@ -79,6 +79,14 @@ that ask for RTP over UDP are refused and switch to TCP on their own.
   constructors violate I/O safety; the streamer does not call them).
 
 ### Fixed
+- Changing `mqtt.base_topic` or `mqtt.discovery_prefix` left what the
+  previous one published on the broker, and the old bridge device in Home
+  Assistant: the record now keeps the layout, and the next connection
+  clears everything published under the old one first.
+- The MQTT bridge gives up on a write after 30 s: a broker whose host
+  vanished without closing the connection blocked it until the kernel
+  dropped the connection, about 15 minutes with no keep-alive and nothing
+  published.
 - `streamer_camera_state` reported a camera in no state at all until its
   first state change: every row started at 0. A camera's `idle` row
   starts at 1 now (every camera starts idle).

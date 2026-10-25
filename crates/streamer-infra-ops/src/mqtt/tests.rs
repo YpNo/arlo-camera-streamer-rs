@@ -376,7 +376,10 @@ async fn a_camera_no_longer_served_is_cleared_and_the_record_updated() {
     let dir = scratch("removal");
     let record = PublishedRecord::in_dir(&dir);
     let before: BTreeSet<CameraId> = [CameraId::new("CAM1"), CameraId::new("OLD")].into();
-    record.save(&before).await.unwrap();
+    record
+        .save(&Layout::new(&config(false)), &before)
+        .await
+        .unwrap();
     let (log, stop, task) = start(&[], FakeAdmin::with(&["CAM1"]), false, &dir);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -395,7 +398,56 @@ async fn a_camera_no_longer_served_is_cleared_and_the_record_updated() {
     assert!(cleared.contains(&"homeassistant/sensor/arlo_streamer_OLD/state/config".to_string()));
     assert!(cleared.iter().all(|t| !t.contains("CAM1")), "{cleared:?}");
     let after = record.load().await;
-    assert_eq!(after, [CameraId::new("CAM1")].into());
+    assert_eq!(after.cameras, [CameraId::new("CAM1")].into());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// After a change of `base_topic`, what was published under the old one
+/// is cleared: the old bridge device would stay in Home Assistant, and
+/// the old state topics on the broker.
+#[tokio::test(start_paused = true)]
+async fn a_new_base_topic_clears_what_the_old_one_published() {
+    let dir = scratch("relayout");
+    let mut old = config(false);
+    old.base_topic = "old".into();
+    PublishedRecord::in_dir(&dir)
+        .save(&Layout::new(&old), &[CameraId::new("CAM1")].into())
+        .await
+        .unwrap();
+    let (log, stop, task) = start(&[], FakeAdmin::with(&["CAM1"]), false, &dir);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    stop_and_join(&stop, task).await;
+
+    let published = log.published();
+    let cleared: Vec<&str> = published
+        .iter()
+        .filter(|(_, p)| p.is_empty())
+        .map(|(t, _)| t.as_str())
+        .collect();
+    for topic in [
+        "old/status",
+        "old/bridge",
+        "old/CAM1/state",
+        "old/CAM1/thumbnail",
+        "homeassistant/binary_sensor/arlo_streamer_bridge_old/arlo_connected/config",
+    ] {
+        assert!(cleared.contains(&topic), "{topic} not cleared: {cleared:?}");
+    }
+    // The camera's config topic is the same under both base topics: it is
+    // cleared first, then announced again, and stays announced.
+    let config_topic = "homeassistant/sensor/arlo_streamer_CAM1/state/config";
+    let last = published
+        .iter()
+        .rev()
+        .find(|(t, _)| t == config_topic)
+        .expect("announced");
+    assert!(!last.1.is_empty(), "the new config is not cleared after");
+    assert!(cleared.contains(&config_topic));
+    assert_eq!(
+        PublishedRecord::in_dir(&dir).load().await.layout,
+        Some(Layout::new(&config(false)))
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -549,6 +601,62 @@ async fn the_session_speaks_mqtt_3_1_1_with_a_retained_will_and_qos_0() {
     assert_eq!(publish.qos, mqttbytes::QoS::AtMostOnce);
     assert!(matches!(packets[2], Packet::PingReq));
     assert!(matches!(packets[3], Packet::Disconnect));
+}
+
+/// A broker that accepts the connection, then stops reading, as a host
+/// that vanished without closing the connection: writes pile up in the
+/// socket buffers until they block.
+async fn deaf_broker() -> (u16, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = BytesMut::new();
+        loop {
+            match mqttbytes::v4::read(&mut buffer, 1 << 20) {
+                Ok(_connect) => break,
+                Err(mqttbytes::Error::InsufficientBytes(_)) => {
+                    stream.read_buf(&mut buffer).await.unwrap();
+                }
+                Err(e) => panic!("bad packet: {e}"),
+            }
+        }
+        let mut reply = BytesMut::new();
+        ConnAck::new(ConnectReturnCode::Success, false)
+            .write(&mut reply)
+            .unwrap();
+        stream.write_all(&reply).await.unwrap();
+        // Hold the connection open and read nothing more.
+        std::future::pending::<()>().await;
+    });
+    (port, task)
+}
+
+/// A write that cannot complete fails within the step timeout: it used to
+/// wait for the kernel to give up on TCP, about 15 minutes during which
+/// no keep-alive could run and nothing was published.
+#[tokio::test(start_paused = true)]
+async fn a_write_the_broker_never_reads_times_out() {
+    let (port, broker) = deaf_broker().await;
+    let mut session = tcp_broker(port, "s3cret")
+        .connect()
+        .await
+        .expect("accepted");
+    let big = Message {
+        topic: "arlo/CAM1/thumbnail".into(),
+        payload: Bytes::from(vec![0u8; 1 << 20]),
+    };
+    let mut outcome = Ok(());
+    for _ in 0..256 {
+        outcome = tokio::time::timeout(Duration::from_secs(600), session.publish(&big))
+            .await
+            .expect("the session must give up on its own");
+        if outcome.is_err() {
+            break;
+        }
+    }
+    assert!(matches!(outcome, Err(MqttError::Timeout(_))), "{outcome:?}");
+    broker.abort();
 }
 
 #[tokio::test]

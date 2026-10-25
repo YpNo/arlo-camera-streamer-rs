@@ -28,6 +28,11 @@ use streamer_domain::config::MqttEndpoint;
 pub(crate) const KEEP_ALIVE_SECS: u16 = 30;
 /// TCP connect, TLS handshake, CONNACK, PINGRESP: each must come this soon.
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+/// A write must be done this soon: a broker that stopped reading (its
+/// host vanished without closing the connection) would otherwise block
+/// the bridge until the kernel gives up on TCP, about 15 minutes with no
+/// keep-alive able to notice. Room for a 512 KiB picture on a slow link.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest packet read from the broker. It only sends CONNACK and
 /// PINGRESP; anything bigger is a misbehaving broker.
 const MAX_INCOMING_BYTES: usize = 64 * 1024;
@@ -152,9 +157,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> StreamSession<S> {
     ) -> Result<(), MqttError> {
         let mut out = BytesMut::new();
         encode(&mut out).map_err(|e| MqttError::Protocol(e.to_string()))?;
-        self.stream
-            .write_all(&out)
+        timeout(WRITE_TIMEOUT, self.stream.write_all(&out))
             .await
+            .map_err(|_| MqttError::Timeout("write"))?
             .map_err(|e| MqttError::Io(e.to_string()))
     }
 

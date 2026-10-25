@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use streamer_domain::admin::CameraSnapshot;
@@ -40,10 +41,13 @@ impl Message {
 pub(crate) const ONLINE: &str = "online";
 pub(crate) const OFFLINE: &str = "offline";
 
-/// Where everything goes, from the `[mqtt]` settings.
-#[derive(Debug, Clone)]
+/// Where everything goes, from the `[mqtt]` settings. Kept in the
+/// published record, so what an earlier layout published can be cleared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Layout {
+    #[serde(rename = "base_topic")]
     base: String,
+    #[serde(rename = "discovery_prefix")]
     discovery: Option<String>,
 }
 
@@ -63,6 +67,22 @@ impl Layout {
             discovery: (!config.discovery_prefix.is_empty())
                 .then(|| config.discovery_prefix.clone()),
         }
+    }
+
+    /// Whether every topic level is letters, digits, `-` or `_`, as the
+    /// configuration requires: a layout read back from the record file
+    /// is checked before any topic is built from it.
+    pub(crate) fn is_valid(&self) -> bool {
+        let prefix_ok = |value: &str| {
+            !value.is_empty()
+                && value.split('/').all(|level| {
+                    !level.is_empty()
+                        && level
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                })
+        };
+        prefix_ok(&self.base) && self.discovery.as_deref().is_none_or(prefix_ok)
     }
 
     /// Availability: `online` / `offline`, retained; also the last will.
@@ -263,6 +283,15 @@ pub(crate) fn removal(layout: &Layout, camera: &CameraId) -> Vec<Message> {
             .iter()
             .filter_map(|(component, object)| layout.discovery_topic(component, &node, object)),
     );
+    topics.into_iter().map(Message::cleared).collect()
+}
+
+/// Clears the bridge's own topics: its availability, its state and its
+/// Home Assistant device. For a layout no longer in use.
+pub(crate) fn bridge_removal(layout: &Layout) -> Vec<Message> {
+    let node = layout.bridge_device_id();
+    let mut topics = vec![layout.status(), layout.bridge()];
+    topics.extend(layout.discovery_topic("binary_sensor", &node, "arlo_connected"));
     topics.into_iter().map(Message::cleared).collect()
 }
 

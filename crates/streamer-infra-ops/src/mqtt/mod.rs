@@ -33,8 +33,8 @@ use streamer_domain::config::MqttConfig;
 use streamer_domain::port::AdminControl;
 
 use messages::{Layout, Message, OFFLINE, ONLINE, Written};
-use record::PublishedRecord;
 pub use record::RECORD_FILE;
+use record::{PublishedRecord, Recorded};
 use session::{ConnectParams, KEEP_ALIVE_SECS, TcpBroker};
 
 /// How often the snapshot is read.
@@ -265,14 +265,19 @@ impl Bridge {
         }
     }
 
-    /// After a connect: `online`, discovery, the removal of cameras no
-    /// longer served, then the full state.
+    /// After a connect: the removal of what is no longer served, then
+    /// `online`, discovery and the full state.
     async fn announce(&mut self, session: &mut dyn Session) -> Result<(), MqttError> {
         let snapshot = self
             .admin
             .snapshot()
             .await
             .map_err(|e| MqttError::Source(e.to_string()))?;
+        self.cameras = snapshot.cameras.iter().map(|c| c.id.clone()).collect();
+        // First: an earlier layout can share topics with this one (the
+        // cameras' discovery configs, or the status when only the
+        // discovery prefix changed), which are then published afresh.
+        self.remove_departed(session).await?;
         self.send(session, messages::status(&self.layout, ONLINE))
             .await?;
         for message in messages::bridge_discovery(&self.layout, &self.version) {
@@ -283,8 +288,6 @@ impl Bridge {
                 self.send(session, message).await?;
             }
         }
-        self.cameras = snapshot.cameras.iter().map(|c| c.id.clone()).collect();
-        self.remove_departed(session).await?;
         self.publish_state(session).await?;
         if self.thumbnails {
             self.publish_thumbnails(session).await?;
@@ -292,17 +295,35 @@ impl Bridge {
         Ok(())
     }
 
-    /// Clear every camera published before but no longer served, then
-    /// record the ones served now.
+    /// Clear what was published before and is no longer served: every
+    /// camera and the bridge of an earlier layout, or the cameras dropped
+    /// since; then record the layout and the cameras served now.
     async fn remove_departed(&mut self, session: &mut dyn Session) -> Result<(), MqttError> {
         let current: BTreeSet<CameraId> = self.cameras.iter().cloned().collect();
-        for gone in self.record.load().await.difference(&current) {
-            info!(camera = %gone, "MQTT: clearing a camera no longer served");
-            for message in messages::removal(&self.layout, gone) {
-                self.send(session, message).await?;
+        let Recorded { layout, cameras } = self.record.load().await;
+        let mut stale = Vec::new();
+        match layout.filter(|old| *old != self.layout) {
+            Some(old) => {
+                info!(
+                    ?old,
+                    "MQTT: clearing what the previous base topic or discovery prefix published"
+                );
+                for camera in &cameras {
+                    stale.extend(messages::removal(&old, camera));
+                }
+                stale.extend(messages::bridge_removal(&old));
+            }
+            None => {
+                for gone in cameras.difference(&current) {
+                    info!(camera = %gone, "MQTT: clearing a camera no longer served");
+                    stale.extend(messages::removal(&self.layout, gone));
+                }
             }
         }
-        if let Err(e) = self.record.save(&current).await {
+        for message in stale {
+            self.send(session, message).await?;
+        }
+        if let Err(e) = self.record.save(&self.layout, &current).await {
             warn!(error = %e, "MQTT published record not saved");
         }
         Ok(())
