@@ -721,6 +721,150 @@ async fn a_refused_login_is_reported_without_the_password() {
     assert!(!text.contains("s3cret"), "{text}");
 }
 
+/// A broker that answers the n-th packet it reads with `replies[n]`, and
+/// closes the connection on the first packet it has no reply for.
+async fn scripted_broker(replies: &'static [&'static [u8]]) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = BytesMut::new();
+        for index in 0..=replies.len() {
+            loop {
+                match mqttbytes::v4::read(&mut buffer, 1 << 20) {
+                    Ok(_) => break,
+                    Err(mqttbytes::Error::InsufficientBytes(_)) => {
+                        if stream.read_buf(&mut buffer).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                    }
+                    Err(e) => panic!("bad packet: {e}"),
+                }
+            }
+            match replies.get(index) {
+                Some(reply) => stream.write_all(reply).await.unwrap(),
+                None => return,
+            }
+        }
+    });
+    port
+}
+
+const CONNACK_ACCEPTED: &[u8] = &[0x20, 0x02, 0x00, 0x00];
+
+async fn connect_error(replies: &'static [&'static [u8]]) -> MqttError {
+    let port = scripted_broker(replies).await;
+    tcp_broker(port, "s3cret")
+        .connect()
+        .await
+        .err()
+        .expect("the connect must fail")
+}
+
+#[tokio::test]
+async fn a_broker_that_closes_after_the_connect_is_reported_as_closed() {
+    let err = connect_error(&[]).await;
+    assert!(
+        matches!(&err, MqttError::Io(text) if text.contains("closed the connection")),
+        "{err}"
+    );
+}
+
+/// Only CONNACK and PINGRESP are expected: a longer packet is refused from
+/// its length, before its body is read.
+#[tokio::test]
+async fn a_packet_longer_than_a_connack_is_refused_unread() {
+    // CONNACK type, remaining length 200 on two bytes.
+    let err = connect_error(&[&[0x20, 0xC8, 0x01]]).await;
+    assert!(
+        matches!(&err, MqttError::Protocol(text) if text.contains("200-byte")),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_remaining_length_over_four_bytes_is_refused() {
+    let err = connect_error(&[&[0x20, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]]).await;
+    assert!(matches!(err, MqttError::Protocol(_)), "{err}");
+}
+
+#[tokio::test]
+async fn a_pingresp_in_place_of_the_connack_is_refused() {
+    let err = connect_error(&[&[0xD0, 0x00]]).await;
+    assert!(
+        matches!(&err, MqttError::Protocol(text) if text.contains("CONNACK")),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_connack_in_place_of_the_pingresp_is_refused() {
+    let port = scripted_broker(&[CONNACK_ACCEPTED, CONNACK_ACCEPTED]).await;
+    let mut session = tcp_broker(port, "s3cret")
+        .connect()
+        .await
+        .expect("accepted");
+    let err = session.keep_alive().await.expect_err("no PINGRESP");
+    assert!(
+        matches!(&err, MqttError::Protocol(text) if text.contains("PINGRESP")),
+        "{err}"
+    );
+}
+
+fn tls_endpoint(host: &str, port: u16) -> MqttEndpoint {
+    MqttEndpoint {
+        tls: true,
+        host: host.into(),
+        port,
+    }
+}
+
+fn anonymous() -> ConnectParams {
+    ConnectParams {
+        client_id: "c".into(),
+        username: None,
+        password: None,
+        will_topic: "s".into(),
+        will_payload: OFFLINE,
+    }
+}
+
+/// A listener that is no TLS server: the handshake fails as a TLS error,
+/// before any CONNECT (and its password) is written.
+#[tokio::test]
+async fn mqtts_to_a_server_without_tls_fails_the_handshake() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+    });
+    let tls = session::tls_config(None).expect("the system roots");
+    let broker = TcpBroker::new(tls_endpoint("127.0.0.1", port), Some(tls), anonymous())
+        .expect("an IP is a TLS server name");
+
+    let err = broker.connect().await.err().expect("no TLS server");
+
+    assert!(matches!(err, MqttError::Tls(_)), "{err}");
+}
+
+#[test]
+fn mqtts_needs_a_host_that_is_a_tls_server_name() {
+    let tls = session::tls_config(None).expect("the system roots");
+    assert!(matches!(
+        TcpBroker::new(tls_endpoint("not a host", 8883), Some(tls), anonymous()),
+        Err(MqttError::Tls(_))
+    ));
+}
+
+/// A CA bundle in PEM gives a TLS setup; the system's own bundle serves as
+/// one (Debian and Ubuntu, where the tests run).
+#[test]
+fn a_ca_file_with_certificates_gives_a_tls_setup() {
+    let pem = std::fs::read("/etc/ssl/certs/ca-certificates.crt").expect("the system CA bundle");
+    assert!(session::tls_config(Some(&pem)).is_ok());
+}
+
 #[test]
 fn mqtts_needs_a_tls_setup_and_a_ca_file_needs_a_certificate() {
     let endpoint = MqttEndpoint {

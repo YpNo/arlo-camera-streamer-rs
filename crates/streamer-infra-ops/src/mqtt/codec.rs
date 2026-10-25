@@ -313,6 +313,9 @@ mod tests {
 
     #[test]
     fn refusal_codes_have_their_specification_names() {
+        assert_eq!(refusal_name(1), "UnacceptableProtocolVersion");
+        assert_eq!(refusal_name(2), "IdentifierRejected");
+        assert_eq!(refusal_name(3), "ServiceUnavailable");
         assert_eq!(refusal_name(4), "BadUserNamePassword");
         assert_eq!(refusal_name(5), "NotAuthorized");
         assert_eq!(refusal_name(9), "UnknownRefusal");
