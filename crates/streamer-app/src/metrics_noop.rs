@@ -23,7 +23,7 @@ impl MetricsRecorder for NoopRecorder {
     ) {
     }
 
-    fn record_motion(&self, _camera: &CameraId, _outcome: MotionOutcome) {}
+    fn record_motion(&self, _camera: &CameraId, _trigger: &str, _outcome: MotionOutcome) {}
 
     fn record_budget(&self, _camera: &CameraId, _decision: BudgetDecision) {}
 
@@ -41,7 +41,7 @@ mod tests {
     #[test]
     fn noop_recorder_is_a_valid_trait_object() {
         let r: Arc<dyn MetricsRecorder> = Arc::new(NoopRecorder);
-        r.record_motion(&CameraId::new("X"), MotionOutcome::Triggered);
+        r.record_motion(&CameraId::new("X"), "motion", MotionOutcome::Triggered);
         // No assertions — the fact that it compiles + runs is the test.
     }
 }

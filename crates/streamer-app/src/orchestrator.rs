@@ -191,6 +191,9 @@ pub struct CameraOrchestrator {
     media: Arc<dyn MediaMultiplexer>,
     user_views: Arc<dyn UserViewSource>,
     metrics: Arc<dyn MetricsRecorder>,
+    /// The pulse (`motion`, `ring`, …) behind the trigger signal being
+    /// handled, for the transition log.
+    pending_trigger: Option<&'static str>,
     events: mpsc::Receiver<CameraEvent>,
     /// Inbound admin commands (e.g. force-idle, manual-wake). The
     /// admin actor in `crate::admin` enqueues here.
@@ -272,6 +275,7 @@ impl CameraOrchestrator {
             media,
             user_views,
             metrics,
+            pending_trigger: None,
             events,
             admin,
             snapshots: watch::Sender::new(initial),
@@ -602,7 +606,7 @@ impl CameraOrchestrator {
                 "pulse while the user watches in the Arlo app; not activating"
             );
             self.metrics
-                .record_motion(&self.camera_id, MotionOutcome::SuppressedUserView);
+                .record_motion(&self.camera_id, trigger, MotionOutcome::SuppressedUserView);
             return None;
         }
         // A relay of the user's view has no cooldown and is not charged:
@@ -613,7 +617,7 @@ impl CameraOrchestrator {
         if self.session_source == Some(LiveSource::UserView) {
             debug!(trigger, "pulse during a relayed user view; absorbed");
             self.metrics
-                .record_motion(&self.camera_id, MotionOutcome::Absorbed);
+                .record_motion(&self.camera_id, trigger, MotionOutcome::Absorbed);
             return None;
         }
         let mut signal = self.intercept_budget(StateTransition::MotionDetected);
@@ -646,7 +650,11 @@ impl CameraOrchestrator {
             ?session_ends_in_ms,
             "trigger pulse"
         );
-        self.metrics.record_motion(&self.camera_id, outcome);
+        self.metrics
+            .record_motion(&self.camera_id, trigger, outcome);
+        // Named in the transition this signal causes: a ring and a motion
+        // drive the same transition.
+        self.pending_trigger = Some(trigger);
         Some(signal)
     }
 
@@ -879,7 +887,19 @@ impl CameraOrchestrator {
                 debug!(?signal, ?from, "no-op transition");
                 continue;
             }
-            info!(?from, ?to, ?signal, "state transition");
+            // The pulse behind a trigger signal: a ring and a motion drive
+            // the same transition and would read the same.
+            let trigger = matches!(
+                signal,
+                StateTransition::MotionDetected | StateTransition::BudgetReset
+            )
+            .then(|| self.pending_trigger.take())
+            .flatten();
+            if let Some(trigger) = trigger {
+                info!(?from, ?to, ?signal, trigger, "state transition");
+            } else {
+                info!(?from, ?to, ?signal, "state transition");
+            }
             self.state = to.clone();
             // ADR 0004 invariant: the session handle lives exactly as
             // long as the camera is live. Dropping it here, before any
@@ -1824,7 +1844,9 @@ mod tests {
         let cfg = camera_cfg(2, 60);
         let sr = StubSignaler::with_responses(vec![Ok(ok_answer())]);
         let media = RecordingMedia::new();
-        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let (mut orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let pulses = Arc::new(PulseSpy::default());
+        orch.metrics = pulses.clone();
         let handle = tokio::spawn(orch.run());
 
         tx.send(CameraEvent::Ring {
@@ -1839,6 +1861,26 @@ mod tests {
         handle.await.unwrap();
         assert!(calls.iter().any(|c| matches!(c, MediaCall::AttachLive(_))));
         assert_eq!(sr.call_count().await, 1);
+        // Counted as a ring, not as motion.
+        assert_eq!(
+            *pulses.0.lock().unwrap(),
+            [("ring".to_string(), MotionOutcome::Triggered)]
+        );
+    }
+
+    /// Records the trigger pulses, nothing else.
+    #[derive(Default)]
+    struct PulseSpy(std::sync::Mutex<Vec<(String, MotionOutcome)>>);
+
+    impl MetricsRecorder for PulseSpy {
+        fn record_state_change(&self, _: &CameraId, _: &CameraState, _: &CameraState, _: &str) {}
+        fn record_motion(&self, _camera: &CameraId, trigger: &str, outcome: MotionOutcome) {
+            self.0.lock().unwrap().push((trigger.to_string(), outcome));
+        }
+        fn record_budget(&self, _: &CameraId, _: BudgetDecision) {}
+        fn record_splice(&self, _: &CameraId, _: SpliceOutcome, _: u64) {}
+        fn record_failure(&self, _: &CameraId, _: u32) {}
+        fn record_dropped_event(&self, _: &CameraId) {}
     }
 
     // ---------- Live-loss feedback (ADR 0004) ----------

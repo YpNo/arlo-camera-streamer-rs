@@ -275,8 +275,9 @@ pub trait MetricsRecorder: Send + Sync {
         signal: &str,
     );
 
-    /// A motion / audio event arrived from the bus.
-    fn record_motion(&self, camera: &CameraId, outcome: MotionOutcome);
+    /// A trigger pulse arrived: `trigger` names it (`motion`, `audio`,
+    /// `ring`, `admin-wake`), `outcome` says what it did.
+    fn record_motion(&self, camera: &CameraId, trigger: &str, outcome: MotionOutcome);
 
     /// The orchestrator made a budget decision (live granted / denied
     /// because exhausted / reset).

@@ -113,6 +113,10 @@ that ask for RTP over UDP are refused and switch to TCP on their own.
   camera still runs one pipeline whichever server a client uses.
 
 ### Changed
+- `streamer_motion_events_total` gains a `trigger` label (`motion`,
+  `audio`, `ring`, `admin-wake`), and the `state transition` log line
+  names the trigger: a ring read as motion in both. Queries summed by
+  `outcome` are unchanged.
 - arlo-rs 0.3.1: the MQTT subscription log states the device counts and
   names the devices without an xCloudId, instead of always ending in
   "no xCloud ⇒ legacy get_devices, no camera events".

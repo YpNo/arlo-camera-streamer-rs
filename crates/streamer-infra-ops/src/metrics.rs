@@ -65,7 +65,7 @@ pub struct Metrics {
     camera_state: IntGaugeVec,
     /// State-transition counter, labeled by `{camera, from, to, signal}`.
     state_transitions_total: IntCounterVec,
-    /// Motion / audio events received per camera, labeled by outcome.
+    /// Trigger pulses per camera, labeled by trigger and outcome.
     motion_events_total: IntCounterVec,
     /// Daily-budget decisions per camera, labeled by decision.
     budget_decisions_total: IntCounterVec,
@@ -143,9 +143,9 @@ impl Metrics {
         let motion_events_total = IntCounterVec::new(
             opts!(
                 "streamer_motion_events_total",
-                "Inbound motion / audio events, labeled by outcome."
+                "Inbound trigger pulses (motion, audio, ring, admin wake), labeled by trigger and outcome."
             ),
-            &["camera", "outcome"],
+            &["camera", "trigger", "outcome"],
         )?;
         let budget_decisions_total = IntCounterVec::new(
             opts!(
@@ -316,9 +316,9 @@ impl MetricsRecorder for Metrics {
             .inc();
     }
 
-    fn record_motion(&self, camera: &CameraId, outcome: MotionOutcome) {
+    fn record_motion(&self, camera: &CameraId, trigger: &str, outcome: MotionOutcome) {
         self.motion_events_total
-            .with_label_values(&[camera.as_str(), outcome.as_label()])
+            .with_label_values(&[camera.as_str(), trigger, outcome.as_label()])
             .inc();
     }
 
@@ -494,16 +494,20 @@ mod tests {
     fn record_motion_increments_per_outcome() {
         let m = Metrics::new(1, "0.1.0").unwrap();
         let id = cam("CAM");
-        m.record_motion(&id, MotionOutcome::Triggered);
-        m.record_motion(&id, MotionOutcome::Triggered);
-        m.record_motion(&id, MotionOutcome::Absorbed);
+        m.record_motion(&id, "motion", MotionOutcome::Triggered);
+        m.record_motion(&id, "motion", MotionOutcome::Triggered);
+        m.record_motion(&id, "motion", MotionOutcome::Absorbed);
+        m.record_motion(&id, "ring", MotionOutcome::Triggered);
         let out = m.render().unwrap();
-        assert!(
-            out.contains("streamer_motion_events_total{camera=\"CAM\",outcome=\"triggered\"} 2")
-        );
-        assert!(
-            out.contains("streamer_motion_events_total{camera=\"CAM\",outcome=\"absorbed\"} 1")
-        );
+        assert!(out.contains(
+            "streamer_motion_events_total{camera=\"CAM\",outcome=\"triggered\",trigger=\"motion\"} 2"
+        ));
+        assert!(out.contains(
+            "streamer_motion_events_total{camera=\"CAM\",outcome=\"triggered\",trigger=\"ring\"} 1"
+        ));
+        assert!(out.contains(
+            "streamer_motion_events_total{camera=\"CAM\",outcome=\"absorbed\",trigger=\"motion\"} 1"
+        ));
     }
 
     #[test]
@@ -572,6 +576,6 @@ mod tests {
         // Compile-time check that Metrics satisfies dyn MetricsRecorder.
         let m: Arc<dyn streamer_domain::port::MetricsRecorder> =
             Arc::new(Metrics::new(1, "0.1.0").unwrap());
-        m.record_motion(&cam("X"), MotionOutcome::Triggered);
+        m.record_motion(&cam("X"), "motion", MotionOutcome::Triggered);
     }
 }

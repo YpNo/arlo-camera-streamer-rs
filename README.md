@@ -519,7 +519,7 @@ curl -H "Authorization: Bearer $STREAMER_ADMIN_TOKEN" -o front_door.jpg \
 | `streamer_arlo_connected`           | gauge      | —                               |
 | `streamer_camera_state`             | gauge      | `camera`, `state`               |
 | `streamer_state_transitions_total`  | counter    | `camera`, `from`, `to`, `signal`|
-| `streamer_motion_events_total`      | counter    | `camera`, `outcome`             |
+| `streamer_motion_events_total`      | counter    | `camera`, `trigger` (`motion`, `audio`, `ring`, `admin-wake`), `outcome` |
 | `streamer_budget_decisions_total`   | counter    | `camera`, `decision`            |
 | `streamer_splice_attempts_total`    | counter    | `camera`, `outcome`             |
 | `streamer_splice_latency_ms`        | histogram  | `camera`, `outcome`             |
