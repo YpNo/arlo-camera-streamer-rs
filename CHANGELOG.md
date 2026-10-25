@@ -96,9 +96,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - arlo-rs 0.3.1: the MQTT subscription log states the device counts and
   names the devices without an xCloudId, instead of always ending in
   "no xCloud ⇒ legacy get_devices, no camera events".
-- arlo-rs 0.3.2 (mailparse 0.18 for the mailbox second factor), which
-  requires Rust 1.99.1: the toolchain, the image's builder and CI move
-  from 1.99.0 to 1.99.1.
+- arlo-rs 0.3.4 (mailparse 0.18 for the mailbox second factor;
+  stealthscraper-rs 1.0.1, whose brotli 9 removes the duplicate brotli 8
+  chain), which requires Rust 1.99.1: the toolchain, the image's builder
+  and CI move from 1.99.0 to 1.99.1.
 - Dependencies refreshed within their versions (29 crates, among them
   tokio 1.53.2, hyper 1.12.0, aws-lc-rs 1.18.2, serde_json 1.0.154);
   every direct dependency is on its latest major.

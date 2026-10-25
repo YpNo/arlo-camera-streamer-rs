@@ -7,7 +7,7 @@
 - **Domain**: Media Streaming & Home Automation
 - **Primary adapters (inbound)**: RTSP Server, Metrics/Health API
 - **Driven adapters (outbound)**: `arlo-rs` client, GStreamer Pipelines
-- **MSRV**: 1.99.1 (follows arlo-rs 0.3.2)
+- **MSRV**: 1.99.1 (follows arlo-rs 0.3.4)
 - **Async runtime**: tokio
 
 ---
