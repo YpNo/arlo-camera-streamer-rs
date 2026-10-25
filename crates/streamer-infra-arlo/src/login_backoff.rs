@@ -55,7 +55,11 @@ impl Record {
     /// clock stepped back) restarts the pause from `now`.
     fn remaining(&self, now: SystemTime) -> Duration {
         let delay = delay_after(self.failures);
-        let last = UNIX_EPOCH + Duration::from_secs(self.last_failure_unix);
+        // A timestamp past what the clock holds (a corrupt file) used to
+        // panic here at every boot; it reads as a full pause.
+        let Some(last) = UNIX_EPOCH.checked_add(Duration::from_secs(self.last_failure_unix)) else {
+            return delay;
+        };
         match now.duration_since(last) {
             Ok(elapsed) => delay.saturating_sub(elapsed),
             Err(_) => delay,
@@ -206,6 +210,17 @@ mod tests {
     }
 
     /// A clock stepped back must not cancel the pause.
+    /// A timestamp past what the clock can hold panicked at every boot
+    /// (third sweep, S3-Z5): it reads as a full pause instead.
+    #[test]
+    fn a_timestamp_beyond_the_clock_reads_as_a_full_pause() {
+        let record = Record {
+            failures: 3,
+            last_failure_unix: u64::MAX,
+        };
+        assert_eq!(record.remaining(SystemTime::now()), delay_after(3));
+    }
+
     #[test]
     fn a_failure_in_the_future_restarts_the_pause_from_now() {
         let record = Record {

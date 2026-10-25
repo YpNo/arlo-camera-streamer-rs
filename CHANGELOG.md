@@ -75,6 +75,10 @@ that ask for RTP over UDP are refused and switch to TCP on their own.
   left the viewers' media without live video once it went, and each
   distinct query built another encoder pipeline. A mount has one media
   now, whatever the query.
+- Snapshot fetches ignore HTTPS_PROXY / ALL_PROXY (a proxy would resolve
+  the host past the private-address check), and NAT64 addresses of a
+  private host, the local-use NAT64 prefix and the benchmarking, IETF
+  and reserved IPv4 ranges count as private.
 - The HLS directory and its root must belong to the daemon and not be
   writable by others (a planted symlink would otherwise be followed by
   the segment writer); the daemon creates them with mode 0750.
@@ -88,6 +92,8 @@ that ask for RTP over UDP are refused and switch to TCP on their own.
   constructors violate I/O safety; the streamer does not call them).
 
 ### Fixed
+- A login back-off file holding a timestamp past what the clock can
+  hold crashed every boot; it reads as a full pause.
 - A failure to create the WebRTC bus-watch thread failed the live attach
   with an error instead of panicking in the middle of it.
 - A video doorbell's snapshot after a motion (`fullFrameSnapshotAvailable`,

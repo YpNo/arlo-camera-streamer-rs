@@ -69,6 +69,9 @@ pub fn http_client(user_agent: &str) -> Result<reqwest::Client, reqwest::Error> 
         .redirect(redirect_policy())
         .referer(false)
         .dns_resolver(Arc::new(PublicOnlyResolver))
+        // A proxy would resolve the host itself, past PublicOnlyResolver
+        // (third sweep, S3-L4): HTTPS_PROXY / ALL_PROXY are ignored.
+        .no_proxy()
         .https_only(true)
         .build()
 }
@@ -108,14 +111,36 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
     }
 }
 
+/// The IPv4 address a well-known-prefix NAT64 address (`64:ff9b::/96`)
+/// stands for: a gateway translates it to that host, private or not.
+fn nat64_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let s = v6.segments();
+    (s[..6] == [0x64, 0xff9b, 0, 0, 0, 0]).then(|| {
+        let [.., hi, lo] = s;
+        std::net::Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo))
+    })
+}
+
+/// The local-use NAT64 prefix (`64:ff9b:1::/48`, RFC 8215): what it
+/// translates to is the network's choice, so it is never public.
+fn is_local_use_nat64(v6: std::net::Ipv6Addr) -> bool {
+    let s = v6.segments();
+    s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1
+}
+
 /// Whether `ip` is reachable on the public internet: not loopback,
 /// private, link-local, shared (CGNAT), unspecified, broadcast,
-/// documentation or multicast; IPv4-mapped IPv6 judged as its IPv4.
+/// documentation, benchmarking, IETF-assigned, reserved or multicast;
+/// IPv4-mapped and NAT64 (`64:ff9b::/96`) IPv6 judged as their IPv4, the
+/// local-use NAT64 prefix (`64:ff9b:1::/48`) never public.
 fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
+            let [a, b, c, _] = v4.octets();
             let shared_cgnat = a == 100 && (64..128).contains(&b);
+            let benchmarking = a == 198 && (b == 18 || b == 19);
+            let ietf_assigned = a == 192 && b == 0 && c == 0;
+            let reserved = a >= 240;
             !(v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
@@ -124,10 +149,14 @@ fn is_public_ip(ip: IpAddr) -> bool {
                 || v4.is_documentation()
                 || v4.is_multicast()
                 || shared_cgnat
+                || benchmarking
+                || ietf_assigned
+                || reserved
                 || a == 0)
         }
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped().or_else(|| nat64_ipv4(v6)) {
             Some(v4) => is_public_ip(IpAddr::V4(v4)),
+            None if is_local_use_nat64(v6) => false,
             None => {
                 !(v6.is_loopback()
                     || v6.is_unspecified()
@@ -494,10 +523,23 @@ mod tests {
             "fe80::1",
             "ff02::1",
             "::ffff:192.168.1.1",
+            // NAT64 of a private address, and the local-use NAT64 prefix
+            // (third sweep, S3-L5).
+            "64:ff9b::c0a8:101",
+            "64:ff9b:1::1",
+            // Benchmarking, IETF protocol assignments, reserved.
+            "198.18.0.1",
+            "192.0.0.1",
+            "240.0.0.1",
         ] {
             assert!(!is_public_ip(ip.parse().unwrap()), "{ip} must be refused");
         }
-        for ip in ["52.216.0.1", "2600:1f18::1", "::ffff:52.216.0.1"] {
+        for ip in [
+            "52.216.0.1",
+            "2600:1f18::1",
+            "::ffff:52.216.0.1",
+            "64:ff9b::34d8:1",
+        ] {
             assert!(is_public_ip(ip.parse().unwrap()), "{ip} is public");
         }
     }
