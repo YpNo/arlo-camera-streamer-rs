@@ -1,12 +1,26 @@
 name: Rust CI
 
-# Minutes are metered (private repository). The workflow is staged —
-# format → clippy → test → coverage / SonarQube, with doc beside test — so
-# a failed stage skips the costlier ones (coverage alone is ~9 min);
-# docs-only changes do not run it; the weekly schedule runs the audit
-# only; Renovate's PRs skip coverage and SonarQube; the GitHub release and
-# the container image (one per released version, to GHCR) come last, after
-# every gate.
+# A change is gated once, on its own pull request. The `plan` job decides
+# what each run deserves, and every job keys off its outputs:
+#   - pull request changing Rust code (crates/, config/, Cargo.*, the
+#     toolchain and lint settings): format → clippy → test → doc, coverage,
+#     SonarQube, plus the audit. Renovate's: no coverage or SonarQube.
+#   - pull request changing a workflow only: format → clippy → test, to
+#     exercise the actions; no coverage, doc or SonarQube.
+#   - pull request changing the Dockerfile (or .dockerignore, .trivyignore):
+#     the image is built and scanned, never pushed.
+#   - any other pull request (Compose, deploy/, scripts/): the audit only.
+#   - push to main bringing a version with no release yet: format → clippy
+#     → test and the audit, then the release and the image. No coverage:
+#     the change was covered on its pull request.
+#   - any other push to main: the release job's image check only (a
+#     released version missing a platform is rebuilt); the code was gated
+#     on its pull request.
+#   - weekly schedule: the audit, plus one coverage and SonarQube baseline
+#     on main for the pull requests to compare against.
+#   - workflow_dispatch: the gates, then the release job.
+# A stage that fails skips the costlier ones after it. Docs-only changes
+# never trigger the workflow (paths-ignore); the secret scan has its own.
 on:
   pull_request:
     branches: [main, master]
@@ -47,13 +61,114 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      pull-requests: read # the files a pull request changes
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      docs: ${{ steps.plan.outputs.docs }}
+      coverage: ${{ steps.plan.outputs.coverage }}
+      sonar: ${{ steps.plan.outputs.sonar }}
+      audits: ${{ steps.plan.outputs.audits }}
+      image_pr: ${{ steps.plan.outputs.image_pr }}
+      release_check: ${{ steps.plan.outputs.release_check }}
+      new_version: ${{ steps.plan.outputs.new_version }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          PR_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          is() { [ "$1" = true ]; }
+          is_pr=false; [ "$EVENT" = pull_request ] && is_pr=true
+          main_push=false
+          if [ "$EVENT" = push ]; then
+            case "$REF" in refs/heads/main|refs/heads/master) main_push=true;; esac
+          fi
+          dispatch=false; [ "$EVENT" = workflow_dispatch ] && dispatch=true
+          schedule=false; [ "$EVENT" = schedule ] && schedule=true
+          bot_pr=false
+          if is $is_pr; then
+            case "$ACTOR" in 'renovate[bot]'|'dependabot[bot]') bot_pr=true;; esac
+          fi
+          fork_pr=false; is $is_pr && [ "$PR_REPO" != "$REPO" ] && fork_pr=true
+
+          # What a pull request changes. An API error runs everything.
+          code=false; ci=false; image=false
+          if is $is_pr; then
+            if files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename'); then
+              has() { printf '%s\n' "$files" | grep -Eq "$1"; }
+              has '^(crates/|config/|\.cargo/|Cargo\.(toml|lock)$|(clippy|rustfmt|rust-toolchain)\.toml$|sonar-project\.properties$)' && code=true
+              has '^\.github/workflows/' && ci=true
+              has '^(Dockerfile|\.dockerignore|\.trivyignore)$' && image=true
+            else
+              echo "::warning::cannot list the pull request's files; running every job"
+              code=true; ci=true; image=true
+            fi
+          fi
+
+          # Whether main now holds a version with no release yet. An API
+          # error counts as new: the gates run, and the release job decides.
+          new_version=false
+          if is $main_push || is $dispatch; then
+            version=v$(gh api "repos/$REPO/contents/Cargo.toml?ref=$SHA" --jq .content \
+              | base64 -d | grep -m1 '^version' | cut -d'"' -f2)
+            if out=$(gh release view "$version" -R "$REPO" --json tagName 2>&1); then
+              echo "$version is released already"
+            elif printf '%s' "$out" | grep -qi 'release not found'; then
+              new_version=true
+            else
+              echo "::warning::cannot tell whether $version is released: $out"
+              new_version=true
+            fi
+          fi
+
+          build=false
+          { { is $is_pr && { is $code || is $ci; }; } || is $new_version || is $dispatch || is $schedule; } && build=true
+          docs=false; { is $is_pr && is $code; } && docs=true
+          coverage=false; { { is $is_pr && is $code && ! is $bot_pr; } || is $schedule; } && coverage=true
+          sonar=false; { is $coverage && ! is $fork_pr; } && sonar=true
+          audits=false; { is $is_pr || is $new_version || is $dispatch || is $schedule; } && audits=true
+          image_pr=false; { is $is_pr && is $image; } && image_pr=true
+          release_check=false; { is $main_push || is $dispatch; } && release_check=true
+
+          {
+            echo "### Plan for \`$EVENT\` (code=$code, workflows=$ci, image=$image)"
+            echo; echo '| job group | runs |'; echo '|---|---|'
+          } >> "$GITHUB_STEP_SUMMARY"
+          out() {
+            echo "$1=$2" >> "$GITHUB_OUTPUT"
+            echo "| $1 | $2 |" >> "$GITHUB_STEP_SUMMARY"
+            echo "$1=$2"
+          }
+          out build "$build"
+          out docs "$docs"
+          out coverage "$coverage"
+          out sonar "$sonar"
+          out audits "$audits"
+          out image_pr "$image_pr"
+          out release_check "$release_check"
+          out new_version "$new_version"
+
   format:
     name: Check Formatting
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    # Root of the build chain: the weekly schedule is for the audit only,
-    # and every build job below `needs` this one.
-    if: github.event_name != 'schedule'
+    # Root of the build chain: everything below `needs` it, so a run the
+    # plan keeps build-free stops here.
+    needs: [plan]
+    if: needs.plan.outputs.build == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
@@ -120,6 +235,8 @@ jobs:
     name: Security & License Audit
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    needs: [plan]
+    if: needs.plan.outputs.audits == 'true'
     permissions:
       contents: read
     steps:
@@ -148,7 +265,8 @@ jobs:
     name: Documentation Check
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    needs: [clippy]
+    needs: [plan, clippy]
+    if: needs.plan.outputs.docs == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install system build deps
@@ -170,10 +288,11 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    needs: [test]
+    needs: [plan, test]
     # The costliest job (instrumented rebuild + the GStreamer integration
-    # tests, ~9 min): not for a dependency bump — the tests already ran.
-    if: github.actor != 'renovate[bot]'
+    # tests, ~9 min): a pull request changing Rust code, and the weekly
+    # baseline on main; never a dependency bot's PR or a merge.
+    if: needs.plan.outputs.coverage == 'true'
     permissions:
       contents: read
     steps:
@@ -238,8 +357,8 @@ jobs:
     name: SonarQube
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: [test]
-    if: github.actor != 'renovate[bot]' # a bump carries no code to analyse
+    needs: [plan, test]
+    if: needs.plan.outputs.sonar == 'true' # with coverage; not a fork's PR
     # Secrets are not readable in a job-level `if`, so the token is mapped
     # to the job environment and the scan step checks it: a fork or a
     # repository without the SonarCloud secret skips the scan instead of
@@ -256,19 +375,62 @@ jobs:
       - uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
         if: env.SONAR_TOKEN != ''
 
-  # The GitHub release, after every gate: a push to main whose Cargo.toml
-  # version has no release yet gets tagged `v<version>` with generated
-  # notes. SonarCloud is reporting only and does not hold a release back.
-  # The image jobs below key on `created`, so an image is published once
-  # per version, never for an unversioned push.
+  # A pull request changing the Dockerfile builds the image and scans it,
+  # as the release would (amd64 only), and pushes nothing: a broken build
+  # or a fixable CRITICAL/HIGH used to surface only once a version was
+  # tagged (0.2.0).
+  image-check:
+    name: Container image check (PR)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs: [plan]
+    if: needs.plan.outputs.image_pr == 'true'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          outputs: type=oci,dest=/tmp/image,tar=false
+          # Reads the release builds' cache; writes nothing, so a pull
+          # request never changes what a release starts from.
+          cache-from: type=gha,scope=image-linux/amd64
+      - name: Vulnerability gate
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          input: /tmp/image
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          exit-code: '1'
+
+  # The GitHub release: a push to main whose Cargo.toml version has no
+  # release yet gets tagged `v<version>` with generated notes, once the
+  # gates the plan ran for it passed (coverage and SonarQube ran on the
+  # pull request). On every other push it only checks that each released
+  # version's image exists for every platform; its gates were skipped by
+  # the plan, hence `always()` and the explicit results below. The image
+  # jobs key on `image_missing`, so an image is published once per version.
   release:
     name: Create GitHub Release
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    needs: [format, clippy, test, security, doc, coverage]
+    needs: [plan, format, clippy, test, security]
     if: >-
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      always() && needs.plan.result == 'success' &&
+      needs.plan.outputs.release_check == 'true' &&
+      (needs.plan.outputs.new_version != 'true' ||
+       (needs.format.result == 'success' && needs.clippy.result == 'success' &&
+        needs.test.result == 'success' && needs.security.result == 'success'))
     permissions:
       contents: write
       packages: read
@@ -409,7 +571,9 @@ jobs:
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 90
     needs: [release]
-    if: needs.release.outputs.image_missing == 'true'
+    # always(): the release job's own gates may have been skipped by the
+    # plan, and a skipped ancestor would skip this job too.
+    if: always() && needs.release.result == 'success' && needs.release.outputs.image_missing == 'true'
     strategy:
       fail-fast: true
       matrix:
@@ -545,6 +709,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs: [release, image]
+    if: always() && needs.release.result == 'success' && needs.image.result == 'success'
     permissions:
       contents: read
       packages: write

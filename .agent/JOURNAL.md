@@ -502,3 +502,28 @@ Changed:  The state directory is probed before the login; failed logins
 Owner:    state as a host directory, `podman unshare chown -R 10001:10001`.
           Compose key is `devices:` (the box's local file had `device:`)
           and needs `group_add` with the host's render gid.
+
+## 2026-10-25 — CI: a plan job; a change is gated once, on its PR
+Seen:     Every push to main re-ran the whole chain its PR had just passed,
+          coverage included (~9 min), and the release waited on that
+          coverage rerun. Renovate PRs rebased after a merge rebuilt again.
+Changed:  ci.yml gets arlo-rs 0.3.4's design, adapted: a `plan` job reads
+          the trigger and, for a PR, its changed files (API), and outputs
+          build/docs/coverage/sonar/audits/image_pr/release_check/
+          new_version; every job keys off them. Rust code (crates/,
+          config/ — the tests include_str! the example config — Cargo.*,
+          toolchain and lint files) gets the full chain; a workflow-only PR
+          format→clippy→test; a Dockerfile PR a new image build + Trivy
+          gate, no push; anything else cargo-deny. A push to main runs the
+          gates only for a version with no release yet (Cargo.toml read
+          through the API, `gh release view`), without coverage; any other
+          push runs only the release job's image check. Weekly: audits +
+          coverage/SonarQube baseline for Codecov's PR comparison. The
+          release job uses always() with explicit gate results, and the
+          image jobs key on the release job's result (a skipped ancestor
+          used to skip them).
+Verified: actionlint + shellcheck clean; the plan script run through 16
+          trigger scenarios with a fake `gh` (all as designed, API errors
+          run everything). The job-level `if`s are reasoned, not run.
+Not done: Renovate config unchanged: main has no protection, so its
+          default rebases only on conflict.

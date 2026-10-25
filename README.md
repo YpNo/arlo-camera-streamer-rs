@@ -924,18 +924,30 @@ CI does.
 ## CI/CD
 
 GitHub Actions workflows live in [`.github/workflows/`](./.github/workflows/).
-The `ci.yml` pipeline is staged: format → clippy → tests (with the GStreamer
-integration tests) → coverage gate (88 %; raised deliberately, never above
-what is held) and SonarCloud, with the rustdoc check beside the tests and
-cargo-deny (a checksum-pinned binary) in parallel. A failed stage skips
-the costlier ones, docs-only changes do not run it, the weekly schedule
-runs cargo-deny only, and Renovate's PRs skip coverage and SonarCloud.
-`secret-scan.yml` runs gitleaks (checksum-pinned, rules in
-`.gitleaks.toml`) on every push and PR, docs included, over every commit
-the push brings (merged side branches too), and weekly over the whole
-history.
+A change is gated once, on its own pull request: a small `plan` job
+reads what triggered the run (and, for a pull request, which files it
+changes) and every job runs only if the plan says so. The summary of
+each run shows the plan.
 
-After every gate, a push to `main` whose `Cargo.toml` version has no
+| Trigger | Runs |
+|---|---|
+| PR changing Rust code (`crates/`, `config/`, `Cargo.*`, toolchain and lint settings) | format → clippy → tests (with the GStreamer integration tests) → rustdoc, coverage gate (88 %), SonarCloud; cargo-deny |
+| … from Renovate or Dependabot | the same without coverage and SonarCloud |
+| PR changing a workflow only | format → clippy → tests, to exercise the actions; cargo-deny |
+| PR changing the `Dockerfile` | the image built and scanned with Trivy (amd64), pushed nowhere |
+| Any other PR (Compose, `deploy/`, `scripts/`) | cargo-deny |
+| Push to `main` with a version that has no release yet | format → clippy → tests and cargo-deny, then the release and the image (no coverage: it ran on the PR) |
+| Any other push to `main` | the image check only (below) |
+| Weekly schedule | cargo-deny, plus a coverage and SonarCloud baseline on `main` for PRs to compare against |
+| Manual run | the gates, then the release job |
+
+A failed stage skips the costlier ones after it, and docs-only changes
+do not run the workflow. `secret-scan.yml` runs gitleaks (checksum-pinned,
+rules in `.gitleaks.toml`) on every push and PR, docs included, over
+every commit the push brings (merged side branches too), and weekly over
+the whole history.
+
+Once its gates pass, a push to `main` whose `Cargo.toml` version has no
 release yet gets a GitHub release tagged `v<version>`, then the container
 image for that version, built from the tag's commit: per platform on
 native runners, into a local OCI layout scanned with Trivy before any

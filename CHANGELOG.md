@@ -100,6 +100,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stealthscraper-rs 1.0.1, whose brotli 9 removes the duplicate brotli 8
   chain), which requires Rust 1.99.1: the toolchain, the image's builder
   and CI move from 1.99.0 to 1.99.1.
+- CI gates a change once, on its pull request: a `plan` job decides what
+  each run deserves from the trigger and the files changed. A merge to
+  `main` no longer re-runs the gates (coverage included); a new version's
+  merge runs format, clippy, tests and cargo-deny before the release; a
+  pull request changing the `Dockerfile` builds and scans the image.
 - Dependencies refreshed within their versions (29 crates, among them
   tokio 1.53.2, hyper 1.12.0, aws-lc-rs 1.18.2, serde_json 1.0.154);
   every direct dependency is on its latest major.
