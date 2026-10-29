@@ -41,74 +41,74 @@ streamer-infra-ops   = { path = "crates/streamer-infra-ops" }
 # Pinned to the crates.io release so CI, Docker and a fresh clone resolve it
 # without a sibling checkout. To build against a local ../arlo-rs, uncomment
 # the `[patch.crates-io]` block at the end of this file (never commit it on).
-arlo-rs = "0.3.4"
+arlo-rs = "0.4.0"
 
 # ---- Async runtime ----
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util   = "0.7"
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tokio-util   = "0.7.20"
 tokio-rustls = "0.26"
 # Test-only: an independent MQTT decoder for the adapter's own codec (ADR 0009;
 # unmaintained since 2021, so not used at run time; in the tree through arlo-rs).
 mqttbytes    = "0.6"
 # Watch-along TLS (ADR 0007): system roots for chain verification, SHA-256 for the certificate pin.
-rustls-native-certs = "0.8"
-ring = "0.17"
+rustls-native-certs = "0.8.5"
+ring = "0.17.14"
 rustls       = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # The certificate parser rustls itself uses (same version, no new crate):
 # the watch-along relay reads which names a certificate presents.
-rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
-url          = "2"
-futures      = "0.3"
-async-trait  = "0.1"
-serde_json   = "1"
+rustls-webpki = { version = "0.103.16", default-features = false, features = ["std"] }
+url          = "2.5.8"
+futures      = "0.3.34"
+async-trait  = "0.1.92"
+serde_json   = "1.0.154"
 
 # ---- Errors / Tracing ----
-thiserror          = "2"
-anyhow             = "1"
-tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror          = "2.0.21"
+anyhow             = "1.0.104"
+tracing            = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 # ---- Serde / Config ----
-serde = { version = "1", features = ["derive"] }
-toml  = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml  = "1.1.8"
 
 # ---- Time / Dates ----
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
 
 # ---- HTTP / Bytes (thumbnail fetch, generic transport) ----
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
-bytes   = "1"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
+bytes   = "1.12.1"
 
 # ---- HTTP server (ops endpoints) ----
-axum       = "0.8"
+axum       = "0.8.9"
 prometheus = "0.14"
 # Listener loop with a header-read timeout and a connection cap (axum::serve has neither);
 # already in the tree through axum.
-hyper-util = { version = "0.1", features = ["server", "server-auto", "server-graceful", "http1", "http2", "tokio", "service"] }
+hyper-util = { version = "0.1.21", features = ["server", "server-auto", "server-graceful", "http1", "http2", "tokio", "service"] }
 # Constant-time token compare (already in the tree through rustls/ring).
-subtle     = "2"
+subtle     = "2.6.1"
 # Secrets zeroed on drop (already in the tree through arlo-rs).
-secrecy    = "0.10"
-zeroize    = "1"
+secrecy    = "0.10.3"
+zeroize    = "1.9.1"
 
 # ---- CLI ----
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 
 # ---- GStreamer (media adapter only) ----
-gstreamer             = "0.25"
-gstreamer-app         = "0.25"
+gstreamer             = "0.25.4"
+gstreamer-app         = "0.25.2"
 gstreamer-rtsp        = "0.25"
-gstreamer-rtsp-server = "0.25"
-gstreamer-webrtc      = "0.25"
-gstreamer-sdp         = "0.25"
+gstreamer-rtsp-server = "0.25.2"
+gstreamer-webrtc      = "0.25.4"
+gstreamer-sdp         = "0.25.3"
 
 # ---- Test ----
 mockall    = "0.15"
-rstest     = "0.27"
-tokio-test = "0.4"
+rstest     = "0.28.0"
+tokio-test = "0.4.6"
 # Test certificates for the relay TLS verifier (dev only).
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
 
 # To build against a local ../arlo-rs before a release, uncomment this block
 # (never commit it on: CI, Docker and a fresh clone have no sibling tree).
