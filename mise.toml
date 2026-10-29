@@ -2,7 +2,7 @@
 # workspace `rust-version` — mise's rust wins over rustup's file. cmake is
 # pinned because a floating one would change the BoringSSL build under us.
 [tools]
-cmake = "4.4.3"
+cmake = "4.4.5"
 rust = "1.99.1"
 
 [env]
