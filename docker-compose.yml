@@ -105,7 +105,7 @@ services:
   # HLS_PUBLISH=192.168.1.10:8080 (all interfaces by default).
   hls:
     profiles: [hls]
-    image: docker.io/nginxinc/nginx-unprivileged:1.30.5-alpine@sha256:15c994d10d6d78658721c3bcafff14cb281fba2a4bdf9d5ba92c416a472516e3
+    image: docker.io/nginxinc/nginx-unprivileged:1.30.5-alpine@sha256:56b8272e43a0525f67aed68d1e0794a712d10e3e45a563e118e9a77c817e6f86
     container_name: arlo-camera-streamer-hls
     restart: unless-stopped
     # The daemon's own uid, so the segments it writes are readable here.
