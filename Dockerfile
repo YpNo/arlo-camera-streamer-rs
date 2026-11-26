@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# syntax=docker/dockerfile:1.29@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
 
 # ----------------------------------------------------------------------
 # Stage 1 — build
@@ -9,7 +9,7 @@
 # The build stage carries the dev headers; runtime carries only the .so
 # files.
 # ----------------------------------------------------------------------
-FROM rust:1.99.1-slim-trixie@sha256:aab42391a986424e22d6a3ec14f37bc6dd3dacff4d457ca7cccd781e02297cc6 AS builder
+FROM rust:1.100.0-slim-trixie@sha256:3b199fd6db7d709274df56565b8f4003f9e30d7bfcff9d53148c86053b7855e2 AS builder
 
 # System packages required to build the gstreamer-rs crates against
 # system GStreamer, plus what arlo-rs's transport needs: `wreq` links
@@ -71,7 +71,7 @@ RUN find crates -name '*.rs' -exec touch {} + \
 # the same isolation by running as a non-root user and stripping the
 # binary at build time.
 # ----------------------------------------------------------------------
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS runtime
+FROM debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0 AS runtime
 
 # GHCR links the package to the repository through this label; the
 # release workflow adds version, revision and dates.
